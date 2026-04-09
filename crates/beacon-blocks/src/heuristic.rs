@@ -37,7 +37,10 @@ impl Default for HeuristicPromptDetector {
 fn looks_like_prompt(line: &[u8]) -> bool {
     // Allow trailing whitespace, then one of the prompt sigils.
     let trimmed = trim_end_ascii(line);
-    matches!(trimmed.last(), Some(b'$') | Some(b'#') | Some(b'>') | Some(b'%'))
+    matches!(
+        trimmed.last(),
+        Some(b'$') | Some(b'#') | Some(b'>') | Some(b'%')
+    )
 }
 
 fn trim_end_ascii(bytes: &[u8]) -> &[u8] {

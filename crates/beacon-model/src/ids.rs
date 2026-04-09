@@ -5,9 +5,7 @@ use ulid::Ulid;
 
 macro_rules! ulid_newtype {
     ($name:ident) => {
-        #[derive(
-            Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-        )]
+        #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(Ulid);
 

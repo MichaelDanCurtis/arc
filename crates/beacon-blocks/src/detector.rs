@@ -40,9 +40,7 @@ impl Perform for DetectorPerform {
                     Osc133Event::PromptStart => BlockEvent::PromptStart,
                     Osc133Event::CommandStart => BlockEvent::CommandStart,
                     Osc133Event::OutputStart => BlockEvent::OutputStart,
-                    Osc133Event::CommandEnd { exit_code } => {
-                        BlockEvent::CommandEnd { exit_code }
-                    }
+                    Osc133Event::CommandEnd { exit_code } => BlockEvent::CommandEnd { exit_code },
                 });
             }
         }
