@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tower_http::cors::{Any, CorsLayer};
+
 mod api;
 mod auth;
 mod config;
@@ -28,7 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay: relay_router.clone(),
     };
 
-    let app = api::build_router(app_state);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+    let app = api::build_router(app_state).layer(cors);
 
     let addr = &config.bind_addr;
     tracing::info!("arc-relay listening on {addr}");
