@@ -7,7 +7,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 pub use beacon_model::{Block, BlockFooter, BlockHeader, BlockId, SessionId, TabId};
 
+pub mod codec;
 pub mod envelope;
+pub use codec::{decode, encode, CodecError};
 pub use envelope::{ArcToClient, ClientToArc};
 
 #[cfg(test)]
