@@ -133,7 +133,9 @@ mod tests {
 
     #[test]
     fn hello_ack_round_trip() {
-        let ack = ArcToClient::HelloAck { protocol_version: 1 };
+        let ack = ArcToClient::HelloAck {
+            protocol_version: 1,
+        };
         let s = serde_json::to_string(&ack).unwrap();
         let back: ArcToClient = serde_json::from_str(&s).unwrap();
         assert_eq!(ack, back);
