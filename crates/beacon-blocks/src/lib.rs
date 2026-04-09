@@ -4,5 +4,7 @@
 //! prompt pattern fallback (Task 14) and emits `BlockEvent`s
 //! consumed by `beacon-session`.
 
+pub mod heuristic;
 pub mod osc133;
+pub use heuristic::HeuristicPromptDetector;
 pub use osc133::Osc133Event;
