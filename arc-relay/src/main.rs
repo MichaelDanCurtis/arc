@@ -1,0 +1,38 @@
+use std::sync::Arc;
+
+mod api;
+mod auth;
+mod config;
+mod db;
+mod models;
+mod relay;
+mod ws;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "arc_relay=info".into()),
+        )
+        .init();
+
+    let config = config::ArcConfig::from_env().expect("invalid configuration");
+    let pool = db::init_pool(&config.database_url).await?;
+    db::run_migrations(&pool).await?;
+
+    let relay_router = Arc::new(relay::router::RelayRouter::new());
+    let app_state = api::AppState {
+        pool: pool.clone(),
+        config: Arc::new(config.clone()),
+        relay: relay_router.clone(),
+    };
+
+    let app = api::build_router(app_state);
+
+    let addr = &config.bind_addr;
+    tracing::info!("arc-relay listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}

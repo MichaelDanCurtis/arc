@@ -1,0 +1,238 @@
+use std::sync::Arc;
+
+use axum::{
+    middleware,
+    routing::{get, post},
+    Router,
+};
+
+use crate::auth::middleware::inject_jwt_secret;
+use crate::config::ArcConfig;
+use crate::relay::router::RelayRouter;
+
+pub mod auth_routes;
+pub mod session_routes;
+pub mod team_routes;
+pub mod user_routes;
+
+/// Shared application state injected into every route handler.
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: sqlx::PgPool,
+    pub config: Arc<ArcConfig>,
+    pub relay: Arc<RelayRouter>,
+}
+
+/// Assemble the top-level Axum router.
+pub fn build_router(state: AppState) -> Router {
+    let jwt_secret = state.config.jwt_secret.clone();
+
+    // ── Public auth routes (no JWT required) ────────────────────────────────
+    let auth = Router::new()
+        .route("/register", post(auth_routes::register))
+        .route("/login", post(auth_routes::login))
+        .route("/refresh", post(auth_routes::refresh));
+
+    // ── Protected API routes (Bearer JWT required) ───────────────────────────
+    //
+    // inject_jwt_secret is a `from_fn_with_state` middleware that takes a
+    // plain `String` state (the JWT secret) and inserts it into request
+    // extensions as `JwtSecret`. The `AuthUser` extractor then reads it.
+    let api = Router::new()
+        .route("/users/me", get(user_routes::get_me))
+        .route("/sessions", get(session_routes::list_sessions))
+        .route("/sessions/:id", get(session_routes::get_session))
+        .route(
+            "/teams",
+            get(team_routes::list_teams).post(team_routes::create_team),
+        )
+        .route("/teams/:id/members", get(team_routes::list_members))
+        .layer(middleware::from_fn_with_state(
+            jwt_secret,
+            inject_jwt_secret,
+        ));
+
+    // ── WebSocket route ──────────────────────────────────────────────────────
+    let ws = Router::new().route("/ws", get(crate::ws::handler::ws_handler));
+
+    Router::new()
+        .nest("/api/auth", auth)
+        .nest("/api", api)
+        .merge(ws)
+        .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt; // for oneshot
+
+    /// Build a minimal AppState with a fake (non-connecting) pool.
+    ///
+    /// We only exercise routing here — no DB calls are made.
+    fn test_state() -> AppState {
+        // We can't construct a real PgPool without a DB, but we can at least
+        // build the router and test that routes *exist* by checking their
+        // response codes (404 = route missing, 405/4xx = route found).
+        //
+        // For route-shape tests we use a disconnected pool constructed via
+        // sqlx's lazy-connect approach: the pool is created but no connection
+        // is actually opened until a query runs.
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc").expect("lazy pool");
+        AppState {
+            pool,
+            config: Arc::new(ArcConfig::default()),
+            relay: Arc::new(RelayRouter::new()),
+        }
+    }
+
+    // ── route-shape tests ───────────────────────────────────────────────────
+
+    /// Helper: send a request and return the status code.
+    async fn status(app: Router, method: &str, uri: &str) -> StatusCode {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn auth_register_route_exists() {
+        // A POST with no body should reach the handler and fail with 422
+        // (Unprocessable Entity — JSON body required) rather than 404.
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/register")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let s = app.oneshot(req).await.unwrap().status();
+        // 422 = handler reached but body rejected; 404 = route not found.
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/auth/register must exist");
+    }
+
+    #[tokio::test]
+    async fn auth_login_route_exists() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/auth/login must exist");
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_route_exists() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/refresh")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/auth/refresh must exist");
+    }
+
+    #[tokio::test]
+    async fn users_me_route_requires_auth() {
+        // Without an Authorization header the JWT middleware should reject with 401.
+        let s = status(build_router(test_state()), "GET", "/api/users/me").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "/api/users/me needs auth");
+    }
+
+    #[tokio::test]
+    async fn sessions_route_requires_auth() {
+        let s = status(build_router(test_state()), "GET", "/api/sessions").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "/api/sessions needs auth");
+    }
+
+    #[tokio::test]
+    async fn session_by_id_route_requires_auth() {
+        let s = status(build_router(test_state()), "GET", "/api/sessions/some-id").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "/api/sessions/:id needs auth");
+    }
+
+    #[tokio::test]
+    async fn teams_route_requires_auth() {
+        let s = status(build_router(test_state()), "GET", "/api/teams").await;
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "/api/teams needs auth");
+    }
+
+    #[tokio::test]
+    async fn teams_post_route_requires_auth() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/teams")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"Test"}"#))
+            .unwrap();
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_eq!(s, StatusCode::UNAUTHORIZED, "POST /api/teams needs auth");
+    }
+
+    #[tokio::test]
+    async fn team_members_route_requires_auth() {
+        let s = status(
+            build_router(test_state()),
+            "GET",
+            "/api/teams/550e8400-e29b-41d4-a716-446655440000/members",
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "/api/teams/:id/members needs auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_404() {
+        let s = status(build_router(test_state()), "GET", "/api/unknown-path").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    // ── protected route with valid token ────────────────────────────────────
+
+    #[tokio::test]
+    async fn users_me_with_valid_token_reaches_handler() {
+        use crate::auth::jwt::generate_token_pair;
+
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        // Mint a valid access token for a random user ID.
+        let user_id = uuid::Uuid::new_v4();
+        let pair = generate_token_pair(user_id, &state.config.jwt_secret, 900, 86_400).unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/users/me")
+            .header("authorization", format!("Bearer {}", pair.access_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let s = app.oneshot(req).await.unwrap().status();
+        // The handler will hit the DB and fail (500) because the pool is lazy
+        // and the user doesn't exist — but it must NOT be 401/403/404.
+        assert_ne!(s, StatusCode::UNAUTHORIZED);
+        assert_ne!(s, StatusCode::NOT_FOUND);
+    }
+}
