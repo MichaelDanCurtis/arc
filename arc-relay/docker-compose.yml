@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  arc-relay:
+    build:
+      context: ..
+      dockerfile: arc-relay/Dockerfile
+    ports:
+      - "9900:9900"
+    environment:
+      ARC_DATABASE_URL: postgres://arc:arc@postgres:5432/arc
+      ARC_JWT_SECRET: dev-secret-change-me-in-production-min-32-chars
+      ARC_BIND_ADDR: "0.0.0.0:9900"
+      RUST_LOG: arc_relay=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: arc
+      POSTGRES_PASSWORD: arc
+      POSTGRES_DB: arc
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arc -d arc"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
