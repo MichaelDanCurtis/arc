@@ -1,4 +1,5 @@
-//! Foundational domain types shared across the beacon-core workspace.
-//!
-//! Nothing in this crate performs I/O. All types are `Send + Sync`
-//! and serde-serializable for wire protocol reuse.
+//! Foundational domain types for beacon-core.
+
+pub mod ids;
+
+pub use ids::{BlockId, SessionId, TabId};
