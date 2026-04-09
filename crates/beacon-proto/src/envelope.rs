@@ -112,6 +112,10 @@ pub enum ArcToClient {
         code: String,
         message: String,
     },
+
+    HelloAck {
+        protocol_version: u16,
+    },
 }
 
 #[cfg(test)]
@@ -125,6 +129,14 @@ mod tests {
         };
         let s = serde_json::to_string(&a).unwrap();
         assert!(s.contains("DetachSession"), "got: {s}");
+    }
+
+    #[test]
+    fn hello_ack_round_trip() {
+        let ack = ArcToClient::HelloAck { protocol_version: 1 };
+        let s = serde_json::to_string(&ack).unwrap();
+        let back: ArcToClient = serde_json::from_str(&s).unwrap();
+        assert_eq!(ack, back);
     }
 
     #[test]
