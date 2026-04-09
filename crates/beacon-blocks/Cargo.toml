@@ -1,0 +1,11 @@
+[package]
+name = "beacon-blocks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+beacon-model = { path = "../beacon-model" }
+vte = { workspace = true }
+tracing = { workspace = true }

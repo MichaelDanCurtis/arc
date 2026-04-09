@@ -1,0 +1,16 @@
+[package]
+name = "beacon-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+beacon-model = { path = "../beacon-model" }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }
