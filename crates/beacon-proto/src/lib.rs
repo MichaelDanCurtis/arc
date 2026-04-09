@@ -7,6 +7,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 pub use beacon_model::{Block, BlockFooter, BlockHeader, BlockId, SessionId, TabId};
 
+pub mod envelope;
+pub use envelope::{ArcToClient, ClientToArc};
+
 #[cfg(test)]
 mod smoke {
     use super::*;
