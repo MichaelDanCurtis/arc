@@ -3,11 +3,14 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 mod api;
+mod audit;
 mod auth;
 mod config;
 mod db;
 mod models;
 mod relay;
+mod retention;
+mod setup;
 mod ws;
 
 #[tokio::main]
@@ -24,11 +27,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db::run_migrations(&pool).await?;
 
     let relay_router = Arc::new(relay::router::RelayRouter::new());
+    let audit_log = audit::AuditLog::new();
     let app_state = api::AppState {
         pool: pool.clone(),
         config: Arc::new(config.clone()),
         relay: relay_router.clone(),
+        audit: audit_log,
     };
+
+    retention::spawn_retention_task();
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
