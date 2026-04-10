@@ -140,6 +140,7 @@ mod tests {
             pool,
             config,
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         // Create a user
@@ -187,6 +188,7 @@ mod tests {
             pool,
             config,
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         let err = get_session(

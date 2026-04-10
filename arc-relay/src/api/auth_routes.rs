@@ -277,6 +277,7 @@ mod tests {
             pool,
             config,
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         let email = format!("register_{}@test.invalid", uuid::Uuid::new_v4());
@@ -308,6 +309,7 @@ mod tests {
             pool: pool.clone(),
             config: config.clone(),
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         // First register a user
@@ -347,6 +349,7 @@ mod tests {
             pool: pool.clone(),
             config: config.clone(),
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         let email = format!("badpw_{}@test.invalid", uuid::Uuid::new_v4());

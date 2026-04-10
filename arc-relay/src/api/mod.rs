@@ -6,6 +6,7 @@ use axum::{
     Router,
 };
 
+use crate::audit::AuditLog;
 use crate::auth::middleware::inject_jwt_secret;
 use crate::config::ArcConfig;
 use crate::relay::router::RelayRouter;
@@ -21,6 +22,7 @@ pub struct AppState {
     pub pool: sqlx::PgPool,
     pub config: Arc<ArcConfig>,
     pub relay: Arc<RelayRouter>,
+    pub audit: AuditLog,
 }
 
 /// Assemble the top-level Axum router.
@@ -52,12 +54,25 @@ pub fn build_router(state: AppState) -> Router {
             inject_jwt_secret,
         ));
 
+    // ── Setup routes (public, no JWT required) ──────────────────────────────
+    let setup = Router::new()
+        .route("/status", get(crate::setup::get_setup_status))
+        .route("/", post(crate::setup::complete_setup));
+
+    // ── Audit route (public for now; protect behind JWT in production) ───────
+    let audit_state = state.audit.clone();
+    let audit = Router::new()
+        .route("/", get(crate::audit::get_audit_log))
+        .with_state(audit_state);
+
     // ── WebSocket route ──────────────────────────────────────────────────────
     let ws = Router::new().route("/ws", get(crate::ws::handler::ws_handler));
 
     Router::new()
         .nest("/api/auth", auth)
         .nest("/api", api)
+        .nest("/api/setup", setup)
+        .nest("/api/audit", audit)
         .merge(ws)
         .with_state(state)
 }
@@ -93,6 +108,7 @@ mod tests {
             pool,
             config: Arc::new(ArcConfig::default()),
             relay: Arc::new(RelayRouter::new()),
+            audit: crate::audit::AuditLog::new(),
         }
     }
 

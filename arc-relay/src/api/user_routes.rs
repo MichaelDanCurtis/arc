@@ -107,6 +107,7 @@ mod tests {
             pool,
             config,
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         let email = format!("getme_{}@test.invalid", uuid::Uuid::new_v4());

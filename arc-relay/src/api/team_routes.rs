@@ -191,6 +191,7 @@ mod tests {
             pool: pool.clone(),
             config,
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         let owner_id = uuid::Uuid::new_v4();
@@ -234,6 +235,7 @@ mod tests {
             pool: pool.clone(),
             config,
             relay,
+            audit: crate::audit::AuditLog::new(),
         };
 
         let owner_id = uuid::Uuid::new_v4();
