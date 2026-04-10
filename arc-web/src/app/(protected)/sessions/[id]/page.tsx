@@ -7,8 +7,8 @@ import { useBlocks } from "@/hooks/use-blocks";
 import { BlockList } from "@/components/blocks/block-list";
 import { XtermWrapper, writeToXterm } from "@/components/terminal/xterm-wrapper";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
+import { ControlBar } from "@/components/session/control-bar";
 import type { ArcToClient } from "@/types/protocol";
 
 export default function SessionAttachPage() {
@@ -98,7 +98,14 @@ export default function SessionAttachPage() {
           {wsState}
         </span>
         <span className="flex-1" />
-        <Badge variant="default">Controlling</Badge>
+        <ControlBar
+          isController={true}
+          controllerName="you"
+          pendingRequests={[]}
+          onRequestControl={() => {}}
+          onGrantControl={() => {}}
+          onDenyControl={() => {}}
+        />
       </div>
     </div>
   );
