@@ -13,6 +13,7 @@ use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
 pub mod session_routes;
+pub mod shadow_routes;
 pub mod team_routes;
 pub mod user_routes;
 
@@ -44,6 +45,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/users/me", get(user_routes::get_me))
         .route("/sessions", get(session_routes::list_sessions))
         .route("/sessions/:id", get(session_routes::get_session))
+        .route(
+            "/sessions/:id/shadow-diff",
+            get(shadow_routes::get_shadow_diff),
+        )
         .route(
             "/teams",
             get(team_routes::list_teams).post(team_routes::create_team),
@@ -82,7 +87,7 @@ pub fn build_router(state: AppState) -> Router {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use axum::{
@@ -94,7 +99,7 @@ mod tests {
     /// Build a minimal AppState with a fake (non-connecting) pool.
     ///
     /// We only exercise routing here — no DB calls are made.
-    fn test_state() -> AppState {
+    pub(crate) fn test_state() -> AppState {
         // We can't construct a real PgPool without a DB, but we can at least
         // build the router and test that routes *exist* by checking their
         // response codes (404 = route missing, 405/4xx = route found).

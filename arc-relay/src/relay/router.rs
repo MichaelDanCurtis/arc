@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 /// State for one relay session.
@@ -30,12 +30,15 @@ pub enum SessionState {
 /// Thread-safe — uses DashMap for lock-free concurrent access.
 pub struct RelayRouter {
     sessions: DashMap<String, SessionRelay>,
+    /// Pending shadow diff response waiters, keyed by request_id.
+    shadow_diff_waiters: DashMap<String, oneshot::Sender<String>>,
 }
 
 impl RelayRouter {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            shadow_diff_waiters: DashMap::new(),
         }
     }
 
@@ -124,6 +127,25 @@ impl RelayRouter {
             cols: s.cols,
             rows: s.rows,
         })
+    }
+
+    /// Register a oneshot sender to await a shadow diff response.
+    pub fn register_shadow_diff_waiter(&self, request_id: &str, tx: oneshot::Sender<String>) {
+        self.shadow_diff_waiters.insert(request_id.to_string(), tx);
+    }
+
+    /// Remove a pending shadow diff waiter (e.g. on timeout).
+    pub fn remove_shadow_diff_waiter(&self, request_id: &str) {
+        self.shadow_diff_waiters.remove(request_id);
+    }
+
+    /// Resolve a pending shadow diff request with the given diff text.
+    pub fn resolve_shadow_diff(&self, request_id: &str, diff: String) -> bool {
+        if let Some((_, tx)) = self.shadow_diff_waiters.remove(request_id) {
+            tx.send(diff).is_ok()
+        } else {
+            false
+        }
     }
 
     /// List all active sessions.

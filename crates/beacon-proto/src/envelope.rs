@@ -57,6 +57,17 @@ pub enum ClientToArc {
         rows: u16,
     },
 
+    // Shadow diff proxy
+    ShadowDiffRequest {
+        session_id: SessionId,
+        request_id: String,
+    },
+    ShadowDiffResponse {
+        session_id: SessionId,
+        request_id: String,
+        diff: String,
+    },
+
     Pong,
 }
 
@@ -147,5 +158,27 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         let back: ArcToClient = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, ArcToClient::Ping));
+    }
+
+    #[test]
+    fn shadow_diff_request_response_round_trip() {
+        let sid = SessionId::new();
+
+        let req = ClientToArc::ShadowDiffRequest {
+            session_id: sid,
+            request_id: "req-001".to_string(),
+        };
+        let req_json = serde_json::to_string(&req).unwrap();
+        let req_back: ClientToArc = serde_json::from_str(&req_json).unwrap();
+        assert_eq!(req, req_back);
+
+        let resp = ClientToArc::ShadowDiffResponse {
+            session_id: sid,
+            request_id: "req-001".to_string(),
+            diff: "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new".to_string(),
+        };
+        let resp_json = serde_json::to_string(&resp).unwrap();
+        let resp_back: ClientToArc = serde_json::from_str(&resp_json).unwrap();
+        assert_eq!(resp, resp_back);
     }
 }

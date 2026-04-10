@@ -226,6 +226,29 @@ pub async fn handle_host(
                                 router.update_size(&sid, cols, rows);
                             }
 
+                            Ok(ClientToArc::ShadowDiffResponse {
+                                session_id: _,
+                                request_id,
+                                diff,
+                            }) => {
+                                tracing::debug!(
+                                    user_id = %user_id,
+                                    request_id = %request_id,
+                                    "shadow diff response received"
+                                );
+                                if !router.resolve_shadow_diff(&request_id, diff) {
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        "no waiter for shadow diff response"
+                                    );
+                                }
+                            }
+
+                            Ok(ClientToArc::ShadowDiffRequest { .. }) => {
+                                // Hosts don't send requests; ignore.
+                                tracing::warn!(user_id = %user_id, "host sent ShadowDiffRequest; ignoring");
+                            }
+
                             Ok(ClientToArc::Pong) => {
                                 tracing::trace!(user_id = %user_id, "host pong");
                             }
