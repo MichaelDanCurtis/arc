@@ -56,6 +56,28 @@ export interface MemberResponse {
   role: "owner" | "admin" | "member";
 }
 
+// --- First-run setup ---
+
+export interface SetupStatus {
+  is_configured: boolean;
+  owner_exists: boolean;
+}
+
+export interface SetupRequest {
+  owner_name: string;
+  owner_email: string;
+  team_name: string;
+  password: string;
+}
+
+export interface SetupResponse {
+  owner_id: string;
+  team_id: string;
+  access_token: string;
+  refresh_token: string;
+  message: string;
+}
+
 // --- Audit log ---
 
 export interface AuditEntry {

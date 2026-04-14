@@ -1,9 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useAuth } from "@/hooks/use-auth";
+import { getRelayUrl } from "@/lib/config";
+import type { SetupStatus } from "@/types/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -16,6 +18,18 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  // If setup has never been run, send the user to the wizard instead.
+  useEffect(() => {
+    fetch(`${getRelayUrl()}/api/setup/status`)
+      .then((r) => (r.ok ? (r.json() as Promise<SetupStatus>) : null))
+      .then((status) => {
+        if (status && !status.is_configured) {
+          router.replace("/setup");
+        }
+      })
+      .catch(() => {});
+  }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
