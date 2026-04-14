@@ -9,6 +9,7 @@ pub use beacon_model::{Block, BlockFooter, BlockHeader, BlockId, SessionId, TabI
 
 pub mod codec;
 pub mod envelope;
+pub mod ipc;
 pub use codec::{decode, encode, CodecError};
 pub use envelope::{ArcToClient, ClientToArc};
 

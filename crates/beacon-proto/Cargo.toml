@@ -10,6 +10,7 @@ beacon-model = { path = "../beacon-model" }
 serde = { workspace = true }
 rmp-serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
