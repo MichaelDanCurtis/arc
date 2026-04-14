@@ -1,0 +1,38 @@
+version: "3.8"
+
+# Arc All-in-One: single container running Postgres + arc-relay + arc-web
+# via s6-overlay. For simple self-hosted deployments.
+#
+# Usage:
+#   docker compose -f docker-compose.all-in-one.yml up --build
+#
+# For the standard multi-container deployment use docker-compose.yml instead.
+
+services:
+  arc-all-in-one:
+    build:
+      context: ..
+      dockerfile: arc-relay/Dockerfile.all-in-one
+    image: arc-all-in-one:latest
+    ports:
+      - "9900:9900"   # arc-relay API / WebSocket
+      - "3000:3000"   # arc-web UI
+    environment:
+      POSTGRES_USER: arc
+      POSTGRES_PASSWORD: arc
+      POSTGRES_DB: arc
+      ARC_DATABASE_URL: postgres://arc:arc@127.0.0.1:5432/arc
+      ARC_JWT_SECRET: dev-secret-change-me-in-production-min-32-chars
+      ARC_BIND_ADDR: "0.0.0.0:9900"
+      ARC_WEB_PORT: "3000"
+      NEXT_PUBLIC_RELAY_URL: "http://localhost:9900"
+      RUST_LOG: arc_relay=info
+    volumes:
+      - pgdata_aio:/var/lib/postgresql/data
+    restart: unless-stopped
+    # s6-overlay uses /init as PID 1; send SIGTERM for graceful shutdown
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+
+volumes:
+  pgdata_aio:

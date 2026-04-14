@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+ARC_DATABASE_URL="${ARC_DATABASE_URL:-postgres://arc:arc@127.0.0.1:5432/arc}"
+ARC_JWT_SECRET="${ARC_JWT_SECRET:-change-me-in-production-min-32-chars!!}"
+ARC_BIND_ADDR="${ARC_BIND_ADDR:-0.0.0.0:9900}"
+
+# Wait for postgres to be ready
+echo "[arc-relay] Waiting for postgres..."
+until pg_isready -h 127.0.0.1 -U "${POSTGRES_USER:-arc}" -d "${POSTGRES_DB:-arc}" -q 2>/dev/null; do
+    sleep 1
+done
+echo "[arc-relay] Postgres is ready."
+
+export ARC_DATABASE_URL ARC_JWT_SECRET ARC_BIND_ADDR
+export RUST_LOG="${RUST_LOG:-arc_relay=info}"
+
+echo "[arc-relay] Starting arc-relay on $ARC_BIND_ADDR..."
+exec /usr/local/bin/arc-relay

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+export NODE_ENV="${NODE_ENV:-production}"
+export NEXT_TELEMETRY_DISABLED=1
+export PORT="${ARC_WEB_PORT:-3000}"
+export NEXT_PUBLIC_RELAY_URL="${NEXT_PUBLIC_RELAY_URL:-http://localhost:9900}"
+
+echo "[arc-web] Starting arc-web on port $PORT..."
+exec node /app/web/server.js

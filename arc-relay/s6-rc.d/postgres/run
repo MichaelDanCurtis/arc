@@ -1,0 +1,34 @@
+#!/bin/sh
+set -e
+
+PGDATA="${PGDATA:-/var/lib/postgresql/data}"
+POSTGRES_USER="${POSTGRES_USER:-arc}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-arc}"
+POSTGRES_DB="${POSTGRES_DB:-arc}"
+
+# Initialize data directory if needed
+if [ ! -f "$PGDATA/PG_VERSION" ]; then
+    echo "[postgres] Initializing database cluster..."
+    install -d -o postgres -g postgres "$PGDATA"
+    # Write password to a temp file (process substitution not available in sh)
+    PWFILE=$(mktemp)
+    echo "$POSTGRES_PASSWORD" > "$PWFILE"
+    gosu postgres /usr/lib/postgresql/16/bin/initdb \
+        -D "$PGDATA" \
+        --username="$POSTGRES_USER" \
+        --pwfile="$PWFILE" \
+        --auth-host=md5 \
+        --auth-local=trust
+    rm -f "$PWFILE"
+    # Create the application database
+    gosu postgres /usr/lib/postgresql/16/bin/pg_ctl -D "$PGDATA" start -w -o "-c listen_addresses=127.0.0.1"
+    gosu postgres /usr/lib/postgresql/16/bin/createdb -U "$POSTGRES_USER" "$POSTGRES_DB" 2>/dev/null || true
+    gosu postgres /usr/lib/postgresql/16/bin/pg_ctl -D "$PGDATA" stop -w
+    echo "[postgres] Initialization complete."
+fi
+
+echo "[postgres] Starting postgres..."
+exec gosu postgres /usr/lib/postgresql/16/bin/postgres \
+    -D "$PGDATA" \
+    -c listen_addresses=127.0.0.1 \
+    -c logging_collector=off

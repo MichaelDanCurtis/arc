@@ -1,0 +1,109 @@
+# ============================================================
+# Arc All-in-One Dockerfile
+# Bundles: Postgres 16 + arc-relay (Rust) + arc-web (Next.js)
+# Process supervisor: s6-overlay v3
+# ============================================================
+
+# ---- Stage 1: Build arc-relay (Rust) -----------------------
+FROM rust:1.88-bookworm AS relay-builder
+
+WORKDIR /build
+COPY beacon-core beacon-core
+COPY arc-relay arc-relay
+
+WORKDIR /build/arc-relay
+RUN cargo build --release
+
+# ---- Stage 2: Build arc-web (Next.js) ----------------------
+FROM node:22-alpine AS web-deps
+WORKDIR /app
+COPY arc-web/package.json arc-web/package-lock.json ./
+RUN npm ci
+
+FROM node:22-alpine AS web-builder
+WORKDIR /app
+COPY --from=web-deps /app/node_modules ./node_modules
+COPY arc-web/ .
+ENV NEXT_TELEMETRY_DISABLED=1
+# Patch tsconfig to exclude e2e/ test files (they import @playwright/test which is a devDep
+# not installed in production node_modules, causing type-check failures during next build).
+# This only affects the build-time type check; the app source is untouched.
+RUN node -e " \
+  const fs = require('fs'); \
+  const cfg = JSON.parse(fs.readFileSync('tsconfig.json', 'utf8')); \
+  cfg.exclude = (cfg.exclude || []).concat(['e2e', 'playwright.config.ts']); \
+  fs.writeFileSync('tsconfig.json', JSON.stringify(cfg, null, 2)); \
+"
+RUN npm run build
+
+# ---- Stage 3: Runtime (s6-overlay + Postgres + Node) -------
+FROM debian:bookworm-slim AS runtime
+
+# Install s6-overlay
+ARG S6_OVERLAY_VERSION=3.2.0.2
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils \
+    && ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) S6_ARCH="x86_64" ;; \
+         arm64) S6_ARCH="aarch64" ;; \
+         *) echo "Unsupported arch: $ARCH" && exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz" \
+       | tar -C / -Jxpf - \
+    && curl -fsSL "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz" \
+       | tar -C / -Jxpf - \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Postgres 16 (via PGDG), Node.js 22, gosu (for su-exec equivalent)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gnupg2 lsb-release curl gosu \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+       -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+       https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+       > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        postgresql-16 \
+        postgresql-client-16 \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy arc-relay binary and migrations
+COPY --from=relay-builder /build/arc-relay/target/release/arc-relay /usr/local/bin/arc-relay
+COPY --from=relay-builder /build/arc-relay/migrations /app/migrations
+
+# Copy arc-web standalone build
+COPY --from=web-builder /app/.next/standalone /app/web/
+COPY --from=web-builder /app/.next/static      /app/web/.next/static
+COPY --from=web-builder /app/public            /app/web/public
+
+# Copy s6-rc service definitions
+COPY arc-relay/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+
+# Make all run scripts executable
+RUN find /etc/s6-overlay/s6-rc.d -name run -exec chmod +x {} \;
+
+# Postgres data directory
+RUN install -d -o postgres -g postgres /var/lib/postgresql/data
+ENV PGDATA=/var/lib/postgresql/data
+
+# Default environment (override at runtime)
+ENV POSTGRES_USER=arc \
+    POSTGRES_PASSWORD=arc \
+    POSTGRES_DB=arc \
+    ARC_DATABASE_URL=postgres://arc:arc@127.0.0.1:5432/arc \
+    ARC_JWT_SECRET=change-me-in-production-min-32-chars!! \
+    ARC_BIND_ADDR=0.0.0.0:9900 \
+    ARC_WEB_PORT=3000 \
+    NEXT_PUBLIC_RELAY_URL=http://localhost:9900 \
+    RUST_LOG=arc_relay=info \
+    NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1
+
+EXPOSE 9900 3000
+
+ENTRYPOINT ["/init"]
