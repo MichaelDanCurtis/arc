@@ -78,6 +78,13 @@ export interface SetupResponse {
   message: string;
 }
 
+// --- Shadow diff ---
+
+export interface ShadowDiffResponse {
+  session_id: string;
+  diff: string;
+}
+
 // --- Audit log ---
 
 export interface AuditEntry {

@@ -1,7 +1,7 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useRef, useCallback } from "react";
+import { useRef, useCallback, useState } from "react";
 import { useWebSocket } from "@/hooks/use-websocket";
 import { useBlocks } from "@/hooks/use-blocks";
 import { BlockList } from "@/components/blocks/block-list";
@@ -9,12 +9,14 @@ import { XtermWrapper, writeToXterm } from "@/components/terminal/xterm-wrapper"
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ControlBar } from "@/components/session/control-bar";
+import { ShadowDiffPanel } from "@/components/session/shadow-diff-panel";
 import type { ArcToClient } from "@/types/protocol";
 
 export default function SessionAttachPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const xtermContainerRef = useRef<HTMLDivElement>(null);
+  const [showShadowDiff, setShowShadowDiff] = useState(false);
   const { blocks, replaying, replayTotal, replayLoaded, handleMessage } =
     useBlocks();
 
@@ -63,6 +65,15 @@ export default function SessionAttachPage() {
           &larr; Sessions
         </Button>
         <h1 className="font-mono text-lg">{id}</h1>
+        <span className="flex-1" />
+        <Button
+          variant={showShadowDiff ? "default" : "outline"}
+          size="sm"
+          onClick={() => setShowShadowDiff((v) => !v)}
+          data-testid="shadow-diff-toggle"
+        >
+          Shadow Diff
+        </Button>
       </div>
 
       {/* Replay progress */}
@@ -72,18 +83,29 @@ export default function SessionAttachPage() {
         </div>
       )}
 
-      {/* Block list (historical) */}
-      <div className="flex-1 overflow-hidden">
-        <BlockList blocks={blocks} height={400} />
-      </div>
+      {/* Main content area: terminal + optional shadow-diff side panel */}
+      <div className="flex flex-1 overflow-hidden">
+        <div className="flex min-w-0 flex-1 flex-col">
+          {/* Block list (historical) */}
+          <div className="flex-1 overflow-hidden">
+            <BlockList blocks={blocks} height={400} />
+          </div>
 
-      {/* Live terminal (xterm.js) */}
-      <div ref={xtermContainerRef}>
-        <XtermWrapper
-          onData={handleInput}
-          onResize={handleResize}
-          readOnly={false}
-        />
+          {/* Live terminal (xterm.js) */}
+          <div ref={xtermContainerRef}>
+            <XtermWrapper
+              onData={handleInput}
+              onResize={handleResize}
+              readOnly={false}
+            />
+          </div>
+        </div>
+
+        {showShadowDiff && (
+          <aside className="w-[420px] shrink-0 border-l border-white/10">
+            <ShadowDiffPanel sessionId={id} />
+          </aside>
+        )}
       </div>
 
       {/* Status bar */}
