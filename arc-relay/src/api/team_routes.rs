@@ -95,6 +95,16 @@ pub async fn create_team(
             )
         })?;
 
+    state
+        .audit
+        .record(
+            &user_id.to_string(),
+            "team.create",
+            &format!("team/{}", new_team.id),
+            &req.name,
+        )
+        .await;
+
     Ok((StatusCode::CREATED, Json(TeamResponse::from(new_team))))
 }
 

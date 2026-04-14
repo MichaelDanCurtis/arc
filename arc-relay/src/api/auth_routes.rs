@@ -82,6 +82,16 @@ pub async fn register(
         )
     })?;
 
+    state
+        .audit
+        .record(
+            &new_user.id.to_string(),
+            "user.register",
+            &format!("user/{}", new_user.id),
+            &req.email,
+        )
+        .await;
+
     Ok((
         StatusCode::CREATED,
         Json(AuthResponse {
@@ -126,6 +136,15 @@ pub async fn login(
     })?;
 
     if !valid {
+        state
+            .audit
+            .record(
+                &existing.id.to_string(),
+                "user.login.failed",
+                &format!("user/{}", existing.id),
+                &req.email,
+            )
+            .await;
         return Err((
             StatusCode::UNAUTHORIZED,
             "Invalid email or password".to_string(),
@@ -145,6 +164,16 @@ pub async fn login(
             format!("Failed to generate tokens: {e}"),
         )
     })?;
+
+    state
+        .audit
+        .record(
+            &existing.id.to_string(),
+            "user.login",
+            &format!("user/{}", existing.id),
+            &req.email,
+        )
+        .await;
 
     Ok(Json(AuthResponse {
         user_id: existing.id.to_string(),

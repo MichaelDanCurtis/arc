@@ -1,35 +1,48 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sqlx::PgPool;
+use std::time::Duration;
 use tokio::time;
-use tracing::info;
+use tracing::{error, info};
 
-const RETENTION_DAYS: u64 = 90;
+const RETENTION_DAYS: i64 = 90;
 const PURGE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60); // daily
 
 /// Starts the retention purge background task.
-/// Runs daily and removes blocks older than RETENTION_DAYS.
-pub fn spawn_retention_task() -> tokio::task::JoinHandle<()> {
+/// Runs daily and removes unpinned blocks older than RETENTION_DAYS.
+pub fn spawn_retention_task(pool: PgPool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = time::interval(PURGE_INTERVAL);
+        // tick() fires immediately on first call; skip to run after first PURGE_INTERVAL
+        interval.tick().await;
         loop {
             interval.tick().await;
-            purge_expired_blocks().await;
+            match purge_expired_blocks(&pool).await {
+                Ok(deleted) => {
+                    info!(
+                        deleted,
+                        "retention purge: removed {} unpinned blocks older than {} days",
+                        deleted,
+                        RETENTION_DAYS
+                    );
+                }
+                Err(e) => {
+                    error!(error = %e, "retention purge failed");
+                }
+            }
         }
     })
 }
 
-async fn purge_expired_blocks() {
-    let cutoff_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-        - (RETENTION_DAYS * 24 * 60 * 60 * 1000);
-
-    // TODO: When DB is wired, execute:
-    // DELETE FROM blocks WHERE created_at_ms < cutoff_ms
-    info!(
-        cutoff_ms,
-        "retention purge: would delete blocks older than {} days", RETENTION_DAYS
-    );
+/// Delete unpinned blocks older than RETENTION_DAYS. Returns the number of rows deleted.
+pub async fn purge_expired_blocks(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM blocks \
+         WHERE NOT pinned \
+           AND created_at < NOW() - ($1 || ' days')::interval",
+    )
+    .bind(RETENTION_DAYS.to_string())
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 // ---------------------------------------------------------------------------
@@ -45,21 +58,5 @@ mod tests {
     fn retention_constants_are_reasonable() {
         assert_eq!(RETENTION_DAYS, 90);
         assert_eq!(PURGE_INTERVAL, Duration::from_secs(24 * 60 * 60));
-    }
-
-    /// Verify that spawn_retention_task returns a JoinHandle (compiles + runs).
-    #[tokio::test]
-    async fn spawn_retention_task_returns_handle() {
-        let handle = spawn_retention_task();
-        // The task is running; just confirm we got a handle and can abort it cleanly.
-        handle.abort();
-        // AbortError is expected when we abort — that's fine.
-        let _ = handle.await;
-    }
-
-    /// Verify purge_expired_blocks doesn't panic (no DB yet, just logging).
-    #[tokio::test]
-    async fn purge_expired_blocks_does_not_panic() {
-        purge_expired_blocks().await;
     }
 }

@@ -55,3 +55,21 @@ export interface MemberResponse {
   user_id: string;
   role: "owner" | "admin" | "member";
 }
+
+// --- Audit log ---
+
+export interface AuditEntry {
+  id: number;
+  timestamp_ms: number;
+  actor: string;
+  action: string;
+  resource: string;
+  detail: string;
+}
+
+export interface AuditQuery {
+  limit?: number;
+  offset?: number;
+  actor?: string;
+  action?: string;
+}

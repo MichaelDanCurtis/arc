@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db::run_migrations(&pool).await?;
 
     let relay_router = Arc::new(relay::router::RelayRouter::new());
-    let audit_log = audit::AuditLog::new();
+    let audit_log = audit::AuditLog::with_pool(pool.clone());
     let app_state = api::AppState {
         pool: pool.clone(),
         config: Arc::new(config.clone()),
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit: audit_log,
     };
 
-    retention::spawn_retention_task();
+    retention::spawn_retention_task(pool.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
