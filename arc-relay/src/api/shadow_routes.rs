@@ -5,7 +5,7 @@ use axum::{
 };
 use beacon_proto::{
     codec::encode,
-    envelope::ClientToArc,
+    envelope::ArcToClient,
 };
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -54,7 +54,7 @@ pub async fn get_shadow_diff(
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid session ID".to_string()))?;
 
-    let request_msg = ClientToArc::ShadowDiffRequest {
+    let request_msg = ArcToClient::ShadowDiffRequest {
         session_id: sid,
         request_id: request_id.clone(),
     };

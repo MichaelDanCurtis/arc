@@ -57,11 +57,7 @@ pub enum ClientToArc {
         rows: u16,
     },
 
-    // Shadow diff proxy
-    ShadowDiffRequest {
-        session_id: SessionId,
-        request_id: String,
-    },
+    // Shadow diff proxy: host replies to Arc with the diff.
     ShadowDiffResponse {
         session_id: SessionId,
         request_id: String,
@@ -127,6 +123,12 @@ pub enum ArcToClient {
     HelloAck {
         protocol_version: u16,
     },
+
+    // Shadow diff proxy: Arc asks the host to produce a diff for a session.
+    ShadowDiffRequest {
+        session_id: SessionId,
+        request_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -164,14 +166,16 @@ mod tests {
     fn shadow_diff_request_response_round_trip() {
         let sid = SessionId::new();
 
-        let req = ClientToArc::ShadowDiffRequest {
+        // Request flows Arc -> host, so it lives on ArcToClient.
+        let req = ArcToClient::ShadowDiffRequest {
             session_id: sid,
             request_id: "req-001".to_string(),
         };
         let req_json = serde_json::to_string(&req).unwrap();
-        let req_back: ClientToArc = serde_json::from_str(&req_json).unwrap();
+        let req_back: ArcToClient = serde_json::from_str(&req_json).unwrap();
         assert_eq!(req, req_back);
 
+        // Response flows host -> Arc, so it stays on ClientToArc.
         let resp = ClientToArc::ShadowDiffResponse {
             session_id: sid,
             request_id: "req-001".to_string(),

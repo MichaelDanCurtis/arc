@@ -244,11 +244,6 @@ pub async fn handle_host(
                                 }
                             }
 
-                            Ok(ClientToArc::ShadowDiffRequest { .. }) => {
-                                // Hosts don't send requests; ignore.
-                                tracing::warn!(user_id = %user_id, "host sent ShadowDiffRequest; ignoring");
-                            }
-
                             Ok(ClientToArc::Pong) => {
                                 tracing::trace!(user_id = %user_id, "host pong");
                             }
