@@ -4,8 +4,8 @@ use axum::{
     Json,
 };
 use beacon_proto::{
-    codec::{decode, encode},
-    envelope::{ArcToClient, ClientToArc},
+    codec::encode,
+    envelope::ClientToArc,
 };
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -66,19 +66,23 @@ pub async fn get_shadow_diff(
         )
     })?;
 
+    // Register a oneshot channel BEFORE sending to the host so that a very
+    // fast response cannot arrive and call resolve_shadow_diff before the
+    // waiter entry exists (which would cause a spurious timeout).
+    let (tx, rx) = oneshot::channel::<String>();
+    state
+        .relay
+        .register_shadow_diff_waiter(&request_id, tx);
+
     // Send the request to the host via the relay router
     if !state.relay.send_to_host(&session_id, encoded).await {
+        // Clean up the waiter we just registered before returning the error.
+        state.relay.remove_shadow_diff_waiter(&request_id);
         return Err((
             StatusCode::BAD_GATEWAY,
             "Host not connected for session".to_string(),
         ));
     }
-
-    // Register a oneshot channel to receive the response
-    let (tx, rx) = oneshot::channel::<String>();
-    state
-        .relay
-        .register_shadow_diff_waiter(&request_id, tx);
 
     // Wait for the response with a timeout
     let diff = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
