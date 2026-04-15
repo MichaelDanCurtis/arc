@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "wasm:build": "wasm-pack build ../beacon-core/crates/beacon-blocks-wasm --target bundler --out-dir \"$(pwd)/src/wasm/beacon-blocks\" --dev",
+    "wasm:build:release": "wasm-pack build ../beacon-core/crates/beacon-blocks-wasm --target bundler --out-dir \"$(pwd)/src/wasm/beacon-blocks\"",
+    "prebuild": "npm run wasm:build:release",
+    "predev": "npm run wasm:build",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
