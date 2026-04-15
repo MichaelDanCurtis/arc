@@ -297,6 +297,13 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
     if (!sessionId) return;
 
     let detector: { feed(bytes: Uint8Array): BlockEventJs[]; free(): void } | null = null;
+    // Cancellation flag: set to true in cleanup so the async .then() callback
+    // can tell whether this effect invocation is still live when the WASM
+    // module resolves. This is the standard React pattern for async effects and
+    // replaces the previous inverted detectorSessionRef check (which allowed a
+    // stale .then() to install a detector for the old session when the module
+    // was already cached and both microtasks fired in quick succession).
+    let cancelled = false;
 
     // Reset reducer so stale blocks from the previous session are cleared
     // immediately — before the new detector resolves.
@@ -306,9 +313,8 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
     // auto-initialises on import; no explicit `init()` call is needed.
     import("@/wasm/beacon-blocks/beacon_blocks_wasm")
       .then(({ WasmBlockDetector }) => {
-        // Race guard: if sessionId changed mid-import, skip instantiation for
-        // the now-stale session.
-        if (detectorSessionRef.current === sessionId) return;
+        // Race guard: skip if this effect was superseded by a newer sessionId.
+        if (cancelled) return;
         detector = new WasmBlockDetector() as typeof detector;
         detectorRef.current = detector;
         detectorSessionRef.current = sessionId;
@@ -318,6 +324,8 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
       });
 
     return () => {
+      // Cancel the pending .then() and free the WASM memory.
+      cancelled = true;
       // Free the WASM memory and clear refs on unmount or sessionId change.
       if (detectorRef.current && detectorSessionRef.current === sessionId) {
         try {
