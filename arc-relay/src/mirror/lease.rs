@@ -33,8 +33,11 @@ pub enum GrabOutcome {
 #[derive(Debug)]
 pub enum ApproveOutcome {
     Granted { driver: DriverInfo, request_id: String },
+    /// The request_id was not found in the pending map.  The current data
+    /// model does not distinguish "already resolved" from "never existed"
+    /// (pending requests are removed, not tombstoned); both are benign no-ops
+    /// from the caller's perspective.
     AlreadyResolved,
-    UnknownRequest,
     /// Returned when `by_user` is not the session owner.
     /// Distinct from `AlreadyResolved` so callers can emit a 403
     /// rather than silently treating it as a benign race.

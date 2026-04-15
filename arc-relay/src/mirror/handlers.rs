@@ -224,8 +224,11 @@ pub async fn handle_subscribe(
 #[derive(thiserror::Error, Debug)]
 pub enum ControlError {
     /// The session is not registered in the mirror registry — either the host
-    /// has never connected or the session has already been cleaned up.  The
-    /// caller should silently ignore the frame (no send back to the watcher).
+    /// has never connected or the session has already been cleaned up.  Also
+    /// returned when the client-supplied session_id string fails to parse as a
+    /// `SessionId` (an unparseable ID semantically equates to a non-existent
+    /// session).  The caller should silently ignore the frame (no send back to
+    /// the watcher).
     #[error("session not found in mirror registry")]
     SessionNotFound,
 }
@@ -251,6 +254,13 @@ pub async fn handle_request_control(
     device_label: &str,
     session_id: &str,
 ) -> Result<(), ControlError> {
+    // Parse the session_id string up-front.  An unparseable string is treated
+    // as SessionNotFound rather than fabricating a phantom SessionId that
+    // would broadcast to nobody and mask a routing bug.
+    let sid: SessionId = session_id
+        .parse()
+        .map_err(|_| ControlError::SessionNotFound)?;
+
     let mirror = state
         .mirror_registry
         .get(session_id)
@@ -261,7 +271,6 @@ pub async fn handle_request_control(
 
     match m.lease.try_grab(user_id, device_label.to_string()) {
         GrabOutcome::Granted { driver } => {
-            let sid: SessionId = session_id.parse().unwrap_or_else(|_| SessionId::new());
             m.fanout.broadcast(
                 session_id,
                 ArcToClient::LeaseChanged {
@@ -277,7 +286,6 @@ pub async fn handle_request_control(
         }
         GrabOutcome::Pending { request_id } => {
             let owner = m.lease.owner_user_id();
-            let sid: SessionId = session_id.parse().unwrap_or_else(|_| SessionId::new());
             m.fanout.broadcast_to_owner(
                 session_id,
                 owner,
@@ -315,9 +323,11 @@ pub async fn handle_request_control(
 ///
 /// Outcome variants:
 /// - `Granted` → broadcast `LeaseChanged` to all watchers.
-/// - `AlreadyResolved` → log at debug (benign race: request timed out or was
-///   already resolved by another path).
-/// - `UnknownRequest` → log at debug (client may have sent a stale request_id).
+/// - `AlreadyResolved` → log at debug.  `LeaseManager::approve` returns this
+///   for both "benign race, already resolved" and "unknown request_id" — the
+///   current data model can't distinguish the two (pending requests are
+///   removed, not tombstoned).  Either way the client-visible effect is the
+///   same: a no-op.
 /// - `Unauthorized` → log at warn (a non-owner tried to approve; treat as a
 ///   client bug rather than closing the connection, since the watcher loop is
 ///   shared with legitimate control frames).
@@ -327,6 +337,10 @@ pub async fn handle_approve_control(
     request_id: &str,
     session_id: &str,
 ) -> Result<(), ControlError> {
+    let sid: SessionId = session_id
+        .parse()
+        .map_err(|_| ControlError::SessionNotFound)?;
+
     let mirror = state
         .mirror_registry
         .get(session_id)
@@ -337,7 +351,6 @@ pub async fn handle_approve_control(
 
     match m.lease.approve(request_id, approver_user_id) {
         ApproveOutcome::Granted { driver, .. } => {
-            let sid: SessionId = session_id.parse().unwrap_or_else(|_| SessionId::new());
             m.fanout.broadcast(
                 session_id,
                 ArcToClient::LeaseChanged {
@@ -357,15 +370,7 @@ pub async fn handle_approve_control(
                 approver = %approver_user_id,
                 session_id = %session_id,
                 request_id = %request_id,
-                "approve: request already resolved (benign race)"
-            );
-        }
-        ApproveOutcome::UnknownRequest => {
-            tracing::debug!(
-                approver = %approver_user_id,
-                session_id = %session_id,
-                request_id = %request_id,
-                "approve: unknown request_id (stale client frame?)"
+                "approve: request already resolved or unknown (no-op)"
             );
         }
         ApproveOutcome::Unauthorized => {
@@ -386,8 +391,8 @@ pub async fn handle_approve_control(
 /// Denies the pending request identified by `request_id`. No broadcast is
 /// emitted — the requesting watcher will time out client-side.
 ///
-/// A non-owner caller is a no-op (`lease.deny` returns `false`) and logged
-/// at debug level (same as `UnknownRequest` — the frame may be stale).
+/// A non-owner caller (or a stale/unknown request_id) is a no-op
+/// (`lease.deny` returns `false`) and logged at debug level.
 pub async fn handle_deny_control(
     state: &AppState,
     denier_user_id: Uuid,
@@ -434,6 +439,10 @@ pub async fn handle_revoke_control(
     revoker_user_id: Uuid,
     session_id: &str,
 ) -> Result<(), ControlError> {
+    let sid: SessionId = session_id
+        .parse()
+        .map_err(|_| ControlError::SessionNotFound)?;
+
     let mirror = state
         .mirror_registry
         .get(session_id)
@@ -454,7 +463,6 @@ pub async fn handle_revoke_control(
 
     let had_driver = m.lease.revoke(revoker_user_id);
     if had_driver {
-        let sid: SessionId = session_id.parse().unwrap_or_else(|_| SessionId::new());
         m.fanout.broadcast(
             session_id,
             ArcToClient::LeaseChanged {
@@ -511,6 +519,10 @@ pub async fn handle_session_input(
     session_id: &str,
     bytes: Vec<u8>,
 ) -> Result<(), ControlError> {
+    let sid: SessionId = session_id
+        .parse()
+        .map_err(|_| ControlError::SessionNotFound)?;
+
     let mirror = state
         .mirror_registry
         .get(session_id)
@@ -529,7 +541,6 @@ pub async fn handle_session_input(
         // Attempt implicit reclaim (owner-class only).
         match m.lease.try_implicit_reclaim(user_id, device_label.to_string()) {
             GrabOutcome::Granted { driver } => {
-                let sid: SessionId = session_id.parse().unwrap_or_else(|_| SessionId::new());
                 m.fanout.broadcast(
                     session_id,
                     ArcToClient::LeaseChanged {
@@ -562,7 +573,6 @@ pub async fn handle_session_input(
     }
 
     // Forward to host via host_input_tx.
-    let sid: SessionId = session_id.parse().unwrap_or_else(|_| SessionId::new());
     if let Some(host_tx) = &m.host_input_tx {
         let _ = host_tx.try_send(ArcToClient::HostInput {
             session_id: sid,

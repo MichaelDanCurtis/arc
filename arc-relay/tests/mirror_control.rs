@@ -160,7 +160,6 @@ async fn non_owner_request_approved_by_owner() {
         .await;
 
     // Alice (owner) should receive ControlRequested; Bob should NOT receive it.
-    // We use a timeout on Bob to assert he doesn't get it.
     let ctrl_req = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         async { loop {
@@ -180,6 +179,25 @@ async fn non_owner_request_approved_by_owner() {
         }
         other => panic!("expected ControlRequested, got: {other:?}"),
     };
+
+    // Negative assertion: Bob (non-owner) must NOT receive ControlRequested.
+    // broadcast_to_owner should have filtered his sink out.  We give a short
+    // budget — by the time Alice has received + processed her frame, any
+    // mis-routed frame to Bob would already be queued.
+    let bob_leak = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        async { loop {
+            let f = bob_ws.recv().await;
+            if matches!(f, ArcToClient::ControlRequested { .. }) {
+                return f;
+            }
+        }},
+    )
+    .await;
+    assert!(
+        bob_leak.is_err(),
+        "Bob (non-owner) must not receive ControlRequested — broadcast_to_owner leak: {bob_leak:?}"
+    );
 
     // Alice approves.
     alice_ws
