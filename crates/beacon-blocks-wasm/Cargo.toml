@@ -1,0 +1,30 @@
+[package]
+name = "beacon-blocks-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+console_error_panic_hook = ["dep:console_error_panic_hook"]
+
+[dependencies]
+beacon-blocks = { path = "../beacon-blocks" }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+tracing = { workspace = true, default-features = false, features = ["log"] }
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# getrandom v0.3 requires wasm_js feature for wasm32-unknown-unknown.
+# beacon-model → ulid → rand → rand_core → getrandom pulls this in.
+# Declaring it here with the feature enabled fixes the build for WASM targets
+# without affecting native consumers of beacon-blocks.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
