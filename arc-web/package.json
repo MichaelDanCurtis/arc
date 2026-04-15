@@ -6,7 +6,7 @@
     "wasm:build": "wasm-pack build ../beacon-core/crates/beacon-blocks-wasm --target bundler --out-dir \"$(pwd)/src/wasm/beacon-blocks\" --dev",
     "wasm:build:release": "wasm-pack build ../beacon-core/crates/beacon-blocks-wasm --target bundler --out-dir \"$(pwd)/src/wasm/beacon-blocks\"",
     "prebuild": "npm run wasm:build:release",
-    "predev": "npm run wasm:build",
+    "predev": "[ -f src/wasm/beacon-blocks/beacon_blocks_wasm_bg.wasm ] || npm run wasm:build",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",

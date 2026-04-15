@@ -3,8 +3,8 @@
 # .wasm/.js/.d.ts files are handed off to the Next.js builder stage.
 # The Rust toolchain never touches the runtime image.
 FROM rust:1-bookworm AS wasm-builder
-# Install wasm-pack (pinned to the version used locally; bump if needed)
-RUN curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+# Install wasm-pack pinned to 0.14.0 (current stable on crates.io as of 2026-04-15)
+RUN cargo install wasm-pack --version 0.14.0 --locked
 # Copy only the parts of the workspace that beacon-blocks-wasm needs.
 # We copy the whole beacon-core tree so workspace Cargo.toml resolution works.
 WORKDIR /workspace
