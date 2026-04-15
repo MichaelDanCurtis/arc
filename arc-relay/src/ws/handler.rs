@@ -63,6 +63,19 @@ pub async fn ws_handler(
 /// Close code sent when the access token has expired mid-connection.
 pub const CLOSE_TOKEN_EXPIRED: u16 = 4001;
 
+/// How often the connection loops re-decode the bearer token to detect expiry.
+///
+/// Production: 30 s is well under the 15-min access-token lifetime, so an
+/// expiring token is detected promptly without burning CPU.
+///
+/// The `fast-revalidate` Cargo feature drops this to 1 s so that integration
+/// tests (which mint 2-second tokens and sleep 4 s) finish quickly.
+#[cfg(not(feature = "fast-revalidate"))]
+pub const TOKEN_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(feature = "fast-revalidate")]
+pub const TOKEN_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Send a WebSocket close frame with code 4001 (token expired).
 pub async fn close_with_expired(socket: &mut axum::extract::ws::WebSocket) {
     use axum::extract::ws::{CloseFrame, Message};
@@ -94,7 +107,7 @@ async fn handle_connection(
     use axum::extract::ws::Message;
     use beacon_proto::codec::decode;
     use beacon_proto::envelope::ClientToArc;
-    use tokio::time::{interval, Duration};
+    use tokio::time::interval;
 
     let jwt_secret = state.config.jwt_secret.clone();
 
@@ -106,7 +119,7 @@ async fn handle_connection(
     }
 
     // Wait for the first binary frame, with a periodic expiry re-check.
-    let mut expiry_tick = interval(Duration::from_secs(1));
+    let mut expiry_tick = interval(TOKEN_REVALIDATE_INTERVAL);
     expiry_tick.tick().await; // consume the immediate first tick
 
     let first_msg = loop {

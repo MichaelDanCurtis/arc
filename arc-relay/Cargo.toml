@@ -35,7 +35,13 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
 
+[features]
+# Use a 1-second revalidation tick so integration tests finish in ~4s.
+# Production builds leave this unset and get the 30-second interval.
+fast-revalidate = []
+
 [dev-dependencies]
+arc-relay = { path = ".", features = ["fast-revalidate"] }
 pretty_assertions = "1"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }

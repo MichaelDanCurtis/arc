@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio::time::{interval, Duration};
+use tokio::time::interval;
 use uuid::Uuid;
 
-use crate::ws::handler::{close_with_expired, token_is_expired};
+use crate::ws::handler::{close_with_expired, token_is_expired, TOKEN_REVALIDATE_INTERVAL};
 use crate::{models::block::get_blocks_for_session, relay::router::RelayRouter};
 
 /// Handle a client (viewer) WebSocket connection.
@@ -141,9 +141,9 @@ pub async fn handle_client(
     }
 
     // ── 8. Main loop: live relay + client input ───────────────────────────────
-    // Periodic token re-validation: check every second. JWT decode is cheap
-    // (HMAC-SHA256 + JSON parse) so a 1-second interval imposes no measurable load.
-    let mut expiry_tick = interval(Duration::from_secs(1));
+    // Periodic token re-validation. Interval is 30 s in production (well under
+    // the 15-min access-token lifetime) and 1 s when built with fast-revalidate.
+    let mut expiry_tick = interval(TOKEN_REVALIDATE_INTERVAL);
     expiry_tick.tick().await; // consume the immediate first tick
 
     loop {
