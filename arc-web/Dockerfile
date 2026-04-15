@@ -5,10 +5,71 @@
 FROM rust:1-bookworm AS wasm-builder
 # Install wasm-pack pinned to 0.14.0 (current stable on crates.io as of 2026-04-15)
 RUN cargo install wasm-pack --version 0.14.0 --locked
-# Copy only the parts of the workspace that beacon-blocks-wasm needs.
-# We copy the whole beacon-core tree so workspace Cargo.toml resolution works.
+
 WORKDIR /workspace
-COPY beacon-core/ beacon-core/
+
+# ── Pass 1: dependency-fetch layer ─────────────────────────────────────────
+# Copy workspace manifest + lock so `cargo fetch` can resolve the full dep
+# graph and download all third-party crates.  Only the three first-party
+# crates that beacon-blocks-wasm actually needs get real Cargo.toml files;
+# the remaining 11 workspace members are represented by stub Cargo.toml +
+# src/lib.rs so the workspace resolver is satisfied without pulling in any
+# of their source.  This layer is only invalidated by Cargo.toml / Cargo.lock
+# changes — NOT by edits to src/ files in unrelated crates.
+COPY beacon-core/Cargo.toml beacon-core/Cargo.toml
+COPY beacon-core/Cargo.lock beacon-core/Cargo.lock
+
+# Real Cargo.toml files for the three crates in the build path.
+COPY beacon-core/crates/beacon-blocks-wasm/Cargo.toml \
+     beacon-core/crates/beacon-blocks-wasm/Cargo.toml
+COPY beacon-core/crates/beacon-blocks/Cargo.toml \
+     beacon-core/crates/beacon-blocks/Cargo.toml
+COPY beacon-core/crates/beacon-model/Cargo.toml \
+     beacon-core/crates/beacon-model/Cargo.toml
+
+# Stub Cargo.toml files for the remaining 11 workspace members.
+# Each crate just needs a package table that satisfies the workspace resolver.
+RUN for crate in \
+      beacon-proto \
+      beacon-pty \
+      beacon-vt \
+      beacon-shadow \
+      beacon-ffi \
+      beacon-tests \
+      beacon-net \
+      beacon-session \
+      beacon-hostd \
+      beacon-complete \
+      beacon-ai \
+    ; do \
+      mkdir -p beacon-core/crates/${crate}/src && \
+      printf '[package]\nname = "%s"\nversion.workspace = true\nedition.workspace = true\n' "${crate}" \
+        > beacon-core/crates/${crate}/Cargo.toml && \
+      echo "// stub" > beacon-core/crates/${crate}/src/lib.rs ; \
+    done
+
+# Stub src/lib.rs for the three real crates so `cargo fetch` can complete
+# without their actual source being present yet.
+RUN for crate in beacon-blocks-wasm beacon-blocks beacon-model; do \
+      mkdir -p beacon-core/crates/${crate}/src && \
+      echo "// stub" > beacon-core/crates/${crate}/src/lib.rs ; \
+    done
+
+# Copy the rust-toolchain so the exact channel is resolved before fetching.
+COPY beacon-core/rust-toolchain.toml beacon-core/rust-toolchain.toml
+
+# Add the wasm32 target and fetch all third-party dependencies.
+# This layer is cached as long as Cargo.toml / Cargo.lock are unchanged.
+RUN rustup target add wasm32-unknown-unknown
+RUN cargo fetch --manifest-path beacon-core/Cargo.toml
+
+# ── Pass 2: real source for beacon-blocks* + beacon-model ──────────────────
+# Overwrite the stubs with actual source.  Only changes to these three crates
+# (or to Cargo.toml / Cargo.lock) will invalidate the layers below.
+COPY beacon-core/crates/beacon-blocks/src     beacon-core/crates/beacon-blocks/src
+COPY beacon-core/crates/beacon-blocks-wasm/src beacon-core/crates/beacon-blocks-wasm/src
+COPY beacon-core/crates/beacon-model/src      beacon-core/crates/beacon-model/src
+
 RUN wasm-pack build \
       beacon-core/crates/beacon-blocks-wasm \
       --target bundler \
