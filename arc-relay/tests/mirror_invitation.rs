@@ -2,7 +2,7 @@
 //!
 //! # Requirements
 //! - Set DATABASE_URL to a Postgres with CREATEDB privilege, e.g.:
-//!     export DATABASE_URL=postgres://arc:arc@localhost:5432/arc
+//!   `export DATABASE_URL=postgres://arc:arc@localhost:5432/arc`
 //! - The dev docker-compose stack (`docker compose -f arc-relay/docker-compose.yml up postgres -d`)
 //!   gives the `arc` user superuser rights, so CREATEDB works out of the box.
 //! - `#[sqlx::test]` creates a fresh per-test database, runs `./migrations`,

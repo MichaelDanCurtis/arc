@@ -132,7 +132,7 @@ async fn handle_connection(
     state: AppState,
 ) {
     use axum::extract::ws::Message;
-    use beacon_proto::codec::decode;
+    use beacon_proto::codec::{decode, encode};
     use beacon_proto::envelope::ClientToArc;
     use tokio::time::{interval, MissedTickBehavior};
 
@@ -286,8 +286,6 @@ async fn handle_connection(
             // Forward frames from the fanout channel to the WebSocket.
             // For Task 2.8, break on any inbound client message or socket close
             // (control handling is Task 2.10+).
-            use axum::extract::ws::Message;
-            use beacon_proto::codec::encode;
             loop {
                 tokio::select! {
                     frame = sink_rx.recv() => {

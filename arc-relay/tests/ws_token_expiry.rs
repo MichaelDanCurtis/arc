@@ -35,8 +35,7 @@ async fn spawn_relay() -> std::net::SocketAddr {
     let pool =
         sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc").expect("lazy pool");
 
-    let mut config = ArcConfig::default();
-    config.jwt_secret = JWT_SECRET.to_string();
+    let config = ArcConfig { jwt_secret: JWT_SECRET.to_string(), ..Default::default() };
 
     let state = AppState {
         pool: pool.clone(),

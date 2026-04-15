@@ -74,7 +74,7 @@ async fn watcher_subscribes_and_receives_presence_changed() {
 #[tokio::test]
 #[ignore]
 async fn two_watchers_both_see_presence_changed() {
-    let relay = match try_spawn_relay().await {
+    let _relay = match try_spawn_relay().await {
         Some(r) => r,
         None => {
             eprintln!("Skipping: DATABASE_URL not set or DB unreachable");
@@ -82,37 +82,13 @@ async fn two_watchers_both_see_presence_changed() {
         }
     };
 
-    let alice = create_user(&relay, &format!("alice2_{}@test.invalid", uuid::Uuid::new_v4())).await;
-    let session_id = host_register_session(&relay, &alice, "Local").await;
-    let sid: beacon_model::SessionId = session_id.parse().expect("parse SessionId");
-
-    // Alice subscribes first.
-    let mut alice_conn = connect_watcher(&relay, &alice, "Mac").await;
-    alice_conn
-        .send(&beacon_proto::envelope::ClientToArc::SubscribeSession {
-            session_id: sid,
-            since_seq: None,
-        })
-        .await;
-
-    // Alice gets PresenceChanged with 1 watcher.
-    let f1 = alice_conn.recv().await;
-    assert!(
-        matches!(f1, ArcToClient::PresenceChanged { .. }),
-        "alice: expected PresenceChanged, got {f1:?}"
-    );
-    if let ArcToClient::PresenceChanged { watchers, .. } = &f1 {
-        assert_eq!(watchers.len(), 1);
-    }
-
-    // Insert a session_grant for bob directly via the DB so he can subscribe.
-    // (Grant API is not yet wired in Task 2.8.)
-    let bob = create_user(&relay, &format!("bob2_{}@test.invalid", uuid::Uuid::new_v4())).await;
-
-    // We need to insert a grant via sqlx — easiest is to use the DB directly.
-    // Since we don't have a grant REST API yet, skip the two-watcher part for now.
-    // This test documents the intent; the grant-insert path will be added in Task 2.10.
-    let _ = bob;
-    let _ = alice_conn;
-    // Test passes — intent documented, deferred to Task 2.10.
+    // Two-watcher presence assertion is deferred to Task 2.10 when the wire
+    // format supports multi-watcher PresenceChanged validation and the grant
+    // REST API is available to give Bob subscribe permission.
+    //
+    // The #[ignore] attribute above keeps this test from running in CI.
+    // This todo!() ensures that if someone removes #[ignore] without finishing
+    // the implementation, the test will loud-fail immediately rather than
+    // passing silently with zero assertions.
+    todo!("two-watcher presence assertion deferred to Task 2.10 when wire format supports multi-watcher PresenceChanged validation");
 }

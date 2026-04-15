@@ -178,7 +178,7 @@ mod tests {
             replay: false,
         });
         // Closed sink pruned; empty-list cleanup drops the session entry.
-        assert!(f.sinks.get(&sid_key).is_none());
+        assert!(!f.sinks.contains_key(&sid_key));
     }
 
     #[tokio::test]
@@ -194,6 +194,6 @@ mod tests {
             tx,
         });
         f.remove(&sid_key, uid, "only");
-        assert!(f.sinks.get(&sid_key).is_none());
+        assert!(!f.sinks.contains_key(&sid_key));
     }
 }

@@ -57,8 +57,7 @@ pub async fn try_spawn_relay() -> Option<Relay> {
     sqlx::migrate!("./migrations").run(&pool).await.ok()?;
 
     let jwt_secret = "test-secret-that-is-long-enough-32x".to_string();
-    let mut config = ArcConfig::default();
-    config.jwt_secret = jwt_secret.clone();
+    let config = ArcConfig { jwt_secret: jwt_secret.clone(), ..Default::default() };
 
     let state = AppState {
         pool: pool.clone(),
@@ -131,6 +130,17 @@ pub async fn create_user(relay: &Relay, email: &str) -> UserCreds {
         .await
         .expect("read response");
     let response_str = String::from_utf8_lossy(&response);
+
+    // NOTE: assumes Content-Length response (Axum JSON does this). If a future
+    // endpoint returns chunked, rewrite with reqwest as a dev-dep.
+    //
+    // Fail fast if the server ever sends chunked transfer encoding — the naive
+    // "\r\n\r\n" split will produce garbled hex-length prefixes as "JSON" and
+    // produce confusing downstream panics rather than a clear error here.
+    debug_assert!(
+        !response_str.to_ascii_lowercase().contains("transfer-encoding: chunked"),
+        "raw HTTP parser cannot handle chunked responses; rewrite with reqwest if this fires"
+    );
 
     // Parse the JSON body after the blank line.
     let json_start = response_str.find("\r\n\r\n").expect("HTTP header end") + 4;

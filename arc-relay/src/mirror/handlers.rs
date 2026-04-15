@@ -20,39 +20,24 @@ use crate::mirror::invitation::SubscribePermission;
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during a `SubscribeSession` handshake.
-#[derive(Debug)]
+///
+/// Uses `thiserror` to derive `Display`, `Error`, and `From` impls rather than
+/// hand-rolling them, keeping the variant list as the single source of truth.
+#[derive(thiserror::Error, Debug)]
 pub enum SubscribeError {
     /// The user does not have permission to subscribe to this session.
+    #[error("permission denied")]
     Denied,
+
     /// A database query failed.
-    Db(sqlx::Error),
-    /// The session does not exist.
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    /// The session does not exist (or the client-supplied session_id string
+    /// failed to parse as a valid `SessionId` — an unparseable ID semantically
+    /// equates to a non-existent session from the server's perspective).
+    #[error("session not found")]
     SessionNotFound,
-}
-
-impl From<sqlx::Error> for SubscribeError {
-    fn from(e: sqlx::Error) -> Self {
-        SubscribeError::Db(e)
-    }
-}
-
-impl std::fmt::Display for SubscribeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SubscribeError::Denied => write!(f, "permission denied"),
-            SubscribeError::Db(e) => write!(f, "database error: {e}"),
-            SubscribeError::SessionNotFound => write!(f, "session not found"),
-        }
-    }
-}
-
-impl std::error::Error for SubscribeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SubscribeError::Db(e) => Some(e),
-            _ => None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,63 +107,90 @@ pub async fn handle_subscribe(
         .get_or_init(session_id, owner, eligible)
         .await;
 
-    let mut m = mirror.lock().await;
+    // ------------------------------------------------------------------
+    // 4. Replay scrollback — extract all data then drop the lock before
+    //    any .send().await calls to avoid holding a contended per-session
+    //    mutex across unbounded await points.
+    // ------------------------------------------------------------------
 
-    // ------------------------------------------------------------------
-    // 4. Replay scrollback
-    // ------------------------------------------------------------------
     // Parse the session_id string into the SessionId newtype used in wire frames.
-    let sid: SessionId = session_id.parse().unwrap_or_else(|_| SessionId::new());
+    // An unparseable string is treated as SessionNotFound rather than fabricating
+    // a phantom UUID — the client sent a malformed ID which semantically means
+    // "the session doesn't exist".
+    let sid: SessionId = session_id
+        .parse()
+        .map_err(|_| SubscribeError::SessionNotFound)?;
 
     let start = since_seq.unwrap_or(0);
-    if since_seq.is_some() && m.scrollback.out_of_range(start) {
+
+    let (out_of_range_flag, last_seq, replay_chunks) = {
+        let m = mirror.lock().await;
+
+        let out_of_range = since_seq.is_some() && m.scrollback.out_of_range(start);
         let last_seq = m.scrollback.next_seq().saturating_sub(1);
+
+        // Collect (seq, bytes) pairs while holding the lock.
+        // ScrollbackEntry has `at: Instant` which is !Clone, so we extract fields.
+        // When out-of-range, skip collection — we will send SessionDiscontinuity only.
+        let chunks: Vec<(u64, Vec<u8>)> = if out_of_range {
+            Vec::new()
+        } else {
+            m.scrollback
+                .replay_since(start)
+                .map(|e| (e.seq, e.bytes.clone()))
+                .collect()
+        };
+
+        (out_of_range, last_seq, chunks)
+        // lock guard `m` is dropped here
+    };
+
+    // All sink_tx.send calls happen WITHOUT holding the mirror lock.
+    if out_of_range_flag {
+        // When the requested sequence is out of scrollback range, send a
+        // discontinuity marker and skip replay — do NOT send both.
         let _ = sink_tx
             .send(ArcToClient::SessionDiscontinuity {
                 session_id: sid,
                 last_seq,
             })
             .await;
-    }
-
-    // Collect (seq, bytes) pairs while holding the lock, then send outside.
-    // ScrollbackEntry has `at: Instant` which is !Clone, so we extract fields.
-    let replay_chunks: Vec<(u64, Vec<u8>)> = m
-        .scrollback
-        .replay_since(start)
-        .map(|e| (e.seq, e.bytes.clone()))
-        .collect();
-
-    for (seq, bytes) in replay_chunks {
-        let _ = sink_tx
-            .send(ArcToClient::SessionOutput {
-                session_id: sid,
-                bytes,
-                seq,
-                replay: true,
-            })
-            .await;
+    } else {
+        for (seq, bytes) in replay_chunks {
+            let _ = sink_tx
+                .send(ArcToClient::SessionOutput {
+                    session_id: sid,
+                    bytes,
+                    seq,
+                    replay: true,
+                })
+                .await;
+        }
     }
 
     // ------------------------------------------------------------------
-    // 5. Register sink + presence
+    // 5. Register sink + presence — re-acquire lock for fanout/presence
+    //    registration, then release before the final broadcast.
     // ------------------------------------------------------------------
-    m.fanout.add(
-        session_id,
-        WatcherSink {
-            user_id,
-            device_label: device_label.to_string(),
-            tx: sink_tx,
-        },
-    );
-    m.presence
-        .add(session_id, user_id, device_label.to_string(), can_drive);
+    let snapshot = {
+        let mut m = mirror.lock().await;
+        m.fanout.add(
+            session_id,
+            WatcherSink {
+                user_id,
+                device_label: device_label.to_string(),
+                tx: sink_tx,
+            },
+        );
+        m.presence
+            .add(session_id, user_id, device_label.to_string(), can_drive);
 
-    let snapshot = m.presence.snapshot(session_id);
-    drop(m);
+        m.presence.snapshot(session_id)
+        // lock guard `m` is dropped here
+    };
 
     // ------------------------------------------------------------------
-    // 6. Broadcast PresenceChanged
+    // 6. Broadcast PresenceChanged — lock NOT held during broadcast
     // ------------------------------------------------------------------
     if let Some(mirror) = state.mirror_registry.get(session_id).await {
         let mut m = mirror.lock().await;
