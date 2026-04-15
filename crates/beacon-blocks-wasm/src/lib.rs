@@ -83,7 +83,7 @@ pub enum BlockEventJs {
 ///
 /// ### Mode-locking
 /// The first time any OSC 133 structural event is observed (PromptStart,
-/// CommandStart, OutputStart, or CommandEnd) `mode_locked` is set to `true`
+/// CommandStart, OutputStart, or CommandEnd) `osc133_seen` is set to `true`
 /// and heuristic emission is suppressed for the lifetime of this detector
 /// instance.
 #[wasm_bindgen]
@@ -93,7 +93,7 @@ pub struct WasmBlockDetector {
     /// Line-based heuristic fallback detector.
     heuristic_detector: HeuristicPromptDetector,
     /// `true` once the first OSC 133 structural event has been seen.
-    mode_locked: bool,
+    osc133_seen: bool,
     /// `true` while a heuristic-synthesized block is open (i.e. we emitted
     /// a heuristic `PromptStart` but not yet a matching `CommandEnd`).
     heuristic_block_open: bool,
@@ -107,7 +107,7 @@ impl WasmBlockDetector {
         WasmBlockDetector {
             block_detector: BlockDetector::new(),
             heuristic_detector: HeuristicPromptDetector::new(),
-            mode_locked: false,
+            osc133_seen: false,
             heuristic_block_open: false,
         }
     }
@@ -127,6 +127,10 @@ impl WasmBlockDetector {
     /// Core per-byte processing, returning native `Vec<BlockEventJs>`.
     /// Extracted from the `#[wasm_bindgen]` impl so the non-wasm unit test
     /// can call it directly without going through `JsValue`.
+    ///
+    /// Do NOT make this `pub` — the `#[wasm_bindgen]` `feed()` is the
+    /// supported entry point. `feed_inner` is an internal testability
+    /// shim for the native unit test only.
     pub(crate) fn feed_inner(&mut self, bytes: &[u8]) -> Vec<BlockEventJs> {
         let mut out: Vec<BlockEventJs> = Vec::new();
 
@@ -139,10 +143,7 @@ impl WasmBlockDetector {
             for ev in osc_events {
                 match ev {
                     // Structural OSC 133 events lock mode.
-                    BlockEvent::PromptStart
-                    | BlockEvent::CommandStart
-                    | BlockEvent::OutputStart
-                    | BlockEvent::CommandEnd { .. } => {
+                    BlockEvent::PromptStart => {
                         // If a heuristic block was open, close it cleanly
                         // before switching to authoritative OSC 133 mode.
                         if self.heuristic_block_open {
@@ -152,13 +153,51 @@ impl WasmBlockDetector {
                             });
                             self.heuristic_block_open = false;
                         }
-
-                        // From this point on, heuristic emission is
-                        // permanently suppressed.
-                        self.mode_locked = true;
-
-                        // Translate and emit the OSC 133 event.
-                        out.push(translate_osc_event(ev));
+                        self.osc133_seen = true;
+                        out.push(BlockEventJs::PromptStart {
+                            mode: DetectorMode::Osc133,
+                        });
+                    }
+                    BlockEvent::CommandStart => {
+                        if self.heuristic_block_open {
+                            out.push(BlockEventJs::CommandEnd {
+                                mode: DetectorMode::Heuristic,
+                                exit_code: None,
+                            });
+                            self.heuristic_block_open = false;
+                        }
+                        self.osc133_seen = true;
+                        out.push(BlockEventJs::CommandStart {
+                            mode: DetectorMode::Osc133,
+                            command: None,
+                        });
+                    }
+                    BlockEvent::OutputStart => {
+                        if self.heuristic_block_open {
+                            out.push(BlockEventJs::CommandEnd {
+                                mode: DetectorMode::Heuristic,
+                                exit_code: None,
+                            });
+                            self.heuristic_block_open = false;
+                        }
+                        self.osc133_seen = true;
+                        out.push(BlockEventJs::OutputStart {
+                            mode: DetectorMode::Osc133,
+                        });
+                    }
+                    BlockEvent::CommandEnd { exit_code } => {
+                        if self.heuristic_block_open {
+                            out.push(BlockEventJs::CommandEnd {
+                                mode: DetectorMode::Heuristic,
+                                exit_code: None,
+                            });
+                            self.heuristic_block_open = false;
+                        }
+                        self.osc133_seen = true;
+                        out.push(BlockEventJs::CommandEnd {
+                            mode: DetectorMode::Osc133,
+                            exit_code,
+                        });
                     }
 
                     // Output bytes are mode-agnostic — pass through always.
@@ -172,11 +211,11 @@ impl WasmBlockDetector {
             // Step 2: Feed the SAME byte into the heuristic detector.
             // The heuristic is always fed (so its line buffer stays warm in
             // case we ever want diagnostics), but emission is gated on
-            // `mode_locked`.
+            // `osc133_seen`.
             // ----------------------------------------------------------------
             let heuristic_fired = self.heuristic_detector.feed(byte);
 
-            if heuristic_fired && !self.mode_locked {
+            if heuristic_fired && !self.osc133_seen {
                 // Close any existing heuristic block before opening a new one.
                 if self.heuristic_block_open {
                     out.push(BlockEventJs::CommandEnd {
@@ -212,37 +251,6 @@ impl Default for WasmBlockDetector {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Translate a `BlockEvent` (OSC 133) to its `BlockEventJs` counterpart.
-///
-/// # Panics
-/// Panics if called with `BlockEvent::OutputByte` — callers must handle
-/// output bytes separately.
-fn translate_osc_event(ev: BlockEvent) -> BlockEventJs {
-    match ev {
-        BlockEvent::PromptStart => BlockEventJs::PromptStart {
-            mode: DetectorMode::Osc133,
-        },
-        BlockEvent::CommandStart => BlockEventJs::CommandStart {
-            mode: DetectorMode::Osc133,
-            command: None,
-        },
-        BlockEvent::OutputStart => BlockEventJs::OutputStart {
-            mode: DetectorMode::Osc133,
-        },
-        BlockEvent::CommandEnd { exit_code } => BlockEventJs::CommandEnd {
-            mode: DetectorMode::Osc133,
-            exit_code,
-        },
-        BlockEvent::OutputByte(_) => {
-            unreachable!("OutputByte must be handled by the caller, not translate_osc_event")
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Non-wasm unit tests (fast signal during development without wasm-pack)
 // ---------------------------------------------------------------------------
 
@@ -268,7 +276,7 @@ mod tests {
             events
         );
         assert!(det.heuristic_block_open, "heuristic block should be open");
-        assert!(!det.mode_locked, "should not be locked yet");
+        assert!(!det.osc133_seen, "should not be locked yet");
 
         // ---- Phase 2: first OSC 133 PromptStart ----
         // Should emit a synthetic heuristic CommandEnd, then OSC 133 PromptStart.
@@ -310,35 +318,44 @@ mod tests {
             "synthetic heuristic CommandEnd must precede OSC 133 PromptStart"
         );
 
-        assert!(det.mode_locked, "mode should be locked after first OSC 133");
+        assert!(det.osc133_seen, "mode should be locked after first OSC 133");
         assert!(!det.heuristic_block_open, "heuristic block should be closed");
 
-        // ---- Phase 3: bytes the heuristic would normally fire on ----
-        // Mode is locked → ZERO heuristic events.
-        let events3 = det.feed_inner(b"$ \n");
-        let any_heuristic = events3.iter().any(|e| {
-            matches!(
-                e,
-                BlockEventJs::PromptStart {
-                    mode: DetectorMode::Heuristic,
-                }
-                | BlockEventJs::CommandStart {
-                    mode: DetectorMode::Heuristic,
-                    ..
-                }
-                | BlockEventJs::OutputStart {
-                    mode: DetectorMode::Heuristic,
-                }
-                | BlockEventJs::CommandEnd {
-                    mode: DetectorMode::Heuristic,
-                    ..
-                }
-            )
-        });
-        assert!(
-            !any_heuristic,
-            "ZERO heuristic events expected after mode lock; got {:?}",
-            events3
-        );
+        // ---- Phase 3: multiple heuristic-firing patterns → ZERO heuristic events ----
+        // Mode is locked → heuristic events must never leak for any of these.
+        let heuristic_patterns: &[&[u8]] = &[
+            b"$ \n",
+            b"user@host:~$ \n",
+            b"root# \n",
+            b"PS> \n",
+            b"40% \n",
+        ];
+        for pattern in heuristic_patterns {
+            let events = det.feed_inner(pattern);
+            let any_heuristic = events.iter().any(|e| {
+                matches!(
+                    e,
+                    BlockEventJs::PromptStart {
+                        mode: DetectorMode::Heuristic,
+                    }
+                    | BlockEventJs::CommandStart {
+                        mode: DetectorMode::Heuristic,
+                        ..
+                    }
+                    | BlockEventJs::OutputStart {
+                        mode: DetectorMode::Heuristic,
+                    }
+                    | BlockEventJs::CommandEnd {
+                        mode: DetectorMode::Heuristic,
+                        ..
+                    }
+                )
+            });
+            assert!(
+                !any_heuristic,
+                "heuristic leaked after lock for {:?}",
+                pattern
+            );
+        }
     }
 }

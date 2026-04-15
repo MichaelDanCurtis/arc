@@ -23,10 +23,6 @@ fn feed(det: &mut WasmBlockDetector, bytes: &[u8]) -> Vec<BlockEventJs> {
     serde_wasm_bindgen::from_value(js_val).expect("deserialisation should succeed")
 }
 
-// ---------------------------------------------------------------------------
-// Test a
-// ---------------------------------------------------------------------------
-
 #[wasm_bindgen_test]
 fn osc133_full_sequence_passes_through() {
     let mut det = WasmBlockDetector::new();
@@ -92,10 +88,6 @@ fn osc133_full_sequence_passes_through() {
         out_str
     );
 }
-
-// ---------------------------------------------------------------------------
-// Test b
-// ---------------------------------------------------------------------------
 
 #[wasm_bindgen_test]
 fn heuristic_only_stream_synthesizes_boundaries() {
@@ -169,10 +161,6 @@ fn heuristic_only_stream_synthesizes_boundaries() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Test c
-// ---------------------------------------------------------------------------
-
 #[wasm_bindgen_test]
 fn sticky_mode_locks_after_first_osc133() {
     let mut det = WasmBlockDetector::new();
@@ -220,37 +208,43 @@ fn sticky_mode_locks_after_first_osc133() {
         "synthetic heuristic CommandEnd must precede OSC 133 PromptStart"
     );
 
-    // Phase 3: bytes the heuristic would normally fire on — mode locked → ZERO heuristic events.
-    let events3 = feed(&mut det, b"$ \n");
-    let any_heuristic = events3.iter().any(|e| {
-        matches!(
-            e,
-            BlockEventJs::PromptStart {
-                mode: DetectorMode::Heuristic,
-            }
-            | BlockEventJs::CommandStart {
-                mode: DetectorMode::Heuristic,
-                ..
-            }
-            | BlockEventJs::OutputStart {
-                mode: DetectorMode::Heuristic,
-            }
-            | BlockEventJs::CommandEnd {
-                mode: DetectorMode::Heuristic,
-                ..
-            }
-        )
-    });
-    assert!(
-        !any_heuristic,
-        "ZERO heuristic events expected after mode is locked; got {:?}",
-        events3
-    );
+    // Phase 3: multiple heuristic-firing patterns → ZERO heuristic events.
+    // Mode is locked — heuristic must never leak for any of these.
+    let heuristic_patterns: &[&[u8]] = &[
+        b"$ \n",
+        b"user@host:~$ \n",
+        b"root# \n",
+        b"PS> \n",
+        b"40% \n",
+    ];
+    for pattern in heuristic_patterns {
+        let events = feed(&mut det, pattern);
+        let any_heuristic = events.iter().any(|e| {
+            matches!(
+                e,
+                BlockEventJs::PromptStart {
+                    mode: DetectorMode::Heuristic,
+                }
+                | BlockEventJs::CommandStart {
+                    mode: DetectorMode::Heuristic,
+                    ..
+                }
+                | BlockEventJs::OutputStart {
+                    mode: DetectorMode::Heuristic,
+                }
+                | BlockEventJs::CommandEnd {
+                    mode: DetectorMode::Heuristic,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !any_heuristic,
+            "heuristic leaked after lock for {:?}",
+            pattern
+        );
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Test d
-// ---------------------------------------------------------------------------
 
 #[wasm_bindgen_test]
 fn plain_output_emits_only_outputbytes() {
