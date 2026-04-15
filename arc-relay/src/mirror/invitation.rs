@@ -25,7 +25,7 @@ pub struct InvitationStore {
 }
 
 /// Result of a permission check for subscribing to a session mirror feed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscribePermission {
     /// The requesting user is the session owner — unrestricted access.
     Owner,
@@ -89,6 +89,10 @@ impl InvitationStore {
         // ------------------------------------------------------------------
         // 3. Email grant (case-insensitive)
         // ------------------------------------------------------------------
+        // Note: Postgres three-valued logic means `lower(NULL) = lower($2)`
+        // evaluates to NULL (not TRUE), so rows with `target_email IS NULL`
+        // are silently excluded. No explicit `AND target_email IS NOT NULL`
+        // predicate is needed.
         let email_grant: Option<(bool,)> = sqlx::query_as(
             "SELECT can_request_control FROM session_grants \
              WHERE session_id = $1 AND lower(target_email) = lower($2) AND revoked_at IS NULL",
@@ -105,10 +109,16 @@ impl InvitationStore {
         // ------------------------------------------------------------------
         // 4. Team grant — user must be a member of the granted team
         // ------------------------------------------------------------------
+        // If the user is in multiple granted teams, take the most permissive
+        // grant — grants are purely additive, and a user shouldn't lose drive
+        // privilege because of team iteration order. ORDER BY ... DESC LIMIT 1
+        // makes the result deterministic across calls.
         let team_grant: Option<(bool,)> = sqlx::query_as(
             "SELECT g.can_request_control FROM session_grants g \
              JOIN team_members tm ON tm.team_id = g.target_team_id \
-             WHERE g.session_id = $1 AND tm.user_id = $2 AND g.revoked_at IS NULL",
+             WHERE g.session_id = $1 AND tm.user_id = $2 AND g.revoked_at IS NULL \
+             ORDER BY g.can_request_control DESC \
+             LIMIT 1",
         )
         .bind(session_id)
         .bind(user_id)
