@@ -6,8 +6,10 @@ pub mod scrollback;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
+
+use beacon_proto::envelope::ArcToClient;
 
 use crate::mirror::{
     fanout::Fanout,
@@ -23,7 +25,8 @@ pub struct SessionMirror {
     pub scrollback: ScrollbackRing,
     pub presence: PresenceTracker,
     pub fanout: Fanout,
-    pub host_input_tx: Option<tokio::sync::mpsc::Sender<beacon_proto::envelope::ArcToClient>>,
+    /// Set by the host WebSocket handler once the host connects; `None` until then.
+    pub host_input_tx: Option<mpsc::Sender<ArcToClient>>,
 }
 
 impl SessionMirror {
@@ -50,6 +53,11 @@ impl MirrorRegistry {
     /// with the given owner + eligible set if no entry exists yet. Subsequent
     /// calls for the same session return the same `Arc` regardless of the
     /// `owner`/`eligible` args — they're only consulted on first init.
+    ///
+    /// Callers holding an `Arc<Mutex<SessionMirror>>` from a prior call retain
+    /// that reference across `remove` + re-init — they do NOT see the
+    /// re-initialized session. Release the Arc before re-initing if you need
+    /// that.
     pub async fn get_or_init(
         &self,
         session_id: &str,
