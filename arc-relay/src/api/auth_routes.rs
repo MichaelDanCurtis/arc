@@ -307,6 +307,7 @@ mod tests {
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         let email = format!("register_{}@test.invalid", uuid::Uuid::new_v4());
@@ -339,6 +340,7 @@ mod tests {
             config: config.clone(),
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         // First register a user
@@ -379,6 +381,7 @@ mod tests {
             config: config.clone(),
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         let email = format!("badpw_{}@test.invalid", uuid::Uuid::new_v4());

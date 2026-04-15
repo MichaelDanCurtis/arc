@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: Arc::new(config.clone()),
         relay: relay_router.clone(),
         audit: audit_log,
+        mirror_registry: arc_relay::mirror::MirrorRegistry::default(),
     };
 
     retention::spawn_retention_task(pool.clone());

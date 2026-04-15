@@ -229,6 +229,7 @@ mod tests {
             config: std::sync::Arc::new(crate::config::ArcConfig::default()),
             relay: std::sync::Arc::new(crate::relay::router::RelayRouter::new()),
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
         let req = SetupRequest {
             owner_name: "Alice".to_string(),

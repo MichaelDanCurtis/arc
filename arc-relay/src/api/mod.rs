@@ -9,6 +9,7 @@ use axum::{
 use crate::audit::AuditLog;
 use crate::auth::middleware::inject_jwt_secret;
 use crate::config::ArcConfig;
+use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
@@ -24,6 +25,7 @@ pub struct AppState {
     pub config: Arc<ArcConfig>,
     pub relay: Arc<RelayRouter>,
     pub audit: AuditLog,
+    pub mirror_registry: MirrorRegistry,
 }
 
 /// Assemble the top-level Axum router.
@@ -114,6 +116,7 @@ pub(crate) mod tests {
             config: Arc::new(ArcConfig::default()),
             relay: Arc::new(RelayRouter::new()),
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: MirrorRegistry::default(),
         }
     }
 

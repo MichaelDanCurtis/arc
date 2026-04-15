@@ -108,6 +108,7 @@ mod tests {
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         let email = format!("getme_{}@test.invalid", uuid::Uuid::new_v4());

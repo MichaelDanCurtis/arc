@@ -202,6 +202,7 @@ mod tests {
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         let owner_id = uuid::Uuid::new_v4();
@@ -246,6 +247,7 @@ mod tests {
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         let owner_id = uuid::Uuid::new_v4();

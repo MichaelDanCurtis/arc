@@ -141,6 +141,7 @@ mod tests {
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         // Create a user
@@ -189,6 +190,7 @@ mod tests {
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
+            mirror_registry: crate::mirror::MirrorRegistry::default(),
         };
 
         let err = get_session(
