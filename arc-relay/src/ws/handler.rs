@@ -61,7 +61,13 @@ pub async fn ws_handler(
 }
 
 /// Close code sent when the access token has expired mid-connection.
+/// Client should refresh and reconnect.
 pub const CLOSE_TOKEN_EXPIRED: u16 = 4001;
+
+/// Close code sent when the token is rejected for a non-expiry reason
+/// (bad signature, malformed, secret rotated, etc.).
+/// Client should re-authenticate from scratch (login flow), not refresh.
+pub const CLOSE_TOKEN_INVALID: u16 = 4003;
 
 /// How often the connection loops re-decode the bearer token to detect expiry.
 ///
@@ -76,23 +82,44 @@ pub const TOKEN_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::
 #[cfg(feature = "fast-revalidate")]
 pub const TOKEN_REVALIDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Send a WebSocket close frame with code 4001 (token expired).
-pub async fn close_with_expired(socket: &mut axum::extract::ws::WebSocket) {
+/// Result of decoding a bearer token during a live connection re-check.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TokenStatus {
+    /// Token is valid and not yet expired.
+    Valid,
+    /// Token signature and structure are fine but the expiry has passed.
+    /// The client should refresh its access token and reconnect.
+    Expired,
+    /// Token is structurally invalid or has a bad signature.
+    /// A refresh will not help; the client must re-authenticate from scratch.
+    Invalid,
+}
+
+/// Decode `token` and classify the outcome into a [`TokenStatus`].
+pub fn token_decode_status(token: &str, jwt_secret: &str) -> TokenStatus {
+    use jsonwebtoken::errors::ErrorKind;
+    match decode_token(token, jwt_secret) {
+        Ok(_) => TokenStatus::Valid,
+        Err(e) => match e.kind() {
+            ErrorKind::ExpiredSignature => TokenStatus::Expired,
+            _ => TokenStatus::Invalid,
+        },
+    }
+}
+
+/// Send a WebSocket close frame with an arbitrary code and reason string.
+pub async fn close_with_code(
+    socket: &mut axum::extract::ws::WebSocket,
+    code: u16,
+    reason: &str,
+) {
     use axum::extract::ws::{CloseFrame, Message};
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
-            code: CLOSE_TOKEN_EXPIRED.into(),
-            reason: "access token expired".into(),
+            code: code.into(),
+            reason: reason.to_owned().into(),
         })))
         .await;
-}
-
-/// Return `true` if the given token is expired (or otherwise invalid).
-///
-/// Uses `decode_token` which validates the signature and expiry with leeway=0.
-/// Any error — including `ExpiredSignature` — returns `true`.
-pub fn token_is_expired(token: &str, jwt_secret: &str) -> bool {
-    decode_token(token, jwt_secret).is_err()
 }
 
 /// Perform the first read on a freshly-upgraded WebSocket to determine
@@ -107,19 +134,28 @@ async fn handle_connection(
     use axum::extract::ws::Message;
     use beacon_proto::codec::decode;
     use beacon_proto::envelope::ClientToArc;
-    use tokio::time::interval;
+    use tokio::time::{interval, MissedTickBehavior};
 
     let jwt_secret = state.config.jwt_secret.clone();
 
     // Check once immediately in case the token expired between upgrade and dispatch.
-    if token_is_expired(&token, &jwt_secret) {
-        tracing::warn!(user_id = %user_id, "token expired before first message; closing 4001");
-        close_with_expired(&mut socket).await;
-        return;
+    match token_decode_status(&token, &jwt_secret) {
+        TokenStatus::Valid => {}
+        TokenStatus::Expired => {
+            tracing::info!(user_id = %user_id, "WS closing before first message: access token expired");
+            close_with_code(&mut socket, CLOSE_TOKEN_EXPIRED, "access token expired").await;
+            return;
+        }
+        TokenStatus::Invalid => {
+            tracing::warn!(user_id = %user_id, "WS closing before first message: token decode failed (signature/malformed)");
+            close_with_code(&mut socket, CLOSE_TOKEN_INVALID, "token rejected").await;
+            return;
+        }
     }
 
     // Wait for the first binary frame, with a periodic expiry re-check.
     let mut expiry_tick = interval(TOKEN_REVALIDATE_INTERVAL);
+    expiry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     expiry_tick.tick().await; // consume the immediate first tick
 
     let first_msg = loop {
@@ -143,10 +179,18 @@ async fn handle_connection(
                 }
             }
             _ = expiry_tick.tick() => {
-                if token_is_expired(&token, &jwt_secret) {
-                    tracing::warn!(user_id = %user_id, "token expired while waiting for first message; closing 4001");
-                    close_with_expired(&mut socket).await;
-                    return;
+                match token_decode_status(&token, &jwt_secret) {
+                    TokenStatus::Valid => {}
+                    TokenStatus::Expired => {
+                        tracing::info!(user_id = %user_id, "WS closing: access token expired");
+                        close_with_code(&mut socket, CLOSE_TOKEN_EXPIRED, "access token expired").await;
+                        return;
+                    }
+                    TokenStatus::Invalid => {
+                        tracing::warn!(user_id = %user_id, "WS closing: token decode failed (signature/malformed)");
+                        close_with_code(&mut socket, CLOSE_TOKEN_INVALID, "token rejected").await;
+                        return;
+                    }
                 }
             }
         }

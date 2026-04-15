@@ -7,10 +7,13 @@ use beacon_proto::{
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::ws::handler::{close_with_expired, token_is_expired, TOKEN_REVALIDATE_INTERVAL};
+use crate::ws::handler::{
+    close_with_code, token_decode_status, TokenStatus, CLOSE_TOKEN_EXPIRED, CLOSE_TOKEN_INVALID,
+    TOKEN_REVALIDATE_INTERVAL,
+};
 use crate::{
     models::session::{create_session, update_session_state},
     relay::router::RelayRouter,
@@ -94,6 +97,7 @@ pub async fn handle_host(
     // Periodic token re-validation. Interval is 30 s in production (well under
     // the 15-min access-token lifetime) and 1 s when built with fast-revalidate.
     let mut expiry_tick = interval(TOKEN_REVALIDATE_INTERVAL);
+    expiry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     expiry_tick.tick().await; // consume the immediate first tick
 
     loop {
@@ -108,10 +112,18 @@ pub async fn handle_host(
 
             // Token expiry check.
             _ = expiry_tick.tick() => {
-                if token_is_expired(&token, &jwt_secret) {
-                    tracing::warn!(user_id = %user_id, "host token expired; closing 4001");
-                    close_with_expired(&mut socket).await;
-                    break;
+                match token_decode_status(&token, &jwt_secret) {
+                    TokenStatus::Valid => {}
+                    TokenStatus::Expired => {
+                        tracing::info!(user_id = %user_id, "WS closing: access token expired");
+                        close_with_code(&mut socket, CLOSE_TOKEN_EXPIRED, "access token expired").await;
+                        break;
+                    }
+                    TokenStatus::Invalid => {
+                        tracing::warn!(user_id = %user_id, "WS closing: token decode failed (signature/malformed)");
+                        close_with_code(&mut socket, CLOSE_TOKEN_INVALID, "token rejected").await;
+                        break;
+                    }
                 }
             }
 
