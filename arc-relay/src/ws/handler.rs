@@ -116,7 +116,7 @@ pub async fn close_with_code(
     use axum::extract::ws::{CloseFrame, Message};
     let _ = socket
         .send(Message::Close(Some(CloseFrame {
-            code: code.into(),
+            code,
             reason: reason.to_owned().into(),
         })))
         .await;
