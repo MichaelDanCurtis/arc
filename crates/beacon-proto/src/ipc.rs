@@ -106,7 +106,7 @@ pub struct IpcSessionInfo {
 }
 
 /// Hostd → terminal-app event stream (one-way push of async notifications).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
 pub enum IpcEvent {
     /// Raw PTY output bytes forwarded from the owning session.
@@ -135,7 +135,7 @@ pub enum IpcEvent {
 }
 
 /// Details about the user currently holding keyboard-control of a session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DriverInfo {
     pub user_id: String,
     pub device_label: String,
@@ -144,7 +144,7 @@ pub struct DriverInfo {
 }
 
 /// Details about a single watcher observing a mirrored session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WatcherInfo {
     pub user_id: String,
     pub device_label: String,
