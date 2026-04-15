@@ -55,6 +55,17 @@ async fn migration_002_schema_and_check_constraint() {
     };
 
     // -----------------------------------------------------------------------
+    // Pre-test cleanup — guarantees re-runs start clean even if a prior
+    // run panicked mid-test. Must run in FK order: grants → sessions → users.
+    // -----------------------------------------------------------------------
+    sqlx::query("DELETE FROM session_grants WHERE session_id LIKE 'test-mig002-%'")
+        .execute(&pool).await.ok();
+    sqlx::query("DELETE FROM sessions WHERE id LIKE 'test-mig002-%'")
+        .execute(&pool).await.ok();
+    sqlx::query("DELETE FROM users WHERE email LIKE 'test-%@example.com' AND email SIMILAR TO 'test-[0-9a-f]%'")
+        .execute(&pool).await.ok();
+
+    // -----------------------------------------------------------------------
     // Apply all migrations (idempotent via sqlx versioned migrations).
     // -----------------------------------------------------------------------
     sqlx::migrate!("./migrations")
