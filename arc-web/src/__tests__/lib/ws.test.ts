@@ -183,6 +183,7 @@ describe("Mirror envelope codec", () => {
     expect(decoded.kind).toBe("PushOutput");
     if (decoded.kind === "PushOutput") {
       expect(decoded.data.seq).toBe(7);
+      expect(decoded.data.bytes).toBeInstanceOf(Uint8Array);
     }
   });
 
@@ -217,6 +218,7 @@ describe("Mirror envelope codec", () => {
     if (decoded.kind === "SessionOutput") {
       expect(decoded.data.seq).toBe(42);
       expect(decoded.data.replay).toBe(false);
+      expect(decoded.data.bytes).toBeInstanceOf(Uint8Array);
     }
   });
 
@@ -235,6 +237,7 @@ describe("Mirror envelope codec", () => {
     expect(decoded.kind).toBe("SessionOutput");
     if (decoded.kind === "SessionOutput") {
       expect(decoded.data.replay).toBe(true);
+      expect(decoded.data.bytes).toBeInstanceOf(Uint8Array);
     }
   });
 
@@ -350,6 +353,7 @@ describe("Mirror envelope codec", () => {
     expect(decoded.kind).toBe("HostInput");
     if (decoded.kind === "HostInput") {
       expect(decoded.data.from_user).toBe("user-alice");
+      expect(decoded.data.bytes).toBeInstanceOf(Uint8Array);
     }
   });
 
