@@ -60,6 +60,14 @@ interface ReducerState {
    */
   promptBytesBuffer: number[] | null;
   /**
+   * Scratch buffer for output bytes while a block is in the "output" phase.
+   * Accumulated as a number[] (amortized O(1) push) and materialized into a
+   * single Uint8Array on CommandEnd. Keeps WatchBlock.output always a settled
+   * Uint8Array for readers while avoiding O(n²) copying during streaming.
+   * null when not in output phase.
+   */
+  outputScratch: number[] | null;
+  /**
    * Phase tracks which segment of a block we're currently accumulating.
    * - "prompt"  : PromptStart received, awaiting CommandStart
    * - "command" : CommandStart received, awaiting OutputStart
@@ -74,6 +82,7 @@ const INITIAL_STATE: ReducerState = {
   currentIndex: null,
   nextId: 0,
   promptBytesBuffer: null,
+  outputScratch: null,
   phase: null,
 };
 
@@ -99,22 +108,12 @@ function decodeBytes(bytes: number[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Pure helper: append bytes to a WatchBlock's output Uint8Array.
-// Returns a new Uint8Array (immutable update).
-// ---------------------------------------------------------------------------
-
-function appendOutputByte(existing: Uint8Array, b: number): Uint8Array {
-  const next = new Uint8Array(existing.length + 1);
-  next.set(existing);
-  next[existing.length] = b;
-  return next;
-}
-
-// ---------------------------------------------------------------------------
 // Action types
 // ---------------------------------------------------------------------------
 
-type Action = { type: "FEED_EVENTS"; events: BlockEventJs[] };
+type Action =
+  | { type: "FEED_EVENTS"; events: BlockEventJs[] }
+  | { type: "RESET" };
 
 // ---------------------------------------------------------------------------
 // Reducer — pure function, exported for unit testing.
@@ -124,6 +123,7 @@ export function mirrorBlocksReducer(
   state: ReducerState,
   action: Action,
 ): ReducerState {
+  if (action.type === "RESET") return { ...INITIAL_STATE };
   if (action.type !== "FEED_EVENTS") return state;
 
   let {
@@ -131,6 +131,7 @@ export function mirrorBlocksReducer(
     currentIndex,
     nextId,
     promptBytesBuffer,
+    outputScratch,
     phase,
   } = state;
 
@@ -144,11 +145,18 @@ export function mirrorBlocksReducer(
         // Close any open block first (defensive — relay should send CommandEnd).
         if (currentIndex !== null && phase !== null) {
           const prev = blocks[currentIndex];
+          // Materialize any pending output scratch into the closing block.
+          const output =
+            outputScratch !== null
+              ? new Uint8Array(outputScratch)
+              : prev.output;
           blocks[currentIndex] = {
             ...prev,
+            output,
             status: "done",
             endedAt: Date.now(),
           };
+          outputScratch = null;
         }
         // Open a new block.
         const id = `block-${nextId}`;
@@ -175,16 +183,18 @@ export function mirrorBlocksReducer(
       case "CommandStart": {
         if (currentIndex === null) break;
         // D2: Extract command text from bytes accumulated since PromptStart.
+        // Fix 3: also save the raw decoded text as the prompt field.
+        let prompt = "";
         let command = "";
         if (promptBytesBuffer !== null && promptBytesBuffer.length > 0) {
-          const raw = decodeBytes(promptBytesBuffer);
-          command = stripPromptSigil(raw.trim());
+          prompt = decodeBytes(promptBytesBuffer).trim();
+          command = stripPromptSigil(prompt);
         }
         // If command field is provided directly by the event (future C4.4+), prefer it.
         if (event.command != null && event.command.length > 0) {
           command = event.command;
         }
-        blocks[currentIndex] = { ...blocks[currentIndex], command };
+        blocks[currentIndex] = { ...blocks[currentIndex], prompt, command };
         promptBytesBuffer = null;
         phase = "command";
         break;
@@ -192,20 +202,28 @@ export function mirrorBlocksReducer(
 
       case "OutputStart": {
         if (currentIndex === null) break;
+        outputScratch = [];
         phase = "output";
         break;
       }
 
       case "CommandEnd": {
         if (currentIndex === null) break;
+        // Materialize the output scratch buffer into a single Uint8Array (O(n) one-shot).
+        const output =
+          outputScratch !== null
+            ? new Uint8Array(outputScratch)
+            : blocks[currentIndex].output;
         blocks[currentIndex] = {
           ...blocks[currentIndex],
+          output,
           exitCode: event.exit_code ?? null,
           status: "done",
           endedAt: Date.now(),
         };
         currentIndex = null;
         promptBytesBuffer = null;
+        outputScratch = null;
         phase = null;
         break;
       }
@@ -214,14 +232,11 @@ export function mirrorBlocksReducer(
         if (currentIndex === null) break;
         const b = event.b;
         if (phase === "prompt" && promptBytesBuffer !== null) {
-          // Accumulate into the prompt/command-extraction buffer.
-          promptBytesBuffer = [...promptBytesBuffer, b];
-        } else if (phase === "output") {
-          // Accumulate into the block's output bytes.
-          blocks[currentIndex] = {
-            ...blocks[currentIndex],
-            output: appendOutputByte(blocks[currentIndex].output, b),
-          };
+          // Accumulate into the prompt/command-extraction buffer (amortized O(1)).
+          promptBytesBuffer.push(b);
+        } else if (phase === "output" && outputScratch !== null) {
+          // Accumulate into scratch buffer (amortized O(1) — no Uint8Array copy per byte).
+          outputScratch.push(b);
         }
         // Bytes in "command" phase (between CommandStart and OutputStart) are
         // discarded — they are echoed input, not useful for the watch view.
@@ -233,7 +248,7 @@ export function mirrorBlocksReducer(
     }
   }
 
-  return { blocks, currentIndex, nextId, promptBytesBuffer, phase };
+  return { blocks, currentIndex, nextId, promptBytesBuffer, outputScratch, phase };
 }
 
 // ---------------------------------------------------------------------------
@@ -283,11 +298,16 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
 
     let detector: { feed(bytes: Uint8Array): BlockEventJs[]; free(): void } | null = null;
 
+    // Reset reducer so stale blocks from the previous session are cleared
+    // immediately — before the new detector resolves.
+    dispatch({ type: "RESET" });
+
     // Lazily import the WASM module. The bundler-target wasm-bindgen output
     // auto-initialises on import; no explicit `init()` call is needed.
     import("@/wasm/beacon-blocks/beacon_blocks_wasm")
       .then(({ WasmBlockDetector }) => {
-        // Guard against sessionId changing before the import resolves.
+        // Race guard: if sessionId changed mid-import, skip instantiation for
+        // the now-stale session.
         if (detectorSessionRef.current === sessionId) return;
         detector = new WasmBlockDetector() as typeof detector;
         detectorRef.current = detector;
@@ -313,6 +333,8 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
 
   const feedBytes = useCallback((bytes: Uint8Array) => {
     const detector = detectorRef.current;
+    // Bytes arriving before the WASM detector resolves are discarded.
+    // Callers that can't tolerate data loss should buffer.
     if (!detector) return;
 
     let events: BlockEventJs[];

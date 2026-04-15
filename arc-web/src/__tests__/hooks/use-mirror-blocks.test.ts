@@ -33,6 +33,7 @@ const INITIAL_STATE = {
   currentIndex: null as number | null,
   nextId: 0,
   promptBytesBuffer: null as number[] | null,
+  outputScratch: null as number[] | null,
   phase: null as "prompt" | "command" | "output" | null,
 };
 
@@ -281,5 +282,72 @@ describe("mirrorBlocksReducer — defensive close", () => {
     expect(state.blocks[1].status).toBe("done");
     expect(state.blocks[1].exitCode).toBe(0);
     expect(state.currentIndex).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reducer: RESET action clears all state
+// ---------------------------------------------------------------------------
+
+describe("mirrorBlocksReducer — RESET", () => {
+  it("clears blocks and resets all fields to initial state", () => {
+    // First build up some state with a completed block.
+    const s1 = feed(INITIAL_STATE, [
+      { kind: "PromptStart", mode: "osc133" },
+      { kind: "CommandStart", mode: "osc133", command: null },
+      { kind: "OutputStart", mode: "osc133" },
+      ...outputBytesFromStr("hello"),
+      { kind: "CommandEnd", mode: "osc133", exit_code: 0 },
+    ]);
+    expect(s1.blocks).toHaveLength(1);
+    expect(s1.nextId).toBe(1);
+
+    // Dispatch RESET.
+    const s2 = mirrorBlocksReducer(s1, { type: "RESET" });
+
+    expect(s2.blocks).toHaveLength(0);
+    expect(s2.currentIndex).toBeNull();
+    expect(s2.nextId).toBe(0);
+    expect(s2.promptBytesBuffer).toBeNull();
+    expect(s2.outputScratch).toBeNull();
+    expect(s2.phase).toBeNull();
+  });
+
+  it("RESET on initial state is a no-op (returns empty state)", () => {
+    const s = mirrorBlocksReducer(INITIAL_STATE, { type: "RESET" });
+    expect(s.blocks).toHaveLength(0);
+    expect(s.currentIndex).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reducer: prompt field population (Fix 3)
+// ---------------------------------------------------------------------------
+
+describe("mirrorBlocksReducer — prompt field", () => {
+  it("populates prompt with trimmed text from PromptStart→CommandStart window", () => {
+    const events: BlockEventJs[] = [
+      { kind: "PromptStart", mode: "osc133" },
+      ...outputBytesFromStr("user@host:~$ "),
+      { kind: "CommandStart", mode: "osc133", command: null },
+      { kind: "OutputStart", mode: "osc133" },
+      { kind: "CommandEnd", mode: "osc133", exit_code: 0 },
+    ];
+    const state = feed(INITIAL_STATE, events);
+    // prompt is the trimmed raw text (before sigil stripping)
+    expect(state.blocks[0].prompt).toBe("user@host:~$");
+    // command has the sigil stripped
+    expect(state.blocks[0].command).toBe("user@host:~");
+  });
+
+  it("prompt is empty string when no bytes arrive before CommandStart", () => {
+    const events: BlockEventJs[] = [
+      { kind: "PromptStart", mode: "osc133" },
+      { kind: "CommandStart", mode: "osc133", command: null },
+      { kind: "OutputStart", mode: "osc133" },
+      { kind: "CommandEnd", mode: "osc133", exit_code: 0 },
+    ];
+    const state = feed(INITIAL_STATE, events);
+    expect(state.blocks[0].prompt).toBe("");
   });
 });

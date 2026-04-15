@@ -22,8 +22,10 @@ export interface WatchBlock {
   /** Locally-generated monotonic id (e.g. "block-0", "block-1"). */
   id: string;
   /**
-   * Raw bytes received between PromptStart and CommandStart.
-   * Used by C4.4 to render the prompt text (e.g. "user@host:~$").
+   * Decoded prompt text received between PromptStart and CommandStart,
+   * trimmed of surrounding whitespace (e.g. "user@host:~$").
+   * Populated by the reducer at CommandStart; empty string if no bytes
+   * arrived in that window. C4.4 may render this alongside the command.
    */
   prompt: string;
   /**
