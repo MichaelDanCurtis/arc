@@ -134,6 +134,18 @@ pub enum IpcEvent {
     },
 }
 
+impl IpcEvent {
+    /// Return the session ID this event is associated with.
+    pub fn session_id(&self) -> &SessionId {
+        match self {
+            Self::RemoteInput { session_id, .. }
+            | Self::LeaseChanged { session_id, .. }
+            | Self::ControlRequested { session_id, .. }
+            | Self::PresenceChanged { session_id, .. } => session_id,
+        }
+    }
+}
+
 /// Details about the user currently holding keyboard-control of a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverInfo {
