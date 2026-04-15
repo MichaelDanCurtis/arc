@@ -70,6 +70,12 @@ pub enum ClientToArc {
         bytes: Vec<u8>,
         seq: u64,
     },
+    /// Host-side: signal a gap in the output stream (after OutputTee drops).
+    /// Pairs with ScrollbackRing's out-of-range detection on the relay side.
+    OutputDiscontinuity {
+        session_id: SessionId,
+        last_seq: u64,
+    },
 
     // Session mirroring: subscribe/control
     SubscribeSession {
