@@ -30,6 +30,8 @@
 import { useParams, useRouter } from "next/navigation";
 import { useRef, useCallback, useState, useEffect, useLayoutEffect } from "react";
 import { useWebSocket } from "@/hooks/use-websocket";
+import { useMirrorBlocks } from "@/hooks/use-mirror-blocks";
+import { WatchBlockList } from "@/components/watch/WatchBlockList";
 import { XtermWrapper, type XtermHandle } from "@/components/terminal/xterm-wrapper";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -49,6 +51,13 @@ export default function WatchPage() {
   // isDriver: true when we believe the relay has granted us control
   const [isDriver, setIsDriver] = useState(false);
 
+  // Block-list sidebar collapse state (plain component state — watchers sidebar
+  // uses the same pattern: no localStorage persistence).
+  const [blockListOpen, setBlockListOpen] = useState(true);
+
+  // useMirrorBlocks: lazily loads WASM detector; returns feedBytes callback.
+  const { blocks, currentBlockId, feedBytes } = useMirrorBlocks(id);
+
   // Track the highest seq received from SessionOutput for discontinuity resume.
   const lastSeenSeqRef = useRef<number | null>(null);
 
@@ -66,8 +75,11 @@ export default function WatchPage() {
 
       switch (msg.kind) {
         case "SessionOutput": {
+          const chunk = new Uint8Array(msg.data.bytes);
           // Write bytes to xterm for both live and replay frames.
-          xtermRef.current?.write(new Uint8Array(msg.data.bytes));
+          xtermRef.current?.write(chunk);
+          // Feed the same bytes into the block detector for WatchBlockList.
+          feedBytes(chunk);
           // Track highest seq for discontinuity resume
           if (lastSeenSeqRef.current === null || msg.data.seq > lastSeenSeqRef.current) {
             lastSeenSeqRef.current = msg.data.seq;
@@ -116,7 +128,7 @@ export default function WatchPage() {
           break;
       }
     },
-    [id],
+    [id, feedBytes],
   );
 
   // Hook call — registers its cleanup effect internally (ws.close on unmount).
@@ -255,10 +267,34 @@ export default function WatchPage() {
         </div>
       )}
 
-      {/* Main area: terminal + optional watchers sidebar */}
+      {/* Main area: terminal + block-list sidebar (D5 split-pane) */}
       <div className="flex flex-1 overflow-hidden">
         {/* xterm terminal — readOnly toggles live without reinit */}
         <div className="flex min-w-0 flex-1 flex-col">
+          {/* Watchers sub-bar — shown when there is at least one watcher */}
+          {watchers.length > 0 && (
+            <div
+              className="flex items-center gap-2 border-b border-white/10 bg-muted/20 px-3 py-1.5"
+              data-testid="watchers-sidebar"
+            >
+              <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Watchers ({watchers.length})
+              </span>
+              <ul className="flex flex-wrap gap-x-3">
+                {watchers.map((w) => (
+                  <li
+                    key={`${w.user_id}:${w.device_label}`}
+                    className="text-xs"
+                  >
+                    <span className="font-medium">{w.device_label}</span>
+                    <span className="ml-1 text-muted-foreground">
+                      ({w.user_id})
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="flex-1">
             <XtermWrapper
               ref={xtermRef}
@@ -269,30 +305,38 @@ export default function WatchPage() {
           </div>
         </div>
 
-        {/* Watchers sidebar — shown when there is at least one watcher */}
-        {watchers.length > 0 && (
-          <aside
-            className="w-48 shrink-0 border-l border-white/10 bg-muted/30 p-3"
-            data-testid="watchers-sidebar"
-          >
-            <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Watchers ({watchers.length})
-            </h2>
-            <ul className="space-y-1">
-              {watchers.map((w) => (
-                <li
-                  key={`${w.user_id}:${w.device_label}`}
-                  className="text-xs"
-                >
-                  <span className="font-medium">{w.device_label}</span>
-                  <span className="ml-1 text-muted-foreground">
-                    ({w.user_id})
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </aside>
-        )}
+        {/* Block-list sidebar (D5) — always present, collapsible via chevron */}
+        <aside
+          className={cn(
+            "flex shrink-0 flex-col border-l border-white/10 bg-muted/30 transition-all",
+            blockListOpen ? "w-72" : "w-8",
+          )}
+          data-testid="block-list-sidebar"
+        >
+          {/* Collapse toggle button — mimics watchers-list header style */}
+          <div className="flex items-center border-b border-white/10 px-2 py-1.5">
+            {blockListOpen && (
+              <h2 className="flex-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                Blocks
+              </h2>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-5 w-5 p-0 text-muted-foreground"
+              aria-label={blockListOpen ? "Collapse block list" : "Expand block list"}
+              onClick={() => setBlockListOpen((o) => !o)}
+              data-testid="block-list-toggle"
+            >
+              {blockListOpen ? "›" : "‹"}
+            </Button>
+          </div>
+          {blockListOpen && (
+            <div className="flex-1 overflow-y-auto">
+              <WatchBlockList blocks={blocks} currentBlockId={currentBlockId} />
+            </div>
+          )}
+        </aside>
       </div>
 
       {/* Status bar */}
