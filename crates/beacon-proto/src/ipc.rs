@@ -132,6 +132,12 @@ pub enum IpcEvent {
         session_id: SessionId,
         watchers: Vec<WatcherInfo>,
     },
+    /// The user's subscription was revoked but the session still exists
+    /// (e.g. host stopped sharing with this user, or a permission change).
+    SessionRevoked {
+        session_id: SessionId,
+        reason: String,
+    },
 }
 
 impl IpcEvent {
@@ -141,7 +147,8 @@ impl IpcEvent {
             Self::RemoteInput { session_id, .. }
             | Self::LeaseChanged { session_id, .. }
             | Self::ControlRequested { session_id, .. }
-            | Self::PresenceChanged { session_id, .. } => session_id,
+            | Self::PresenceChanged { session_id, .. }
+            | Self::SessionRevoked { session_id, .. } => session_id,
         }
     }
 }
