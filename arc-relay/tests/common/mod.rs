@@ -59,18 +59,26 @@ pub async fn spawn_relay() -> Option<Relay> {
 }
 
 /// Drain frames from `conn` until the predicate `pred` returns `true` for a
-/// received frame.  Panics if the stream closes before the predicate matches.
+/// received frame.  Panics if the stream closes before the predicate matches,
+/// or if the predicate has not matched within 10 seconds (guards against
+/// test-deadlock when the awaited frame never arrives — e.g. a relay bug that
+/// silently drops PresenceChanged).
 #[allow(dead_code)]
 pub async fn drain_until<F>(conn: &mut WatcherConn, pred: F)
 where
     F: Fn(&ArcToClient) -> bool,
 {
-    loop {
-        let frame = conn.recv().await;
-        if pred(&frame) {
-            return;
+    let fut = async {
+        loop {
+            let frame = conn.recv().await;
+            if pred(&frame) {
+                return;
+            }
         }
-    }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+        .await
+        .expect("drain_until: timed out after 10s waiting for predicate to match");
 }
 
 /// Spin up a full axum relay on a random port backed by the `DATABASE_URL`
@@ -340,7 +348,9 @@ pub async fn host_push_output(
         }
     }
 
-    // Send PushOutput.
+    // Send PushOutput. `seq` is always 0 here — the relay discards the
+    // client-sent seq and assigns its own canonical sequence from the
+    // scrollback ring, so any value is equivalent for test purposes.
     ws.send(Message::Binary(
         encode(&ClientToArc::PushOutput {
             session_id: session_id_parsed,
