@@ -29,6 +29,42 @@ import { useEffect, useRef, useReducer, useCallback } from "react";
 import type { WatchBlock, WatchBlockMode } from "@/types/watch-block";
 
 // ---------------------------------------------------------------------------
+// Pre-init byte buffer — public only for testing; not part of the public API.
+// ---------------------------------------------------------------------------
+
+/** Maximum total bytes held in the pre-init pending buffer (~1 MB). */
+export const PENDING_BUF_CAP = 1 * 1024 * 1024;
+
+/**
+ * Drain `pendingChunks` into `detector`, collect all events, then clear the
+ * arrays in-place.  Exported as a pure helper so tests can verify buffer
+ * drain logic without mounting the hook.
+ *
+ * @param pendingChunks - accumulated pre-init Uint8Array chunks (mutated: cleared)
+ * @param pendingSizeHolder - single-element array holding the total byte count (mutated)
+ * @param detector - an initialised WasmBlockDetector (feed / free)
+ * @returns flat array of all BlockEventJs events produced during drain
+ */
+export function drainPendingBytes(
+  pendingChunks: Uint8Array[],
+  pendingSizeHolder: [number],
+  detector: { feed(bytes: Uint8Array): BlockEventJs[] },
+): BlockEventJs[] {
+  const allEvents: BlockEventJs[] = [];
+  for (const chunk of pendingChunks) {
+    try {
+      const evts = detector.feed(chunk);
+      if (Array.isArray(evts)) allEvents.push(...evts);
+    } catch {
+      // Ignore individual chunk errors during drain — best-effort.
+    }
+  }
+  pendingChunks.length = 0;
+  pendingSizeHolder[0] = 0;
+  return allEvents;
+}
+
+// ---------------------------------------------------------------------------
 // BlockEventJs shape (matches serde tagged enum from beacon-blocks-wasm)
 // Note: Rust uses #[serde(tag = "kind")] and DetectorMode uses snake_case.
 // ---------------------------------------------------------------------------
@@ -262,6 +298,9 @@ export interface MirrorBlocksResult {
   /**
    * Feed a chunk of raw PTY bytes into the detector.
    * Call this from your SessionOutput handler on every incoming mirror frame.
+   *
+   * Bytes arriving before detector init are buffered (up to ~1 MB) and drained
+   * on init.  If the cap is hit, the oldest buffered bytes are silently dropped.
    */
   feedBytes: (bytes: Uint8Array) => void;
 }
@@ -293,6 +332,14 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
   // Track the sessionId for which the detector was created.
   const detectorSessionRef = useRef<string | null>(null);
 
+  // Pre-init byte buffer: chunks arriving before the WASM detector resolves
+  // are queued here and drained synchronously once the detector is ready.
+  const pendingChunksRef = useRef<Uint8Array[]>([]);
+  // Single-element tuple so drainPendingBytes can mutate the size in-place.
+  const pendingSizeRef = useRef<[number]>([0]);
+  // Guard: log the cap warning at most once per mount to avoid log spam.
+  const capWarnedRef = useRef(false);
+
   useEffect(() => {
     if (!sessionId) return;
 
@@ -309,6 +356,12 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
     // immediately — before the new detector resolves.
     dispatch({ type: "RESET" });
 
+    // Clear the pending buffer on each sessionId change so stale bytes from
+    // a previous session don't bleed into the new one.
+    pendingChunksRef.current = [];
+    pendingSizeRef.current = [0];
+    capWarnedRef.current = false;
+
     // Lazily import the WASM module. The bundler-target wasm-bindgen output
     // auto-initialises on import; no explicit `init()` call is needed.
     import("@/wasm/beacon-blocks/beacon_blocks_wasm")
@@ -318,6 +371,17 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
         detector = new WasmBlockDetector() as typeof detector;
         detectorRef.current = detector;
         detectorSessionRef.current = sessionId;
+
+        // Drain any bytes that arrived before the detector was ready.
+        // detector was just assigned above; the non-null assertion is safe.
+        const drained = drainPendingBytes(
+          pendingChunksRef.current,
+          pendingSizeRef.current,
+          detector!,
+        );
+        if (drained.length > 0) {
+          dispatch({ type: "FEED_EVENTS", events: drained });
+        }
       })
       .catch((err: unknown) => {
         console.error("[useMirrorBlocks] failed to load WasmBlockDetector:", err);
@@ -341,9 +405,35 @@ export function useMirrorBlocks(sessionId: string | null): MirrorBlocksResult {
 
   const feedBytes = useCallback((bytes: Uint8Array) => {
     const detector = detectorRef.current;
-    // Bytes arriving before the WASM detector resolves are discarded.
-    // Callers that can't tolerate data loss should buffer.
-    if (!detector) return;
+    // Bytes arriving before the WASM detector resolves are buffered (up to
+    // ~1 MB) and drained on init.  Once the detector is ready, bytes are fed
+    // synchronously and never queued.
+    if (!detector) {
+      // Cap check: if adding this chunk would exceed PENDING_BUF_CAP, drop
+      // oldest chunks from the front until there is room (or the chunk itself
+      // is larger than the cap, in which case we keep only this chunk).
+      const incoming = bytes.length;
+      const chunks = pendingChunksRef.current;
+      const sizeHolder = pendingSizeRef.current;
+
+      if (incoming + sizeHolder[0] > PENDING_BUF_CAP) {
+        if (!capWarnedRef.current) {
+          console.warn(
+            "[useMirrorBlocks] pre-init buffer cap (~1 MB) reached; dropping oldest bytes.",
+          );
+          capWarnedRef.current = true;
+        }
+        // Drop oldest chunks until there is room for the new one.
+        while (chunks.length > 0 && incoming + sizeHolder[0] > PENDING_BUF_CAP) {
+          const dropped = chunks.shift()!;
+          sizeHolder[0] -= dropped.length;
+        }
+      }
+
+      chunks.push(bytes);
+      sizeHolder[0] += incoming;
+      return;
+    }
 
     let events: BlockEventJs[];
     try {
