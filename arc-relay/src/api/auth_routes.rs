@@ -303,11 +303,12 @@ mod tests {
         let config = std::sync::Arc::new(crate::config::ArcConfig::default());
         let relay = std::sync::Arc::new(crate::relay::router::RelayRouter::new());
         let state = AppState {
-            pool,
+            pool: pool.clone(),
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool),
         };
 
         let email = format!("register_{}@test.invalid", uuid::Uuid::new_v4());
@@ -341,6 +342,7 @@ mod tests {
             relay,
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
         };
 
         // First register a user
@@ -382,6 +384,7 @@ mod tests {
             relay,
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
         };
 
         let email = format!("badpw_{}@test.invalid", uuid::Uuid::new_v4());

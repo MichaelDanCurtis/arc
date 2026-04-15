@@ -20,6 +20,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Checks whether a user may subscribe to a mirrored session.
+#[derive(Clone)]
 pub struct InvitationStore {
     pool: PgPool,
 }

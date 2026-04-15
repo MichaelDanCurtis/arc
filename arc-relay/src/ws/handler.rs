@@ -232,6 +232,99 @@ async fn handle_connection(
             )
             .await;
         }
+        ClientToArc::SubscribeSession { session_id, since_seq } => {
+            tracing::info!(user_id = %user_id, session_id = %session_id, "WebSocket dispatching to mirror-subscribe handler");
+
+            // Look up the user's email from DB (not in JWT claims).
+            let user_email: String = match sqlx::query_scalar::<_, String>(
+                "SELECT email FROM users WHERE id = $1",
+            )
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await
+            {
+                Ok(Some(e)) => e,
+                Ok(None) => {
+                    tracing::warn!(user_id = %user_id, "SubscribeSession: user not found in DB");
+                    let _ = socket.close().await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(user_id = %user_id, "SubscribeSession: DB error looking up email: {e}");
+                    let _ = socket.close().await;
+                    return;
+                }
+            };
+
+            // Create the watcher channel. The tx goes into Fanout; we drive the rx here.
+            let (sink_tx, mut sink_rx) = crate::mirror::fanout::Fanout::make_channel();
+
+            // Sanctioned deviation: device_label hardcoded as "Watcher" for Task 2.8.
+            // Task 2.10+ will add it to the SubscribeSession wire variant.
+            let device_label = "Watcher";
+            let session_id_str = session_id.to_string();
+
+            match crate::mirror::handlers::handle_subscribe(
+                &state,
+                user_id,
+                &user_email,
+                device_label,
+                &session_id_str,
+                since_seq,
+                sink_tx,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(user_id = %user_id, "SubscribeSession denied/failed: {e}");
+                    let _ = socket.close().await;
+                    return;
+                }
+            }
+
+            // Forward frames from the fanout channel to the WebSocket.
+            // For Task 2.8, break on any inbound client message or socket close
+            // (control handling is Task 2.10+).
+            use axum::extract::ws::Message;
+            use beacon_proto::codec::encode;
+            loop {
+                tokio::select! {
+                    frame = sink_rx.recv() => {
+                        match frame {
+                            Some(msg) => {
+                                match encode(&msg) {
+                                    Ok(bytes) => {
+                                        if socket.send(Message::Binary(bytes)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("SubscribeSession: encode error: {e}");
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                // Channel closed (watcher evicted by fanout).
+                                let _ = socket.close().await;
+                                break;
+                            }
+                        }
+                    }
+                    inbound = socket.recv() => {
+                        match inbound {
+                            Some(Ok(_)) => {
+                                // Task 2.10+ will handle inbound control frames.
+                                // For now, any inbound message closes the connection.
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
         other => {
             tracing::warn!(
                 user_id = %user_id,

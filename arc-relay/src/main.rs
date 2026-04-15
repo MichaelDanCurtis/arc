@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay: relay_router.clone(),
         audit: audit_log,
         mirror_registry: arc_relay::mirror::MirrorRegistry::default(),
+        invitations: arc_relay::mirror::invitation::InvitationStore::new(pool.clone()),
     };
 
     retention::spawn_retention_task(pool.clone());

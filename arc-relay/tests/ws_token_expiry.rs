@@ -39,10 +39,12 @@ async fn spawn_relay() -> std::net::SocketAddr {
     config.jwt_secret = JWT_SECRET.to_string();
 
     let state = AppState {
-        pool,
+        pool: pool.clone(),
         config: Arc::new(config),
         relay: Arc::new(RelayRouter::new()),
         audit: AuditLog::new(),
+        mirror_registry: arc_relay::mirror::MirrorRegistry::default(),
+        invitations: arc_relay::mirror::invitation::InvitationStore::new(pool),
     };
 
     let router = build_router(state);

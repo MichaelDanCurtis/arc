@@ -225,11 +225,12 @@ mod tests {
         };
         let pool = sqlx::PgPool::connect(&url).await.expect("connect");
         let state = AppState {
-            pool,
+            pool: pool.clone(),
             config: std::sync::Arc::new(crate::config::ArcConfig::default()),
             relay: std::sync::Arc::new(crate::relay::router::RelayRouter::new()),
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool),
         };
         let req = SetupRequest {
             owner_name: "Alice".to_string(),

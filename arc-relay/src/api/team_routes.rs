@@ -203,6 +203,7 @@ mod tests {
             relay,
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
         };
 
         let owner_id = uuid::Uuid::new_v4();
@@ -248,6 +249,7 @@ mod tests {
             relay,
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
         };
 
         let owner_id = uuid::Uuid::new_v4();

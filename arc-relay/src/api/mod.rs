@@ -9,6 +9,7 @@ use axum::{
 use crate::audit::AuditLog;
 use crate::auth::middleware::inject_jwt_secret;
 use crate::config::ArcConfig;
+use crate::mirror::invitation::InvitationStore;
 use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
@@ -26,6 +27,7 @@ pub struct AppState {
     pub relay: Arc<RelayRouter>,
     pub audit: AuditLog,
     pub mirror_registry: MirrorRegistry,
+    pub invitations: InvitationStore,
 }
 
 /// Assemble the top-level Axum router.
@@ -112,11 +114,12 @@ pub(crate) mod tests {
         let pool =
             sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc").expect("lazy pool");
         AppState {
-            pool,
+            pool: pool.clone(),
             config: Arc::new(ArcConfig::default()),
             relay: Arc::new(RelayRouter::new()),
             audit: crate::audit::AuditLog::new(),
             mirror_registry: MirrorRegistry::default(),
+            invitations: InvitationStore::new(pool),
         }
     }
 

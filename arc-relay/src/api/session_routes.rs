@@ -137,11 +137,12 @@ mod tests {
         let config = std::sync::Arc::new(crate::config::ArcConfig::default());
         let relay = std::sync::Arc::new(crate::relay::router::RelayRouter::new());
         let state = AppState {
-            pool,
+            pool: pool.clone(),
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool),
         };
 
         // Create a user
@@ -186,11 +187,12 @@ mod tests {
         let config = std::sync::Arc::new(crate::config::ArcConfig::default());
         let relay = std::sync::Arc::new(crate::relay::router::RelayRouter::new());
         let state = AppState {
-            pool,
+            pool: pool.clone(),
             config,
             relay,
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
+            invitations: crate::mirror::invitation::InvitationStore::new(pool),
         };
 
         let err = get_session(

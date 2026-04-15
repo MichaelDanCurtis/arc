@@ -1,4 +1,5 @@
 pub mod fanout;
+pub mod handlers;
 pub mod invitation;
 pub mod lease;
 pub mod presence;
