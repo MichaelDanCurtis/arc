@@ -62,10 +62,8 @@ impl Fanout {
     pub fn remove(&mut self, session_id: &str, user_id: Uuid, device_label: &str) {
         if let Some(list) = self.sinks.get_mut(session_id) {
             list.retain(|s| !(s.user_id == user_id && s.device_label == device_label));
-            if list.is_empty() {
-                self.sinks.remove(session_id);
-            }
         }
+        self.prune_if_empty(session_id);
     }
 
     /// Send `frame` to every watcher subscribed to `session_id`.
@@ -90,8 +88,13 @@ impl Fanout {
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
             }
         });
-        // If the last watcher was just dropped, clean up the session entry.
-        if self.sinks.get(session_id).map_or(false, Vec::is_empty) {
+        self.prune_if_empty(session_id);
+    }
+
+    /// Remove the HashMap entry if the sink list for `session_id` is empty.
+    /// Idempotent; safe to call when the session key is already absent.
+    fn prune_if_empty(&mut self, session_id: &str) {
+        if self.sinks.get(session_id).is_some_and(Vec::is_empty) {
             self.sinks.remove(session_id);
         }
     }
@@ -154,5 +157,43 @@ mod tests {
         assert!(count > 0, "fast watcher received no frames");
         // Slow watcher was evicted; only the fast sink remains.
         assert_eq!(f.sinks.get(&sid_key).unwrap().len(), 1, "expected only fast sink to remain");
+    }
+
+    #[tokio::test]
+    async fn closed_channel_sink_silently_pruned() {
+        let mut f = Fanout::new();
+        let sid = SessionId::new();
+        let sid_key = sid.to_string();
+        let (tx, rx) = Fanout::make_channel();
+        drop(rx); // Close the channel so try_send returns Closed
+        f.add(&sid_key, WatcherSink {
+            user_id: Uuid::new_v4(),
+            device_label: "dead".into(),
+            tx,
+        });
+        f.broadcast(&sid_key, ArcToClient::SessionOutput {
+            session_id: sid,
+            bytes: vec![1],
+            seq: 0,
+            replay: false,
+        });
+        // Closed sink pruned; empty-list cleanup drops the session entry.
+        assert!(f.sinks.get(&sid_key).is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_drops_session_entry_when_last_watcher_leaves() {
+        let mut f = Fanout::new();
+        let sid = SessionId::new();
+        let sid_key = sid.to_string();
+        let (tx, _rx) = Fanout::make_channel();
+        let uid = Uuid::new_v4();
+        f.add(&sid_key, WatcherSink {
+            user_id: uid,
+            device_label: "only".into(),
+            tx,
+        });
+        f.remove(&sid_key, uid, "only");
+        assert!(f.sinks.get(&sid_key).is_none());
     }
 }
