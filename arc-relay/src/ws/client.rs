@@ -350,6 +350,35 @@ pub async fn handle_client(
         }
     }
 
+    // ── Task 2.11: attached-client disconnect cleanup ─────────────────────────
+    // The attached client may have become driver via handle_session_input's
+    // implicit reclaim (Task 2.10, device_label = "Attached").  Clear the lease
+    // so other watchers see the driver seat freed.  Attached clients are NOT
+    // registered in presence/fanout, so only the lease needs cleanup here.
+    tracing::debug!(
+        user_id = %user_id,
+        session_id = %sid,
+        "attached client disconnected; clearing lease if held"
+    );
+    if let Some(mirror) = state.mirror_registry.get(&sid).await {
+        use beacon_proto::envelope::ArcToClient;
+        let mut m = mirror.lock().await;
+        let was_driver = m.lease.driver().is_some_and(|d| {
+            d.user_id == user_id.to_string() && d.device_label == "Attached"
+        });
+        m.lease.on_disconnect(user_id, "Attached");
+        if was_driver {
+            m.fanout.broadcast(
+                &sid,
+                ArcToClient::LeaseChanged {
+                    session_id: replay_sid,
+                    driver: None,
+                },
+            );
+        }
+        // guard drops here
+    }
+
     tracing::info!(user_id = %user_id, session_id = %sid, "client handler exiting");
 }
 

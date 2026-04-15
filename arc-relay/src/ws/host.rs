@@ -389,6 +389,17 @@ pub async fn handle_host(
         tracing::info!(user_id = %user_id, session_id = %sid, "suspending session on host disconnect");
         router.suspend_session(sid);
 
+        // Task 2.11: clear host_input_tx so subsequent SessionInput frames from
+        // watchers don't try_send into a dead mpsc channel.  The pump task that
+        // drained host_input_rx will stop on its own once host_rx is gone; we
+        // just need to drop the sender so handle_session_input sees None and
+        // returns an error instead of silently queuing into the void.
+        if let Some(mirror) = mirror_registry.get(sid).await {
+            let mut m = mirror.lock().await;
+            m.host_input_tx = None;
+            tracing::debug!(session_id = %sid, "cleared host_input_tx on host disconnect");
+        }
+
         let pool2 = pool.clone();
         let sid2 = sid.clone();
         tokio::spawn(async move {

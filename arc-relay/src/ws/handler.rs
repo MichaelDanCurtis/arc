@@ -265,6 +265,10 @@ async fn handle_connection(
             // Task 2.10+ will add it to the SubscribeSession wire variant.
             let device_label = "Watcher";
             let session_id_str = session_id.to_string();
+            // Keep a Copy of session_id for the post-loop cleanup broadcasts
+            // (session_id is moved into handle_subscribe via &session_id_str, but
+            // SessionId is Copy so we can hold onto it independently).
+            let session_id_typed = session_id;
 
             match crate::mirror::handlers::handle_subscribe(
                 &state,
@@ -421,6 +425,59 @@ async fn handle_connection(
                         }
                     }
                 }
+            }
+
+            // ── Task 2.11: watcher disconnect cleanup ─────────────────────────
+            // All break paths in the loop above converge here.  Clear this
+            // watcher from the SessionMirror so other watchers see an updated
+            // presence list and (if this watcher was the driver) a cleared lease.
+            tracing::debug!(
+                user_id = %user_id,
+                session_id = %session_id_str,
+                "watcher disconnected; clearing lease + presence"
+            );
+
+            // Phase 1: mutate state under lock, capture owned values for broadcast.
+            let (driver_cleared, presence_snapshot) = {
+                match state.mirror_registry.get(&session_id_str).await {
+                    Some(mirror) => {
+                        let mut m = mirror.lock().await;
+                        let was_driver = m.lease.driver().is_some_and(|d| {
+                            d.user_id == user_id.to_string() && d.device_label == device_label
+                        });
+                        m.lease.on_disconnect(user_id, device_label);
+                        m.presence.remove(&session_id_str, user_id, device_label);
+                        m.fanout.remove(&session_id_str, user_id, device_label);
+                        let snap = m.presence.snapshot(&session_id_str);
+                        (was_driver, snap)
+                        // guard drops here
+                    }
+                    None => (false, Vec::new()),
+                }
+            };
+
+            // Phase 2: broadcast — re-acquire lock, call sync fanout.broadcast,
+            // then release before returning.  fanout.broadcast is sync (try_send)
+            // so it is safe to call under the mutex.
+            if let Some(mirror) = state.mirror_registry.get(&session_id_str).await {
+                use beacon_proto::envelope::ArcToClient;
+                let mut m = mirror.lock().await;
+                if driver_cleared {
+                    m.fanout.broadcast(
+                        &session_id_str,
+                        ArcToClient::LeaseChanged {
+                            session_id: session_id_typed,
+                            driver: None,
+                        },
+                    );
+                }
+                m.fanout.broadcast(
+                    &session_id_str,
+                    ArcToClient::PresenceChanged {
+                        session_id: session_id_typed,
+                        watchers: presence_snapshot,
+                    },
+                );
             }
         }
         other => {
