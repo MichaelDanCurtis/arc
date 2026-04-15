@@ -2,7 +2,7 @@
 # Uses the official Rust image; wasm-pack is installed here and the compiled
 # .wasm/.js/.d.ts files are handed off to the Next.js builder stage.
 # The Rust toolchain never touches the runtime image.
-FROM rust:1-bookworm AS wasm-builder
+FROM rust:1.85-bookworm AS wasm-builder
 # Install wasm-pack pinned to 0.14.0 (current stable on crates.io as of 2026-04-15)
 RUN cargo install wasm-pack --version 0.14.0 --locked
 
