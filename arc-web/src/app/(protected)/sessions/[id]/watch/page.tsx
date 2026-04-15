@@ -33,6 +33,7 @@ import { useWebSocket } from "@/hooks/use-websocket";
 import { useMirrorBlocks } from "@/hooks/use-mirror-blocks";
 import { WatchBlockList } from "@/components/watch/WatchBlockList";
 import { XtermWrapper, type XtermHandle } from "@/components/terminal/xterm-wrapper";
+import { ChevronRightIcon, ChevronLeftIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { ArcToClient, DriverInfo, WatcherInfo, ClientToArc } from "@/types/protocol";
@@ -311,6 +312,7 @@ export default function WatchPage() {
             "flex shrink-0 flex-col border-l border-white/10 bg-muted/30 transition-all",
             blockListOpen ? "w-72" : "w-8",
           )}
+          aria-label="Mirror blocks"
           data-testid="block-list-sidebar"
         >
           {/* Collapse toggle button — mimics watchers-list header style */}
@@ -324,11 +326,14 @@ export default function WatchPage() {
               variant="ghost"
               size="sm"
               className="h-5 w-5 p-0 text-muted-foreground"
-              aria-label={blockListOpen ? "Collapse block list" : "Expand block list"}
+              aria-label={blockListOpen ? "Collapse mirror blocks" : "Expand mirror blocks"}
+              aria-expanded={blockListOpen}
               onClick={() => setBlockListOpen((o) => !o)}
               data-testid="block-list-toggle"
             >
-              {blockListOpen ? "›" : "‹"}
+              {blockListOpen
+                ? <ChevronRightIcon className="size-4" aria-hidden="true" />
+                : <ChevronLeftIcon className="size-4" aria-hidden="true" />}
             </Button>
           </div>
           {blockListOpen && (
