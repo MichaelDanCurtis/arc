@@ -223,6 +223,46 @@ describe("WatchPage", () => {
     expect(capturedSend).not.toHaveBeenCalled();
   });
 
+  it("resubscribes with since_seq null when discontinuity arrives before any output", () => {
+    render(<WatchPage />);
+    // No SessionOutput delivered — lastSeenSeqRef is still null
+    dispatch({
+      kind: "SessionDiscontinuity",
+      data: { session_id: SESSION_ID, last_seq: 5 },
+    });
+    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
+    const resubscribe = calls.find(
+      (c) => c.kind === "SubscribeSession",
+    ) as Extract<ClientToArc, { kind: "SubscribeSession" }> | undefined;
+    expect(resubscribe).toBeDefined();
+    expect(resubscribe!.data.session_id).toBe(SESSION_ID);
+    expect(resubscribe!.data.since_seq).toBeNull();
+  });
+
+  it("tracks max seq across out-of-order SessionOutput frames", () => {
+    render(<WatchPage />);
+    // Deliver seq 15 first, then seq 10 (out of order)
+    dispatch({
+      kind: "SessionOutput",
+      data: { session_id: SESSION_ID, bytes: new Uint8Array([0x61]), seq: 15, replay: false },
+    });
+    dispatch({
+      kind: "SessionOutput",
+      data: { session_id: SESSION_ID, bytes: new Uint8Array([0x62]), seq: 10, replay: false },
+    });
+    // Discontinuity should resubscribe from 15 (the max), not 10 (the most recent)
+    dispatch({
+      kind: "SessionDiscontinuity",
+      data: { session_id: SESSION_ID, last_seq: 20 },
+    });
+    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
+    const resubscribe = calls.find(
+      (c) => c.kind === "SubscribeSession",
+    ) as Extract<ClientToArc, { kind: "SubscribeSession" }> | undefined;
+    expect(resubscribe).toBeDefined();
+    expect(resubscribe!.data.since_seq).toBe(15);
+  });
+
   // ── SessionOutput ─────────────────────────────────────────────────────────
 
   it("writes SessionOutput bytes to xterm", () => {
@@ -235,6 +275,7 @@ describe("WatchPage", () => {
     expect(writeToXterm).toHaveBeenCalled();
     const args = vi.mocked(writeToXterm).mock.calls[0];
     expect(args[1]).toBeInstanceOf(Uint8Array);
+    expect(args[1]).toEqual(new Uint8Array([0x68, 0x69]));
   });
 
   it("writes replay:true SessionOutput bytes to xterm (history)", () => {

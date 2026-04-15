@@ -49,9 +49,8 @@ export default function WatchPage() {
     (msg: ArcToClient) => {
       // Only process envelopes for this session.
       // All mirroring envelope types carry a session_id inside .data.
-      if ("data" in msg && msg.data !== null && "session_id" in (msg.data as object)) {
-        const d = msg.data as { session_id: string };
-        if (d.session_id !== id) return;
+      if (msg.data !== null && "session_id" in msg.data) {
+        if ((msg.data as { session_id: string }).session_id !== id) return;
       }
 
       switch (msg.kind) {
@@ -91,6 +90,8 @@ export default function WatchPage() {
           });
           break;
         }
+        // Non-mirror kinds (e.g. BlockOutputChunk, Ping) are intentionally dropped
+        // on the view-only watch page.
         default:
           break;
       }
