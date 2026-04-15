@@ -28,7 +28,7 @@ export function BlockRenderer({ block }: Props) {
 
       {!collapsed && outputHtml && (
         <div
-          className="border-t bg-[#1e1e1e] px-3 py-2 font-mono text-sm text-[#d4d4d4] overflow-x-auto"
+          className="border-t bg-neutral-900 px-3 py-2 font-mono text-sm text-neutral-200 overflow-x-auto"
           dangerouslySetInnerHTML={{ __html: outputHtml }}
         />
       )}

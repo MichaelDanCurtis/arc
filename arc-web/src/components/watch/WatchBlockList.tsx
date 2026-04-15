@@ -13,7 +13,7 @@
  * - No virtualisation — deferred.
  */
 
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import type { WatchBlock } from "@/types/watch-block";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
@@ -105,7 +105,7 @@ interface WatchBlockItemProps {
   isCurrentBlock: boolean;
 }
 
-function WatchBlockItem({ block, isCurrentBlock }: WatchBlockItemProps) {
+const WatchBlockItem = memo(function WatchBlockItem({ block, isCurrentBlock }: WatchBlockItemProps) {
   const outputText = useMemo(() => decodeOutput(block.output), [block.output]);
 
   // D2: render em-dash when command is empty.
@@ -160,7 +160,7 @@ function WatchBlockItem({ block, isCurrentBlock }: WatchBlockItemProps) {
       )}
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // WatchBlockList — public component.
