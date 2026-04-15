@@ -20,12 +20,12 @@ import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
 // Output decoder — lazy, non-fatal UTF-8.
+// A fresh TextDecoder is created per call so a future { stream: true } usage
+// elsewhere cannot corrupt shared decoder state.
 // ---------------------------------------------------------------------------
 
-const outputDecoder = new TextDecoder("utf-8", { fatal: false });
-
 function decodeOutput(bytes: Uint8Array): string {
-  return outputDecoder.decode(bytes);
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -59,12 +59,20 @@ function ExitCodeChip({
 }) {
   // D4: heuristic blocks never have a reliable exit code — show em-dash.
   if (mode === "heuristic" || exitCode === null) {
-    return <span className="font-mono text-xs text-muted-foreground">—</span>;
+    return (
+      <span
+        data-testid="exit-code-chip"
+        className="font-mono text-xs text-muted-foreground"
+      >
+        —
+      </span>
+    );
   }
 
   const isError = exitCode !== 0;
   return (
     <Badge
+      data-testid="exit-code-chip"
       variant="outline"
       className={cn(
         "font-mono text-xs",
@@ -141,9 +149,9 @@ function WatchBlockItem({ block, isCurrentBlock }: WatchBlockItemProps) {
 
       {/* Output area — plain UTF-8 pre, no ANSI parsing yet (deferred) */}
       {outputText.length > 0 && (
-        <div className="border-t bg-[#1e1e1e] px-3 py-2">
+        <div className="border-t bg-neutral-900 px-3 py-2">
           <pre
-            className="overflow-x-auto font-mono text-sm text-[#d4d4d4] whitespace-pre-wrap"
+            className="overflow-x-auto font-mono text-sm text-neutral-200 whitespace-pre-wrap"
             data-testid="output-pre"
           >
             {outputText}

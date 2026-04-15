@@ -93,11 +93,10 @@ describe("WatchBlockList — D4 exit code chip", () => {
   it("renders em-dash for heuristic block regardless of exitCode", () => {
     const block = makeBlock({ mode: "heuristic", exitCode: null });
     render(<WatchBlockList blocks={[block]} currentBlockId={null} />);
-    // em-dash in the exit code chip area
-    const emDashes = screen.getAllByText("—");
-    // At least one em-dash: either from empty command or exit code chip.
-    // Here command is 'ls -la' so the em-dash must be from the exit code chip.
-    expect(emDashes.length).toBeGreaterThanOrEqual(1);
+    // Use the testid to target the chip directly — avoids relying on em-dash
+    // count across the whole rendered tree.
+    const chip = screen.getByTestId("exit-code-chip");
+    expect(chip.textContent).toBe("—");
   });
 
   it("renders em-dash for osc133 block with null exitCode (still running)", () => {
