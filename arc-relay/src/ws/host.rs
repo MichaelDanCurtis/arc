@@ -85,9 +85,12 @@ pub async fn handle_host(
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
 
     // Drain host_rx (client input forwarded by the router) into out_tx.
+    // Clone out_tx here so the SessionRegister arm can clone it again for the
+    // host_input pump task (Task 2.10).
+    let out_tx_router = out_tx.clone();
     tokio::spawn(async move {
         while let Some(data) = host_rx.recv().await {
-            if out_tx.send(data).await.is_err() {
+            if out_tx_router.send(data).await.is_err() {
                 break; // socket writer is gone
             }
         }
@@ -163,6 +166,59 @@ pub async fn handle_host(
                                     name.clone(),
                                 );
                                 registered_sessions.push(sid.clone());
+
+                                // ── Task 2.10: plumb host_input_tx ──────────────
+                                // Create an mpsc channel for watcher→host input forwarding.
+                                // The sender half is stored in SessionMirror.host_input_tx;
+                                // the receiver half is drained by a pump task that writes
+                                // ArcToClient::HostInput frames to the host socket via out_tx.
+                                //
+                                // We get_or_init the mirror here (owner=user_id, eligible=[]
+                                // as a conservative default — handle_subscribe will init with
+                                // the real eligible list if a watcher subscribes first; if the
+                                // host registers first, eligible starts empty and is not
+                                // retroactively updated since the mirror was already inited).
+                                // The eligible list is only consulted for non-owner try_grab
+                                // calls, so an empty list at host-register time is safe when
+                                // watchers subscribe later through handle_subscribe which loads
+                                // the real eligible set and calls get_or_init (which is a
+                                // no-op for already-inited mirrors).
+                                let mirror_arc = mirror_registry
+                                    .get_or_init(&sid, user_id, vec![])
+                                    .await;
+
+                                let (host_input_tx, mut host_input_rx) =
+                                    mpsc::channel::<beacon_proto::envelope::ArcToClient>(256);
+
+                                {
+                                    let mut m = mirror_arc.lock().await;
+                                    m.host_input_tx = Some(host_input_tx);
+                                }
+
+                                // Pump task: ArcToClient frames → host socket (via out_tx).
+                                let out_tx2 = out_tx.clone();
+                                let sid_pump = sid.clone();
+                                tokio::spawn(async move {
+                                    while let Some(frame) = host_input_rx.recv().await {
+                                        match beacon_proto::codec::encode(&frame) {
+                                            Ok(bytes) => {
+                                                if out_tx2.send(bytes).await.is_err() {
+                                                    tracing::debug!(
+                                                        session_id = %sid_pump,
+                                                        "host_input pump: out_tx closed; stopping"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    session_id = %sid_pump,
+                                                    "host_input pump: encode error: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                });
 
                                 // Persist session to DB (best-effort).
                                 let pool2 = pool.clone();

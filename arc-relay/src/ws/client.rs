@@ -12,6 +12,7 @@ use std::time::SystemTime;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
+use crate::api::AppState;
 use crate::ws::handler::{
     close_with_code, token_decode_status, TokenStatus, CLOSE_TOKEN_EXPIRED, CLOSE_TOKEN_INVALID,
     TOKEN_REVALIDATE_INTERVAL,
@@ -30,6 +31,10 @@ use crate::{models::block::get_blocks_for_session, relay::router::RelayRouter};
 /// 4. Enter the main loop: forward live broadcast frames to the client while
 ///    reading client input (SessionInput, DetachSession) from the socket.
 /// 5. On disconnect: clean up silently (no router state to remove for clients).
+// Eight arguments: WS socket, identity, open message, router, pool, token,
+// jwt_secret, and app state (added in Task 2.10 for lease check). Same
+// justification as handle_host which already carries the same allow attribute.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_client(
     mut socket: WebSocket,
     user_id: Uuid,
@@ -38,6 +43,7 @@ pub async fn handle_client(
     pool: PgPool,
     token: String,
     jwt_secret: String,
+    state: AppState,
 ) {
     // ── Unpack AttachSession ──────────────────────────────────────────────────
     let (session_id, since_block) = match attach_msg {
@@ -247,31 +253,49 @@ pub async fn handle_client(
                                 session_id: input_sid,
                                 bytes: input_bytes,
                             }) => {
-                                // Re-encode as a ClientToArc::SessionInput and
-                                // forward to the host via the router.
-                                let fwd = ClientToArc::SessionInput {
-                                    session_id: input_sid,
-                                    bytes: input_bytes,
-                                };
-                                match encode(&fwd) {
-                                    Ok(encoded) => {
-                                        if !router
-                                            .send_to_host(&sid, encoded)
-                                            .await
-                                        {
+                                // Task 2.10: route through handle_session_input so the
+                                // lease check (and implicit reclaim for the owner) runs
+                                // before forwarding to the host.
+                                //
+                                // Design decision — host_input_tx over router.send_to_host:
+                                // handle_session_input sends via mirror.host_input_tx
+                                // (ArcToClient::HostInput), which is the correct relay→host
+                                // direction for mirrored input. router.send_to_host is
+                                // retained as the fallback only when the mirror is not
+                                // registered (non-mirrored sessions that pre-date Task 2.9).
+                                let input_sid_str = input_sid.to_string();
+                                let mirror_result = crate::mirror::handlers::handle_session_input(
+                                    &state,
+                                    user_id,
+                                    "Attached",
+                                    &input_sid_str,
+                                    input_bytes.clone(),
+                                ).await;
+
+                                if let Err(crate::mirror::handlers::ControlError::SessionNotFound) = mirror_result {
+                                    // Session not in mirror registry — fall back to
+                                    // router.send_to_host for non-mirrored sessions.
+                                    let fwd = ClientToArc::SessionInput {
+                                        session_id: input_sid,
+                                        bytes: input_bytes,
+                                    };
+                                    match encode(&fwd) {
+                                        Ok(encoded) => {
+                                            if !router.send_to_host(&sid, encoded).await {
+                                                tracing::warn!(
+                                                    user_id = %user_id,
+                                                    session_id = %sid,
+                                                    "send_to_host failed (session gone?)"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
                                             tracing::warn!(
                                                 user_id = %user_id,
                                                 session_id = %sid,
-                                                "send_to_host failed (session gone?)"
+                                                "failed to encode SessionInput for fallback forward: {e}"
                                             );
                                         }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            user_id = %user_id,
-                                            session_id = %sid,
-                                            "failed to encode SessionInput for forwarding: {e}"
-                                        );
                                     }
                                 }
                             }

@@ -230,6 +230,7 @@ async fn handle_connection(
                 state.pool.clone(),
                 token,
                 jwt_secret,
+                state.clone(),
             )
             .await;
         }
@@ -285,8 +286,9 @@ async fn handle_connection(
             }
 
             // Forward frames from the fanout channel to the WebSocket.
-            // For Task 2.8, break on any inbound client message or socket close
-            // (control handling is Task 2.10+).
+            // Task 2.10: dispatch inbound control frames from the watcher.
+            // Sanctioned deviation: device_label still hardcoded as "Watcher"
+            // (envelope.rs RequestControl has no device_label field yet).
             loop {
                 tokio::select! {
                     frame = sink_rx.recv() => {
@@ -313,12 +315,109 @@ async fn handle_connection(
                     }
                     inbound = socket.recv() => {
                         match inbound {
-                            Some(Ok(_)) => {
-                                // Task 2.10+ will handle inbound control frames.
-                                // For now, any inbound message closes the connection.
+                            Some(Ok(Message::Binary(bytes))) => {
+                                match decode::<ClientToArc>(&bytes) {
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            user_id = %user_id,
+                                            session_id = %session_id_str,
+                                            "SubscribeSession: decode error on inbound frame: {e}"
+                                        );
+                                    }
+                                    Ok(ClientToArc::RequestControl { session_id: req_sid }) => {
+                                        let sid_str = req_sid.to_string();
+                                        let _ = crate::mirror::handlers::handle_request_control(
+                                            &state,
+                                            user_id,
+                                            device_label,
+                                            &sid_str,
+                                        ).await;
+                                    }
+                                    Ok(ClientToArc::ApproveControl { session_id: req_sid, request_id }) => {
+                                        let sid_str = req_sid.to_string();
+                                        let _ = crate::mirror::handlers::handle_approve_control(
+                                            &state,
+                                            user_id,
+                                            &request_id,
+                                            &sid_str,
+                                        ).await;
+                                    }
+                                    Ok(ClientToArc::DenyControl { session_id: req_sid, request_id }) => {
+                                        let sid_str = req_sid.to_string();
+                                        let _ = crate::mirror::handlers::handle_deny_control(
+                                            &state,
+                                            user_id,
+                                            &request_id,
+                                            &sid_str,
+                                        ).await;
+                                    }
+                                    Ok(ClientToArc::RevokeControl { session_id: req_sid }) => {
+                                        let sid_str = req_sid.to_string();
+                                        let _ = crate::mirror::handlers::handle_revoke_control(
+                                            &state,
+                                            user_id,
+                                            &sid_str,
+                                        ).await;
+                                    }
+                                    Ok(ClientToArc::SessionInput { session_id: req_sid, bytes: input_bytes }) => {
+                                        let sid_str = req_sid.to_string();
+                                        let _ = crate::mirror::handlers::handle_session_input(
+                                            &state,
+                                            user_id,
+                                            device_label,
+                                            &sid_str,
+                                            input_bytes,
+                                        ).await;
+                                    }
+                                    Ok(ClientToArc::UnsubscribeSession { .. }) => {
+                                        // Clean unsubscribe: exit the pump loop without
+                                        // closing the socket (caller's outer handler does that).
+                                        tracing::info!(
+                                            user_id = %user_id,
+                                            session_id = %session_id_str,
+                                            "watcher sent UnsubscribeSession; exiting pump"
+                                        );
+                                        break;
+                                    }
+                                    Ok(ClientToArc::Pong) => {
+                                        tracing::trace!(user_id = %user_id, "watcher pong");
+                                    }
+                                    Ok(other) => {
+                                        tracing::warn!(
+                                            user_id = %user_id,
+                                            session_id = %session_id_str,
+                                            "SubscribeSession: unexpected inbound variant: {other:?}"
+                                        );
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Close(_))) => {
+                                tracing::info!(
+                                    user_id = %user_id,
+                                    session_id = %session_id_str,
+                                    "watcher sent Close frame"
+                                );
                                 break;
                             }
-                            _ => break,
+                            Some(Ok(_)) => {
+                                // Text / ping / pong frames — ignore.
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(
+                                    user_id = %user_id,
+                                    session_id = %session_id_str,
+                                    "SubscribeSession: socket recv error: {e}"
+                                );
+                                break;
+                            }
+                            None => {
+                                tracing::debug!(
+                                    user_id = %user_id,
+                                    session_id = %session_id_str,
+                                    "SubscribeSession: socket closed by watcher"
+                                );
+                                break;
+                            }
                         }
                     }
                 }

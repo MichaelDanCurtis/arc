@@ -106,6 +106,41 @@ impl Fanout {
     pub fn make_channel() -> (mpsc::Sender<ArcToClient>, mpsc::Receiver<ArcToClient>) {
         mpsc::channel(QUEUE_DEPTH)
     }
+
+    /// Send `frame` to every watcher whose `user_id` matches `owner_user_id`,
+    /// using the same slow-watcher eviction policy as [`broadcast`].
+    ///
+    /// # Design rationale
+    ///
+    /// The plan pseudocode calls for `owner_sinks` to return `Vec<&mut WatcherSink>`
+    /// so callers can call `sink.tx.try_send(...)`.  In practice the borrow-checker
+    /// makes mutable-ref iteration over a retained Vec awkward — any shared reference
+    /// to the Vec blocks the `retain` call used for eviction.  A closure-based
+    /// approach (same as `broadcast`) avoids that friction while keeping the same
+    /// evict-on-full semantics.  The caller passes the frame to send, and this
+    /// method handles eviction internally.
+    pub fn broadcast_to_owner(&mut self, session_id: &str, owner_user_id: Uuid, frame: ArcToClient) {
+        let Some(list) = self.sinks.get_mut(session_id) else { return };
+        list.retain(|sink| {
+            if sink.user_id != owner_user_id {
+                return true; // keep non-owner sinks untouched
+            }
+            match sink.tx.try_send(frame.clone()) {
+                Ok(_) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        user_id = %sink.user_id,
+                        device  = %sink.device_label,
+                        session = %session_id,
+                        "slow owner-watcher disconnect (queue full, owner-only send)"
+                    );
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        });
+        self.prune_if_empty(session_id);
+    }
 }
 
 impl Default for Fanout {
@@ -179,6 +214,48 @@ mod tests {
         });
         // Closed sink pruned; empty-list cleanup drops the session entry.
         assert!(!f.sinks.contains_key(&sid_key));
+    }
+
+    #[tokio::test]
+    async fn broadcast_to_owner_only_reaches_owner_sinks() {
+        let mut f = Fanout::new();
+        let sid = SessionId::new();
+        let sid_key = sid.to_string();
+
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        let (tx_owner, mut rx_owner) = Fanout::make_channel();
+        let (tx_other, mut rx_other) = Fanout::make_channel();
+
+        f.add(&sid_key, WatcherSink {
+            user_id: owner,
+            device_label: "owner-device".into(),
+            tx: tx_owner,
+        });
+        f.add(&sid_key, WatcherSink {
+            user_id: other,
+            device_label: "other-device".into(),
+            tx: tx_other,
+        });
+
+        f.broadcast_to_owner(&sid_key, owner, ArcToClient::LeaseChanged {
+            session_id: sid,
+            driver: None,
+        });
+
+        // Owner sink must receive the frame.
+        assert!(
+            rx_owner.try_recv().is_ok(),
+            "owner sink did not receive broadcast_to_owner frame"
+        );
+        // Non-owner sink must NOT receive it.
+        assert!(
+            rx_other.try_recv().is_err(),
+            "non-owner sink unexpectedly received broadcast_to_owner frame"
+        );
+        // Both sinks remain registered (no eviction).
+        assert_eq!(f.sinks.get(&sid_key).unwrap().len(), 2);
     }
 
     #[tokio::test]

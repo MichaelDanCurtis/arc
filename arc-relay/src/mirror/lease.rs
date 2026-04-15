@@ -48,6 +48,9 @@ impl LeaseManager {
 
     pub fn driver(&self) -> Option<&DriverInfo> { self.driver.as_ref() }
 
+    /// Return the Uuid of the session owner.
+    pub fn owner_user_id(&self) -> Uuid { self.owner_user_id }
+
     pub fn pending_requests(&self) -> impl Iterator<Item = (&String, &PendingRequest)> {
         self.pending.iter()
     }
