@@ -20,6 +20,13 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
 
+  webServer: {
+    command: 'npm run dev',
+    url: 'http://localhost:3000',
+    reuseExistingServer: !process.env.CI,
+    timeout: 240 * 1000,
+  },
+
   projects: [
     {
       name: "chromium",
