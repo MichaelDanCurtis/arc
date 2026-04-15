@@ -75,17 +75,16 @@ export default function WatchPage() {
           break;
         }
         case "LeaseChanged": {
-          setDriver(msg.data.driver);
+          const newDriver = msg.data.driver;
+          setDriver(newDriver);
           // Detection heuristic: if we had a pending request and the new driver
           // is non-null, assume the grant was to us.
           setPendingRequestMine((pending) => {
-            if (pending && msg.data.driver !== null) {
-              setIsDriver(true);
-            } else if (!pending) {
-              // Driver changed without our request — revoke local driver state
-              // (covers relay forcing a lease change or null driver)
-              setIsDriver(false);
-            }
+            // Single decisive expression: become driver iff we had a pending
+            // request AND the relay now shows a non-null driver (implicitly us).
+            // Every other case — denial (null driver while pending), or a lease
+            // change we did not request — sets isDriver=false unambiguously.
+            setIsDriver(pending && newDriver !== null);
             return false; // always clear pending
           });
           break;
@@ -145,22 +144,22 @@ export default function WatchPage() {
 
   const handleData = useCallback(
     (bytes: Uint8Array) => {
-      send({
+      sendRef.current({
         kind: "SessionInput",
         data: { session_id: id, bytes },
       });
     },
-    [send, id],
+    [id],
   );
 
   const handleResize = useCallback(
     (cols: number, rows: number) => {
-      send({
+      sendRef.current({
         kind: "SessionResizeRequest",
         data: { session_id: id, cols, rows },
       });
     },
-    [send, id],
+    [id],
   );
 
   const handleReleaseControl = useCallback(() => {
@@ -190,6 +189,7 @@ export default function WatchPage() {
           <span
             className="text-sm font-medium text-primary"
             data-testid="driver-indicator"
+            aria-live="polite"
           >
             You are driving
           </span>
@@ -197,6 +197,7 @@ export default function WatchPage() {
           <span
             className="text-sm text-muted-foreground"
             data-testid="driver-indicator"
+            aria-live="polite"
           >
             {driver ? (
               <>

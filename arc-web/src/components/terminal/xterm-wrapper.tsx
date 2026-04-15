@@ -108,6 +108,10 @@ export const XtermWrapper = forwardRef<XtermHandle, Props>(function XtermWrapper
 
   // Live-toggle readOnly without reinitialising the terminal.
   // Runs after mount (terminalRef is populated) and on every readOnly change.
+  // Note: the Terminal() constructor above sets disableStdin=true and
+  // cursorBlink=false, which matches the default readOnly=true prop. The first
+  // execution of this effect on mount is therefore an intentional no-op —
+  // it mirrors the state the terminal was already constructed in.
   useEffect(() => {
     const term = terminalRef.current;
     if (!term) return;

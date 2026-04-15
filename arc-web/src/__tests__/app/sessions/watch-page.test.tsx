@@ -406,10 +406,7 @@ describe("WatchPage", () => {
       },
     });
 
-    // Pending cleared — isDriver=false (driver was set but pendingRequestMine was true and
-    // the new driver is non-null, so actually this becomes isDriver=true per the heuristic).
-    // Wait — per spec: if pendingRequestMine===true AND msg.data.driver!==null → isDriver=true
-    // So after clicking Request Control and getting LeaseChanged with driver, isDriver=true.
+    // Per spec: pendingRequestMine===true AND driver!==null → isDriver=true.
     // The "You are driving" indicator should appear instead.
     expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
     // Release Control button should appear
@@ -617,5 +614,30 @@ describe("WatchPage", () => {
   it("XtermWrapper receives readOnly=true in default view-only state", () => {
     render(<WatchPage />);
     expect(mockXtermProps.readOnly).toBe(true);
+  });
+
+  // ── Finding (1): LeaseChanged with null driver while pending must NOT grant isDriver ──
+
+  it("LeaseChanged with null driver while pendingRequestMine does NOT set isDriver", () => {
+    render(<WatchPage />);
+    // Set a driver so Request Control button appears
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    // Click Request Control — sets pendingRequestMine=true
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    // Relay denies by sending LeaseChanged with null driver while we are pending
+    dispatch({
+      kind: "LeaseChanged",
+      data: { session_id: SESSION_ID, driver: null },
+    });
+    // isDriver must NOT become true — xterm stays read-only
+    expect(mockXtermProps.readOnly).toBe(true);
+    // "Release Control" must not appear
+    expect(screen.queryByRole("button", { name: /release control/i })).toBeNull();
   });
 });
