@@ -1,3 +1,4 @@
 pub mod lease;
+pub mod presence;
 pub mod scrollback;
-// (presence, invitation, fanout, handlers land in later Phase 2 tasks)
+// (invitation, fanout, handlers land in later Phase 2 tasks)
