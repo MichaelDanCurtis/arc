@@ -47,6 +47,41 @@ pub enum IpcRequest {
         rows: u16,
     },
     Status,
+    // ── Session-mirroring variants ────────────────────────────────────────
+    /// Push raw PTY output bytes with a monotonic sequence number.
+    PushOutput {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        seq: u64,
+    },
+    /// Signal a gap in the output stream (e.g. after reconnect).
+    OutputDiscontinuity {
+        session_id: SessionId,
+        last_seq: u64,
+    },
+    /// Subscribe to the mirrored output stream of a session.
+    Subscribe {
+        session_id: SessionId,
+    },
+    /// Unsubscribe from the mirrored output stream of a session.
+    Unsubscribe {
+        session_id: SessionId,
+    },
+    /// Grant keyboard-control of a session to another user.
+    GrantControl {
+        session_id: SessionId,
+        to_user: String,
+        request_id: String,
+    },
+    /// Deny a pending control request.
+    DenyControl {
+        session_id: SessionId,
+        request_id: String,
+    },
+    /// Revoke active keyboard control from the current driver.
+    RevokeControl {
+        session_id: SessionId,
+    },
 }
 
 /// Response from hostd to a terminal app over IPC.
@@ -68,6 +103,52 @@ pub struct IpcSessionInfo {
     pub name: String,
     pub state: String,
     pub buffered_messages: usize,
+}
+
+/// Hostd → terminal-app event stream (one-way push of async notifications).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum IpcEvent {
+    /// Raw PTY output bytes forwarded from the owning session.
+    RemoteInput {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        from_user: String,
+    },
+    /// The keyboard-control lease changed (new driver or lease dropped).
+    LeaseChanged {
+        session_id: SessionId,
+        driver: Option<DriverInfo>,
+    },
+    /// Another user is requesting keyboard control of this session.
+    ControlRequested {
+        session_id: SessionId,
+        request_id: String,
+        from_user: String,
+        from_device: String,
+    },
+    /// The set of watchers observing this session changed.
+    PresenceChanged {
+        session_id: SessionId,
+        watchers: Vec<WatcherInfo>,
+    },
+}
+
+/// Details about the user currently holding keyboard-control of a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverInfo {
+    pub user_id: String,
+    pub device_label: String,
+    /// Unix timestamp (seconds) when the lease was granted.
+    pub since: i64,
+}
+
+/// Details about a single watcher observing a mirrored session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherInfo {
+    pub user_id: String,
+    pub device_label: String,
+    pub can_drive: bool,
 }
 
 #[derive(Debug, Error)]
@@ -109,6 +190,40 @@ pub async fn write_ipc_response<W: tokio::io::AsyncWrite + Unpin>(
     response: &IpcResponse,
 ) -> Result<(), IpcError> {
     let body = encode(response)?;
+    let len = (body.len() as u32).to_be_bytes();
+    writer.write_all(&len).await?;
+    writer.write_all(&body).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Read a length-delimited IPC event from a stream.
+/// Format: 4-byte big-endian length + msgpack body.
+pub async fn read_ipc_event<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<IpcEvent>, IpcError> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(IpcError::FrameTooLarge(len));
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).await?;
+    let evt: IpcEvent = decode(&body)?;
+    Ok(Some(evt))
+}
+
+/// Write a length-delimited IPC event to a stream.
+pub async fn write_ipc_event<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    event: &IpcEvent,
+) -> Result<(), IpcError> {
+    let body = encode(event)?;
     let len = (body.len() as u32).to_be_bytes();
     writer.write_all(&len).await?;
     writer.write_all(&body).await?;
