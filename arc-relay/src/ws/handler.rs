@@ -55,8 +55,31 @@ pub async fn ws_handler(
         }
     };
 
+    let token = params.token.clone();
     tracing::info!(user_id = %user_id, "WebSocket connection upgrading");
-    ws.on_upgrade(move |socket| handle_connection(socket, user_id, state))
+    ws.on_upgrade(move |socket| handle_connection(socket, user_id, token, state))
+}
+
+/// Close code sent when the access token has expired mid-connection.
+pub const CLOSE_TOKEN_EXPIRED: u16 = 4001;
+
+/// Send a WebSocket close frame with code 4001 (token expired).
+pub async fn close_with_expired(socket: &mut axum::extract::ws::WebSocket) {
+    use axum::extract::ws::{CloseFrame, Message};
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code: CLOSE_TOKEN_EXPIRED.into(),
+            reason: "access token expired".into(),
+        })))
+        .await;
+}
+
+/// Return `true` if the given token is expired (or otherwise invalid).
+///
+/// Uses `decode_token` which validates the signature and expiry with leeway=0.
+/// Any error — including `ExpiredSignature` — returns `true`.
+pub fn token_is_expired(token: &str, jwt_secret: &str) -> bool {
+    decode_token(token, jwt_secret).is_err()
 }
 
 /// Perform the first read on a freshly-upgraded WebSocket to determine
@@ -65,27 +88,54 @@ pub async fn ws_handler(
 async fn handle_connection(
     mut socket: axum::extract::ws::WebSocket,
     user_id: Uuid,
+    token: String,
     state: AppState,
 ) {
     use axum::extract::ws::Message;
     use beacon_proto::codec::decode;
     use beacon_proto::envelope::ClientToArc;
+    use tokio::time::{interval, Duration};
 
-    // Wait for the first binary frame.
-    let first_msg = match socket.recv().await {
-        Some(Ok(Message::Binary(bytes))) => bytes,
-        Some(Ok(_)) => {
-            tracing::warn!(user_id = %user_id, "WebSocket first message was not binary; closing");
-            let _ = socket.close().await;
-            return;
-        }
-        Some(Err(e)) => {
-            tracing::warn!(user_id = %user_id, "WebSocket first message error: {e}");
-            return;
-        }
-        None => {
-            tracing::debug!(user_id = %user_id, "WebSocket closed before first message");
-            return;
+    let jwt_secret = state.config.jwt_secret.clone();
+
+    // Check once immediately in case the token expired between upgrade and dispatch.
+    if token_is_expired(&token, &jwt_secret) {
+        tracing::warn!(user_id = %user_id, "token expired before first message; closing 4001");
+        close_with_expired(&mut socket).await;
+        return;
+    }
+
+    // Wait for the first binary frame, with a periodic expiry re-check.
+    let mut expiry_tick = interval(Duration::from_secs(1));
+    expiry_tick.tick().await; // consume the immediate first tick
+
+    let first_msg = loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Binary(bytes))) => break bytes,
+                    Some(Ok(_)) => {
+                        tracing::warn!(user_id = %user_id, "WebSocket first message was not binary; closing");
+                        let _ = socket.close().await;
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(user_id = %user_id, "WebSocket first message error: {e}");
+                        return;
+                    }
+                    None => {
+                        tracing::debug!(user_id = %user_id, "WebSocket closed before first message");
+                        return;
+                    }
+                }
+            }
+            _ = expiry_tick.tick() => {
+                if token_is_expired(&token, &jwt_secret) {
+                    tracing::warn!(user_id = %user_id, "token expired while waiting for first message; closing 4001");
+                    close_with_expired(&mut socket).await;
+                    return;
+                }
+            }
         }
     };
 
@@ -107,6 +157,8 @@ async fn handle_connection(
                 hello,
                 state.relay.clone(),
                 state.pool.clone(),
+                token,
+                jwt_secret,
             )
             .await;
         }
@@ -118,6 +170,8 @@ async fn handle_connection(
                 attach,
                 state.relay.clone(),
                 state.pool.clone(),
+                token,
+                jwt_secret,
             )
             .await;
         }

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.76"
 
+[lib]
+name = "arc_relay"
+path = "src/lib.rs"
+
 [[bin]]
 name = "arc-relay"
 path = "src/main.rs"
@@ -34,3 +38,5 @@ async-trait = "0.1"
 [dev-dependencies]
 pretty_assertions = "1"
 tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"

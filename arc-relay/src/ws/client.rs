@@ -9,8 +9,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
+use crate::ws::handler::{close_with_expired, token_is_expired};
 use crate::{models::block::get_blocks_for_session, relay::router::RelayRouter};
 
 /// Handle a client (viewer) WebSocket connection.
@@ -31,6 +33,8 @@ pub async fn handle_client(
     attach_msg: ClientToArc,
     router: Arc<RelayRouter>,
     pool: PgPool,
+    token: String,
+    jwt_secret: String,
 ) {
     // ── Unpack AttachSession ──────────────────────────────────────────────────
     let (session_id, since_block) = match attach_msg {
@@ -137,8 +141,26 @@ pub async fn handle_client(
     }
 
     // ── 8. Main loop: live relay + client input ───────────────────────────────
+    // Periodic token re-validation: check every second. JWT decode is cheap
+    // (HMAC-SHA256 + JSON parse) so a 1-second interval imposes no measurable load.
+    let mut expiry_tick = interval(Duration::from_secs(1));
+    expiry_tick.tick().await; // consume the immediate first tick
+
     loop {
         tokio::select! {
+            // Token expiry check.
+            _ = expiry_tick.tick() => {
+                if token_is_expired(&token, &jwt_secret) {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        session_id = %sid,
+                        "client token expired; closing 4001"
+                    );
+                    close_with_expired(&mut socket).await;
+                    break;
+                }
+            }
+
             // Live broadcast frames → client socket.
             result = broadcast_rx.recv() => {
                 match result {

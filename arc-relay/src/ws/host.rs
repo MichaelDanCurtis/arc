@@ -7,8 +7,10 @@ use beacon_proto::{
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
+use crate::ws::handler::{close_with_expired, token_is_expired};
 use crate::{
     models::session::{create_session, update_session_state},
     relay::router::RelayRouter,
@@ -32,6 +34,8 @@ pub async fn handle_host(
     host_hello: ClientToArc,
     router: Arc<RelayRouter>,
     pool: PgPool,
+    token: String,
+    jwt_secret: String,
 ) {
     // ── 1. Log the HostHello fields (we don't re-validate auth here; the
     //        upgrade handler already checked the JWT) ────────────────────────
@@ -87,12 +91,26 @@ pub async fn handle_host(
     let mut registered_sessions: Vec<String> = Vec::new();
 
     // ── 5. Main loop ─────────────────────────────────────────────────────────
+    // Periodic token re-validation: check every second. JWT decode is cheap
+    // (HMAC-SHA256 + JSON parse) so a 1-second interval imposes no measurable load.
+    let mut expiry_tick = interval(Duration::from_secs(1));
+    expiry_tick.tick().await; // consume the immediate first tick
+
     loop {
         tokio::select! {
             // Outbound: forward client input to the host.
             Some(data) = out_rx.recv() => {
                 if socket.send(Message::Binary(data)).await.is_err() {
                     tracing::info!(user_id = %user_id, "host socket send error; disconnecting");
+                    break;
+                }
+            }
+
+            // Token expiry check.
+            _ = expiry_tick.tick() => {
+                if token_is_expired(&token, &jwt_secret) {
+                    tracing::warn!(user_id = %user_id, "host token expired; closing 4001");
+                    close_with_expired(&mut socket).await;
                     break;
                 }
             }

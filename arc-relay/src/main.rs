@@ -1,17 +1,7 @@
+use arc_relay::{api, audit, config, db, relay, retention};
 use std::sync::Arc;
 
 use tower_http::cors::{Any, CorsLayer};
-
-mod api;
-mod audit;
-mod auth;
-mod config;
-mod db;
-mod models;
-mod relay;
-mod retention;
-mod setup;
-mod ws;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
