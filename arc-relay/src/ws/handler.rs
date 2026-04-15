@@ -216,6 +216,7 @@ async fn handle_connection(
                 state.pool.clone(),
                 token,
                 jwt_secret,
+                state.mirror_registry.clone(),
             )
             .await;
         }

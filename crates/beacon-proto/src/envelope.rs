@@ -64,6 +64,13 @@ pub enum ClientToArc {
         diff: String,
     },
 
+    // Host-side: raw PTY output stream (for mirroring)
+    PushOutput {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        seq: u64,
+    },
+
     // Session mirroring: subscribe/control
     SubscribeSession {
         session_id: SessionId,

@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use uuid::Uuid;
 
+use crate::mirror::MirrorRegistry;
 use crate::ws::handler::{
     close_with_code, token_decode_status, TokenStatus, CLOSE_TOKEN_EXPIRED, CLOSE_TOKEN_INVALID,
     TOKEN_REVALIDATE_INTERVAL,
@@ -31,6 +32,7 @@ use crate::{
 /// 4. Main receive loop: match on incoming `ClientToArc` variants and drive the
 ///    relay / DB accordingly.
 /// 5. On disconnect: mark all sessions owned by this host as "suspended".
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_host(
     mut socket: WebSocket,
     user_id: Uuid,
@@ -39,6 +41,7 @@ pub async fn handle_host(
     pool: PgPool,
     token: String,
     jwt_secret: String,
+    mirror_registry: MirrorRegistry,
 ) {
     // ── 1. Log the HostHello fields (we don't re-validate auth here; the
     //        upgrade handler already checked the JWT) ────────────────────────
@@ -270,6 +273,33 @@ pub async fn handle_host(
                                     tracing::warn!(
                                         request_id = %request_id,
                                         "no waiter for shadow diff response"
+                                    );
+                                }
+                            }
+
+                            Ok(ClientToArc::PushOutput {
+                                session_id,
+                                bytes,
+                                seq: _client_seq,
+                            }) => {
+                                let sid = session_id.to_string();
+                                if let Some(mirror) = mirror_registry.get(&sid).await {
+                                    let mut m = mirror.lock().await;
+                                    let canonical_seq = m.scrollback.append(bytes.clone());
+                                    m.fanout.broadcast(
+                                        &sid,
+                                        ArcToClient::SessionOutput {
+                                            session_id,
+                                            bytes,
+                                            seq: canonical_seq,
+                                            replay: false,
+                                        },
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        user_id = %user_id,
+                                        session_id = %sid,
+                                        "PushOutput: session not registered for mirroring; ignoring"
                                     );
                                 }
                             }

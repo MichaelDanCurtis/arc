@@ -47,6 +47,32 @@ impl Relay {
     }
 }
 
+/// Spin up a relay, skipping the test if `DATABASE_URL` is not set.
+///
+/// Convenience wrapper around [`try_spawn_relay`] for tests that use the
+/// `#[ignore]` attribute but call a `spawn_relay` that returns `Relay`
+/// directly.  Returns `None` (caller should early-return) when the DB is
+/// unavailable.
+#[allow(dead_code)]
+pub async fn spawn_relay() -> Option<Relay> {
+    try_spawn_relay().await
+}
+
+/// Drain frames from `conn` until the predicate `pred` returns `true` for a
+/// received frame.  Panics if the stream closes before the predicate matches.
+#[allow(dead_code)]
+pub async fn drain_until<F>(conn: &mut WatcherConn, pred: F)
+where
+    F: Fn(&ArcToClient) -> bool,
+{
+    loop {
+        let frame = conn.recv().await;
+        if pred(&frame) {
+            return;
+        }
+    }
+}
+
 /// Spin up a full axum relay on a random port backed by the `DATABASE_URL`
 /// environment variable.  Returns `None` if `DATABASE_URL` is not set.
 pub async fn try_spawn_relay() -> Option<Relay> {
@@ -269,16 +295,64 @@ pub async fn host_register_session(relay: &Relay, user: &UserCreds, label: &str)
     session_id.to_string()
 }
 
-/// Placeholder for Task 2.9. For Task 2.8 tests we do not push output;
-/// scrollback is empty and the test verifies the subscribe + PresenceChanged path.
+/// Send a `PushOutput` frame from the host for `session_id`.
 ///
-/// Sanctioned deviation: real host push output requires Task 2.9 (ClientToArc::PushOutput).
-#[allow(unused_variables, dead_code)]
+/// Opens a fresh host WebSocket, authenticates with `HostHello`, sends the
+/// `PushOutput` frame, and closes the connection. The session must already be
+/// registered (via `host_register_session`) before calling this.
+#[allow(dead_code)]
 pub async fn host_push_output(
-    _relay: &Relay,
-    _user: &UserCreds,
-    _session_id: &str,
-    _bytes: &[u8],
+    relay: &Relay,
+    user: &UserCreds,
+    session_id: &str,
+    bytes: &[u8],
 ) {
-    // No-op for Task 2.8. Task 2.9 will implement ClientToArc::PushOutput.
+    use beacon_model::SessionId;
+
+    let session_id_parsed: SessionId = session_id.parse().expect("parse session_id");
+
+    let url = relay.ws_url(&user.access_token);
+    let (mut ws, _) = connect_async(&url).await.expect("host_push_output: ws connect");
+
+    // Authenticate with HostHello.
+    ws.send(Message::Binary(
+        encode(&ClientToArc::HostHello {
+            host_id: user.user_id.to_string(),
+            auth_token: user.access_token.clone(),
+            protocol_version: 1,
+        })
+        .expect("encode HostHello"),
+    ))
+    .await
+    .expect("host_push_output: send HostHello");
+
+    // Wait for HelloAck.
+    loop {
+        match ws.next().await.expect("host_push_output: stream ended") {
+            Ok(Message::Binary(b)) => {
+                let msg: ArcToClient = decode(&b).expect("decode");
+                if matches!(msg, ArcToClient::HelloAck { .. }) {
+                    break;
+                }
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("host_push_output: ws error waiting for HelloAck: {e}"),
+        }
+    }
+
+    // Send PushOutput.
+    ws.send(Message::Binary(
+        encode(&ClientToArc::PushOutput {
+            session_id: session_id_parsed,
+            bytes: bytes.to_vec(),
+            seq: 0,
+        })
+        .expect("encode PushOutput"),
+    ))
+    .await
+    .expect("host_push_output: send PushOutput");
+
+    // Give the relay time to process the frame, then close cleanly.
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let _ = ws.close(None).await;
 }
