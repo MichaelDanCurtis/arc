@@ -437,30 +437,30 @@ async fn handle_connection(
                 "watcher disconnected; clearing lease + presence"
             );
 
-            // Phase 1: mutate state under lock, capture owned values for broadcast.
-            let (driver_cleared, presence_snapshot) = {
-                match state.mirror_registry.get(&session_id_str).await {
-                    Some(mirror) => {
-                        let mut m = mirror.lock().await;
-                        let was_driver = m.lease.driver().is_some_and(|d| {
-                            d.user_id == user_id.to_string() && d.device_label == device_label
-                        });
-                        m.lease.on_disconnect(user_id, device_label);
-                        m.presence.remove(&session_id_str, user_id, device_label);
-                        m.fanout.remove(&session_id_str, user_id, device_label);
-                        let snap = m.presence.snapshot(&session_id_str);
-                        (was_driver, snap)
-                        // guard drops here
-                    }
-                    None => (false, Vec::new()),
-                }
-            };
-
-            // Phase 2: broadcast — re-acquire lock, call sync fanout.broadcast,
-            // then release before returning.  fanout.broadcast is sync (try_send)
-            // so it is safe to call under the mutex.
+            // Hold the Arc<Mutex<SessionMirror>> across both phases so the
+            // SessionMirror stays alive even if another task removes the entry
+            // from mirror_registry between Phase 1 and Phase 2.  Without this,
+            // a concurrent session teardown could orphan the final broadcast.
             if let Some(mirror) = state.mirror_registry.get(&session_id_str).await {
                 use beacon_proto::envelope::ArcToClient;
+
+                // Phase 1: mutate state under lock, capture owned values for broadcast.
+                let (driver_cleared, presence_snapshot) = {
+                    let mut m = mirror.lock().await;
+                    let was_driver = m.lease.driver().is_some_and(|d| {
+                        d.user_id == user_id.to_string() && d.device_label == device_label
+                    });
+                    m.lease.on_disconnect(user_id, device_label);
+                    m.presence.remove(&session_id_str, user_id, device_label);
+                    m.fanout.remove(&session_id_str, user_id, device_label);
+                    let snap = m.presence.snapshot(&session_id_str);
+                    (was_driver, snap)
+                    // guard drops here
+                };
+
+                // Phase 2: broadcast — re-acquire lock, call sync fanout.broadcast,
+                // then release before returning.  fanout.broadcast is sync (try_send)
+                // so it is safe to call under the mutex.
                 let mut m = mirror.lock().await;
                 if driver_cleared {
                     m.fanout.broadcast(
