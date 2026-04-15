@@ -15,10 +15,11 @@
  *        a synthetic UserProfile JSON so the auth hook resolves as authenticated.
  *
  * Byte-sequence source: constructed inline.
- *   Block 1 (heuristic): plain shell prompt line "admin@arc:~$ ls\r\n".
- *     The WasmBlockDetector fires heuristic PromptStart on the newline after
- *     a line ending with a sigil-space.  This block is closed synthetically
- *     when the osc133 sequence arrives.
+ *   Block 1 (heuristic): prompt-only line "admin@arc:~$ \n" (no command text).
+ *     trim_end_ascii in heuristic.rs strips only ' '/'\t', not '\r', so the
+ *     sequence must NOT include '\r' before '\n'.  Trimmed buffer ends in '$'
+ *     → detector fires.  The block has no command (renders as "—" em-dash).
+ *     This block is closed synthetically when the osc133 sequence arrives.
  *   Block 2 (osc133): full OSC 133 A/B/C/D sequence with exit code 0.
  *     Sending these bytes mode-locks the detector, emits a synthetic
  *     heuristic CommandEnd for block 1, then opens and closes block 2.
@@ -43,28 +44,42 @@ import { encode as msgpackEncode } from "@msgpack/msgpack";
 // ---------------------------------------------------------------------------
 
 const SESSION_ID = "e2e-wasm-test-session";
-const RELAY_WS_URL = "**/ws**";        // glob: matches ws://localhost:9900/ws?token=…
-const RELAY_BASE = "http://localhost:9900";
+// Narrowed glob: only matches ws://localhost:9900/ws?token=… — avoids false
+// positives against Next HMR WS, /news routes, /views routes, etc.
+const RELAY_WS_URL = "**localhost:9900/ws**";
 const FAKE_TOKEN = "e2e-fake-access-token";
 
 // ---------------------------------------------------------------------------
 // Byte fixtures
 //
-// Block 1 — heuristic
-//   A single prompt line "admin@arc:~$ ls\r\n".  The WasmBlockDetector fires
-//   HeuristicPromptStart on the newline after it sees "$ ".
+// Block 0 — heuristic  (nth(0): sent first → rendered first)
+//   Prompt-only line "admin@arc:~$ \n".  trim_end_ascii strips trailing spaces
+//   → last byte is '$' → HeuristicPromptStart fires.  No command text follows,
+//   so command-text renders as "—" (D2).  Closed synthetically on OSC 133 A.
 //
-// Block 2 — osc133
-//   Full OSC 133 A (PromptStart) → prompt text → B (CommandStart) → command
-//   text → C (OutputStart) → output → D;0 (CommandEnd, exit=0).
-//   Arrival of OSC 133 A closes block 1 synthetically before opening block 2.
+// Block 1 — osc133  (nth(1): OSC 133 sequence arrives second)
+//   Full OSC 133 A (PromptStart) → prompt text → B (CommandStart) →
+//   "echo hello" → C (OutputStart) → output → D;0 (CommandEnd, exit=0).
+//   OSC 133 A arrival mode-locks the detector and emits a synthetic
+//   CommandEnd for block 0 before opening block 1.
 // ---------------------------------------------------------------------------
 
 // prettier-ignore
 const HEURISTIC_BYTES = new Uint8Array([
-  // "admin@arc:~$ ls\r\n"
-  97, 100, 109, 105, 110,  64,  97, 114,  99,  58, 126,  36,
-  32, 108, 115,  13,  10,
+  // "admin@arc:~$ \n"  (prompt-only line, no command text)
+  //
+  // CRITICAL fix: the original sequence was "admin@arc:~$ ls\r\n".
+  // trim_end_ascii in beacon-blocks/src/heuristic.rs strips only ' ' and '\t',
+  // NOT '\r'.  At the '\n' boundary the line buffer is b"admin@arc:~$ ls\r",
+  // so trimmed.last() == Some(b'\r'), which is NOT a prompt sigil — the
+  // detector never fires and the test would time out waiting for block 0.
+  //
+  // With "admin@arc:~$ \n" the buffer at '\n' is b"admin@arc:~$ ", trimmed to
+  // b"admin@arc:~$", and trimmed.last() == Some(b'$') → detector fires.
+  //
+  // The heuristic block will have no command text (renders as "—" em-dash),
+  // which is correct per D2 (heuristic blocks don't extract commands).
+  97, 100, 109, 105, 110,  64,  97, 114,  99,  58, 126,  36,  32,  10,
 ]);
 
 // prettier-ignore
@@ -123,7 +138,9 @@ async function injectFakeToken(page: import("@playwright/test").Page) {
  * This unblocks the useAuth hook so isAuthenticated becomes true.
  */
 async function mockUsersMe(page: import("@playwright/test").Page) {
-  await page.route(`${RELAY_BASE}/api/users/me`, (route) => {
+  // Use a glob ("**/api/users/me") rather than the absolute RELAY_BASE URL so
+  // the mock fires regardless of which origin the app's fetch uses at runtime.
+  await page.route("**/api/users/me", (route) => {
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -206,6 +223,11 @@ test.describe("Watch page — WASM block-list (C4.6)", () => {
 
     const blocks = page.getByTestId("watch-block");
 
+    // nth(0) = heuristic block (HEURISTIC_BYTES sent as seq=1, arrives first).
+    // nth(1) = osc133 block (OSC133_BYTES sent as seq=2, arrives second).
+    // Send order equals render order: sticky-mode handover emits a synthetic
+    // CommandEnd for block 0 on OSC 133 A arrival, then opens block 1.
+
     // --- Block 0: heuristic ---
     const block0 = blocks.nth(0);
 
@@ -227,8 +249,9 @@ test.describe("Watch page — WASM block-list (C4.6)", () => {
     // Green styling: the chip carries border-green-600 / text-green-600
     await expect(exitChip).toHaveClass(/green/);
 
-    // Command text is non-empty for the osc133 block
-    // (prompt bytes "user@host:~$ " are decoded; sigil+space stripped → "user@host:~")
+    // Command text is non-empty for the osc133 block.
+    // The OSC 133 B marker delimits the command; bytes between B and C are
+    // "echo hello" → command-text renders that string, not "—".
     const commandText = block1.getByTestId("command-text");
     await expect(commandText).not.toHaveText("—");
   });
