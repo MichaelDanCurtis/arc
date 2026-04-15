@@ -64,6 +64,29 @@ pub enum ClientToArc {
         diff: String,
     },
 
+    // Session mirroring: subscribe/control
+    SubscribeSession {
+        session_id: SessionId,
+        since_seq: Option<u64>,
+    },
+    UnsubscribeSession {
+        session_id: SessionId,
+    },
+    RequestControl {
+        session_id: SessionId,
+    },
+    ApproveControl {
+        session_id: SessionId,
+        request_id: String,
+    },
+    DenyControl {
+        session_id: SessionId,
+        request_id: String,
+    },
+    RevokeControl {
+        session_id: SessionId,
+    },
+
     Pong,
 }
 
@@ -128,6 +151,41 @@ pub enum ArcToClient {
     ShadowDiffRequest {
         session_id: SessionId,
         request_id: String,
+    },
+
+    // Session mirroring: output stream + control events
+    SessionOutput {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        seq: u64,
+        replay: bool,
+    },
+    SessionDiscontinuity {
+        session_id: SessionId,
+        last_seq: u64,
+    },
+    LeaseChanged {
+        session_id: SessionId,
+        driver: Option<crate::ipc::DriverInfo>,
+    },
+    ControlRequested {
+        session_id: SessionId,
+        request_id: String,
+        from_user: String,
+        from_device: String,
+    },
+    PresenceChanged {
+        session_id: SessionId,
+        watchers: Vec<crate::ipc::WatcherInfo>,
+    },
+    HostInput {
+        session_id: SessionId,
+        bytes: Vec<u8>,
+        from_user: String,
+    },
+    SessionRevoked {
+        session_id: SessionId,
+        reason: String,
     },
 }
 
