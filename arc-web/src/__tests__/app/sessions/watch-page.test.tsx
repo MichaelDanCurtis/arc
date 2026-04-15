@@ -309,4 +309,108 @@ describe("WatchPage", () => {
     expect(unsub).toBeDefined();
     expect(unsub!.data.session_id).toBe(SESSION_ID);
   });
+
+  // ── Request Control ───────────────────────────────────────────────────────
+
+  it("hides Request Control button when driver is null", () => {
+    render(<WatchPage />);
+    // No LeaseChanged delivered — driver is null by default
+    expect(screen.queryByRole("button", { name: /request control/i })).toBeNull();
+  });
+
+  it("shows Request Control button when driver is non-null", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    expect(screen.getByRole("button", { name: /request control/i })).toBeInTheDocument();
+  });
+
+  it("clicking Request Control sends RequestControl envelope", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    const btn = screen.getByRole("button", { name: /request control/i });
+    fireEvent.click(btn);
+
+    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
+    const req = calls.find(
+      (c) => c.kind === "RequestControl",
+    ) as Extract<ClientToArc, { kind: "RequestControl" }> | undefined;
+    expect(req).toBeDefined();
+    expect(req!.data.session_id).toBe(SESSION_ID);
+  });
+
+  it("enters pending state after clicking Request Control", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    const btn = screen.getByRole("button", { name: /request control/i });
+    fireEvent.click(btn);
+
+    // Button should now be disabled and show "Requesting..."
+    const pendingBtn = screen.getByRole("button", { name: /requesting/i });
+    expect(pendingBtn).toBeDisabled();
+  });
+
+  it("clears pending state when LeaseChanged arrives after request", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    // Click to enter pending
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    expect(screen.getByRole("button", { name: /requesting/i })).toBeDisabled();
+
+    // Lease changes (driver updated)
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u2", device_label: "Other Device", since: 2000 },
+      },
+    });
+
+    // Pending cleared — button should be re-enabled (still visible because driver != null)
+    const btn = screen.getByRole("button", { name: /request control/i });
+    expect(btn).not.toBeDisabled();
+  });
+
+  it("back-to-back clicks are idempotent — only one RequestControl sent", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    const btn = screen.getByRole("button", { name: /request control/i });
+    fireEvent.click(btn);
+    // Second click hits disabled button — should not fire again
+    const disabledBtn = screen.getByRole("button", { name: /requesting/i });
+    fireEvent.click(disabledBtn);
+
+    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
+    const reqCalls = calls.filter((c) => c.kind === "RequestControl");
+    expect(reqCalls).toHaveLength(1);
+  });
 });

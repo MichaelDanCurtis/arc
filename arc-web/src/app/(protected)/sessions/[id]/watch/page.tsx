@@ -37,6 +37,8 @@ export default function WatchPage() {
   const [driver, setDriver] = useState<DriverInfo | null>(null);
   const [watchers, setWatchers] = useState<WatcherInfo[]>([]);
   const [revokedReason, setRevokedReason] = useState<string | null>(null);
+  // Request Control pending state: true after click, cleared on any LeaseChanged
+  const [controlPending, setControlPending] = useState(false);
 
   // Track the highest seq received from SessionOutput for discontinuity resume.
   const lastSeenSeqRef = useRef<number | null>(null);
@@ -68,6 +70,8 @@ export default function WatchPage() {
         }
         case "LeaseChanged": {
           setDriver(msg.data.driver);
+          // Clear pending request state on any lease change (granted or denied)
+          setControlPending(false);
           break;
         }
         case "PresenceChanged": {
@@ -154,6 +158,21 @@ export default function WatchPage() {
             "No driver"
           )}
         </span>
+
+        {/* Request Control — only shown when someone else is driving */}
+        {driver && (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={controlPending}
+            onClick={() => {
+              setControlPending(true);
+              sendRef.current({ kind: "RequestControl", data: { session_id: id } });
+            }}
+          >
+            {controlPending ? "Requesting..." : "Request Control"}
+          </Button>
+        )}
       </div>
 
       {/* SessionRevoked banner */}
