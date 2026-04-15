@@ -1,12 +1,13 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { connectToRelay, type ArcWebSocket, type WsState } from "@/lib/ws";
+import { connectToRelay, type ArcWebSocket, type WsState, type ConnectMode } from "@/lib/ws";
 import type { ArcToClient, ClientToArc } from "@/types/protocol";
 
 export function useWebSocket(
   sessionId: string | null,
   onMessage: (msg: ArcToClient) => void,
+  mode: ConnectMode = "attach",
 ) {
   const [state, setState] = useState<WsState>("disconnected");
   const wsRef = useRef<ArcWebSocket | null>(null);
@@ -20,6 +21,7 @@ export function useWebSocket(
       sessionId,
       (msg) => onMessageRef.current(msg),
       setState,
+      mode,
     );
     wsRef.current = ws;
 
@@ -27,7 +29,7 @@ export function useWebSocket(
       ws.close();
       wsRef.current = null;
     };
-  }, [sessionId]);
+  }, [sessionId, mode]);
 
   const send = useCallback((msg: ClientToArc) => {
     wsRef.current?.send(msg);
