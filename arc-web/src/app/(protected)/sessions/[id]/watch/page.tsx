@@ -15,9 +15,16 @@
  * cleanup fires FIRST on unmount — sending UnsubscribeSession before the
  * hook's own ws.close() runs. This gives the relay a clean presence signal.
  *
- * Deferred:
- *   C3 — control UI (RequestControl / Grant / Deny / Revoke)
- *   C4 — BlockList for watchers (WASM block parsing)
+ * C3.5 — isDriver detection heuristic:
+ *   Browser has no myUserId concept (intentional deferral). We use a local
+ *   pendingRequestMine flag: set true on click, cleared on any LeaseChanged.
+ *   If cleared while driver is non-null → assume grant-to-me → isDriver=true.
+ *
+ *   Known edge case: if two watchers click near-simultaneously and the other
+ *   watcher wins, we show "You are driving" for one render before the relay's
+ *   lease check drops our first input. The server-side lease check in
+ *   arc-relay handle_session_input is the authority; this UI is a best-effort
+ *   hint only.
  */
 
 import { useParams, useRouter } from "next/navigation";
@@ -37,8 +44,10 @@ export default function WatchPage() {
   const [driver, setDriver] = useState<DriverInfo | null>(null);
   const [watchers, setWatchers] = useState<WatcherInfo[]>([]);
   const [revokedReason, setRevokedReason] = useState<string | null>(null);
-  // Request Control pending state: true after click, cleared on any LeaseChanged
-  const [controlPending, setControlPending] = useState(false);
+  // pendingRequestMine: true after "Request Control" click, cleared on any LeaseChanged
+  const [pendingRequestMine, setPendingRequestMine] = useState(false);
+  // isDriver: true when we believe the relay has granted us control
+  const [isDriver, setIsDriver] = useState(false);
 
   // Track the highest seq received from SessionOutput for discontinuity resume.
   const lastSeenSeqRef = useRef<number | null>(null);
@@ -58,9 +67,6 @@ export default function WatchPage() {
       switch (msg.kind) {
         case "SessionOutput": {
           // Write bytes to xterm for both live and replay frames.
-          // replay:true is historical content — write it verbatim.
-          // We intentionally do NOT show a "new activity" indicator for
-          // replay frames since they represent already-completed history.
           xtermRef.current?.write(new Uint8Array(msg.data.bytes));
           // Track highest seq for discontinuity resume
           if (lastSeenSeqRef.current === null || msg.data.seq > lastSeenSeqRef.current) {
@@ -70,8 +76,18 @@ export default function WatchPage() {
         }
         case "LeaseChanged": {
           setDriver(msg.data.driver);
-          // Clear pending request state on any lease change (granted or denied)
-          setControlPending(false);
+          // Detection heuristic: if we had a pending request and the new driver
+          // is non-null, assume the grant was to us.
+          setPendingRequestMine((pending) => {
+            if (pending && msg.data.driver !== null) {
+              setIsDriver(true);
+            } else if (!pending) {
+              // Driver changed without our request — revoke local driver state
+              // (covers relay forcing a lease change or null driver)
+              setIsDriver(false);
+            }
+            return false; // always clear pending
+          });
           break;
         }
         case "PresenceChanged": {
@@ -80,6 +96,7 @@ export default function WatchPage() {
         }
         case "SessionRevoked": {
           setRevokedReason(msg.data.reason);
+          setIsDriver(false);
           break;
         }
         case "SessionDiscontinuity": {
@@ -108,8 +125,6 @@ export default function WatchPage() {
   const { state: wsState, send } = useWebSocket(id, onMessage, "mirror");
 
   // Keep sendRef in sync with the latest send identity.
-  // useLayoutEffect runs synchronously after DOM mutations but before paint,
-  // ensuring the ref is always current before any subsequent effects fire.
   useLayoutEffect(() => {
     sendRef.current = send;
   });
@@ -126,6 +141,33 @@ export default function WatchPage() {
     };
   }, [id]);
 
+  // ── Input handlers (used when isDriver) ────────────────────────────────
+
+  const handleData = useCallback(
+    (bytes: Uint8Array) => {
+      send({
+        kind: "SessionInput",
+        data: { session_id: id, bytes },
+      });
+    },
+    [send, id],
+  );
+
+  const handleResize = useCallback(
+    (cols: number, rows: number) => {
+      send({
+        kind: "SessionResizeRequest",
+        data: { session_id: id, cols, rows },
+      });
+    },
+    [send, id],
+  );
+
+  const handleReleaseControl = useCallback(() => {
+    send({ kind: "RevokeControl", data: { session_id: id } });
+    setIsDriver(false);
+  }, [send, id]);
+
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
@@ -138,43 +180,60 @@ export default function WatchPage() {
           &larr; Sessions
         </Button>
         <h1 className="font-mono text-lg">{id}</h1>
-        <span className="text-xs text-muted-foreground">(view only)</span>
+        {!isDriver && (
+          <span className="text-xs text-muted-foreground">(view only)</span>
+        )}
         <span className="flex-1" />
 
         {/* Driver indicator */}
-        <span
-          className="text-sm text-muted-foreground"
-          data-testid="driver-indicator"
-        >
-          {driver ? (
-            <>
-              Driver:{" "}
-              <span className="font-medium text-foreground">
-                {driver.device_label}
-              </span>{" "}
-              ({driver.user_id})
-            </>
-          ) : (
-            "No driver"
-          )}
-        </span>
+        {isDriver ? (
+          <span
+            className="text-sm font-medium text-primary"
+            data-testid="driver-indicator"
+          >
+            You are driving
+          </span>
+        ) : (
+          <span
+            className="text-sm text-muted-foreground"
+            data-testid="driver-indicator"
+          >
+            {driver ? (
+              <>
+                Driver:{" "}
+                <span className="font-medium text-foreground">
+                  {driver.device_label}
+                </span>{" "}
+                ({driver.user_id})
+              </>
+            ) : (
+              "No driver"
+            )}
+          </span>
+        )}
 
-        {/* Request Control — only shown when someone else is driving */}
-        {driver && (
+        {/* Control button — conditional on isDriver state */}
+        {isDriver ? (
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={handleReleaseControl}
+          >
+            Release Control
+          </Button>
+        ) : driver ? (
           <Button
             variant="outline"
             size="sm"
-            disabled={controlPending}
+            disabled={pendingRequestMine}
             onClick={() => {
-              // Stuck-pending is a known v0 limitation; mirrors Phase 4.7 Mac pattern.
-              // Relay's LeaseChanged signal is reliable in practice and clears this state.
-              setControlPending(true);
+              setPendingRequestMine(true);
               sendRef.current({ kind: "RequestControl", data: { session_id: id } });
             }}
           >
-            {controlPending ? "Requesting..." : "Request Control"}
+            {pendingRequestMine ? "Requesting..." : "Request Control"}
           </Button>
-        )}
+        ) : null}
       </div>
 
       {/* SessionRevoked banner */}
@@ -197,10 +256,15 @@ export default function WatchPage() {
 
       {/* Main area: terminal + optional watchers sidebar */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Read-only xterm terminal */}
+        {/* xterm terminal — readOnly toggles live without reinit */}
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex-1">
-            <XtermWrapper ref={xtermRef} readOnly={true} />
+            <XtermWrapper
+              ref={xtermRef}
+              readOnly={!isDriver}
+              onData={isDriver ? handleData : undefined}
+              onResize={isDriver ? handleResize : undefined}
+            />
           </div>
         </div>
 
@@ -246,7 +310,9 @@ export default function WatchPage() {
           {wsState}
         </span>
         <span className="flex-1" />
-        <span className="text-xs opacity-60">read-only mirror</span>
+        <span className="text-xs opacity-60">
+          {isDriver ? "driving" : "read-only mirror"}
+        </span>
       </div>
     </div>
   );

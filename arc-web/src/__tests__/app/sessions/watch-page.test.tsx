@@ -21,11 +21,22 @@ vi.mock("next/navigation", () => ({
 
 // Mock XtermWrapper as a forwardRef component — jsdom has no canvas.
 // Expose a module-scoped write mock so tests can assert bytes were written.
+// Also capture latest props for readOnly assertions.
 import React from "react";
 const mockXtermWrite = vi.fn();
+
+interface MockXtermProps {
+  readOnly?: boolean;
+  onData?: (data: Uint8Array) => void;
+  onResize?: (cols: number, rows: number) => void;
+}
+let mockXtermProps: MockXtermProps = {};
+
 vi.mock("@/components/terminal/xterm-wrapper", () => ({
-  XtermWrapper: React.forwardRef((_props: unknown, ref: React.Ref<{ write: (data: Uint8Array | string) => void }>) => {
+  XtermWrapper: React.forwardRef((props: MockXtermProps, ref: React.Ref<{ write: (data: Uint8Array | string) => void }>) => {
     React.useImperativeHandle(ref, () => ({ write: mockXtermWrite }), []);
+    // Capture latest props for assertions (runs on every render)
+    mockXtermProps = props;
     return <div data-testid="xterm-wrapper" />;
   }),
 }));
@@ -69,6 +80,7 @@ describe("WatchPage", () => {
     capturedSend = vi.fn();
     mockPush.mockReset();
     mockXtermWrite.mockReset();
+    mockXtermProps = {};
   });
 
   // ── Navigation ──────────────────────────────────────────────────────────
@@ -384,7 +396,8 @@ describe("WatchPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
     expect(screen.getByRole("button", { name: /requesting/i })).toBeDisabled();
 
-    // Lease changes (driver updated)
+    // Lease changes (driver updated) WITHOUT a non-null driver while pending
+    // — this should clear pending and NOT grant isDriver (driver changed to someone else)
     dispatch({
       kind: "LeaseChanged",
       data: {
@@ -393,9 +406,14 @@ describe("WatchPage", () => {
       },
     });
 
-    // Pending cleared — button should be re-enabled (still visible because driver != null)
-    const btn = screen.getByRole("button", { name: /request control/i });
-    expect(btn).not.toBeDisabled();
+    // Pending cleared — isDriver=false (driver was set but pendingRequestMine was true and
+    // the new driver is non-null, so actually this becomes isDriver=true per the heuristic).
+    // Wait — per spec: if pendingRequestMine===true AND msg.data.driver!==null → isDriver=true
+    // So after clicking Request Control and getting LeaseChanged with driver, isDriver=true.
+    // The "You are driving" indicator should appear instead.
+    expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
+    // Release Control button should appear
+    expect(screen.getByRole("button", { name: /release control/i })).toBeInTheDocument();
   });
 
   it("back-to-back clicks are idempotent — only one RequestControl sent", () => {
@@ -416,5 +434,188 @@ describe("WatchPage", () => {
     const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
     const reqCalls = calls.filter((c) => c.kind === "RequestControl");
     expect(reqCalls).toHaveLength(1);
+  });
+
+  // ── C3.5: isDriver / interactive mode ────────────────────────────────────
+
+  it("shows 'You are driving' and Release Control button after control is granted", () => {
+    render(<WatchPage />);
+    // Set a driver so Request Control button appears
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    // Click Request Control (sets pendingRequestMine=true)
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    // LeaseChanged with non-null driver while pending → grant-to-me
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+      },
+    });
+    expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /release control/i })).toBeInTheDocument();
+    // Request Control button should NOT be present
+    expect(screen.queryByRole("button", { name: /request control/i })).toBeNull();
+  });
+
+  it("renders XtermWrapper with readOnly=false when isDriver is true", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+      },
+    });
+    // After grant, xterm should not be read-only
+    expect(mockXtermProps.readOnly).toBe(false);
+  });
+
+  it("clicking Release Control sends RevokeControl envelope", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+      },
+    });
+    // Now release control
+    fireEvent.click(screen.getByRole("button", { name: /release control/i }));
+
+    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
+    const revoke = calls.find(
+      (c) => c.kind === "RevokeControl",
+    ) as Extract<ClientToArc, { kind: "RevokeControl" }> | undefined;
+    expect(revoke).toBeDefined();
+    expect(revoke!.data.session_id).toBe(SESSION_ID);
+  });
+
+  it("clicking Release Control optimistically clears isDriver", () => {
+    render(<WatchPage />);
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+      },
+    });
+    // Now release
+    fireEvent.click(screen.getByRole("button", { name: /release control/i }));
+    // "You are driving" should disappear
+    expect(screen.queryByText(/you are driving/i)).toBeNull();
+    // Release Control button should disappear (driver still non-null, so Request Control appears)
+    expect(screen.queryByRole("button", { name: /release control/i })).toBeNull();
+  });
+
+  it("LeaseChanged with driver when pendingRequestMine is false does NOT flip to driver mode", () => {
+    render(<WatchPage />);
+    // Receive LeaseChanged WITHOUT having clicked Request Control
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    // isDriver should remain false — "You are driving" should NOT appear
+    expect(screen.queryByText(/you are driving/i)).toBeNull();
+    // Request Control should be visible (not in driver mode)
+    expect(screen.getByRole("button", { name: /request control/i })).toBeInTheDocument();
+    // xterm should be read-only
+    expect(mockXtermProps.readOnly).toBe(true);
+  });
+
+  it("SessionRevoked resets isDriver to false", () => {
+    render(<WatchPage />);
+    // Grant control
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+      },
+    });
+    expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
+
+    // Session revoked
+    dispatch({
+      kind: "SessionRevoked",
+      data: { session_id: SESSION_ID, reason: "host closed session" },
+    });
+    // Should no longer be in driver mode
+    expect(screen.queryByText(/you are driving/i)).toBeNull();
+  });
+
+  it("LeaseChanged with null driver while isDriver resets to view-only", () => {
+    render(<WatchPage />);
+    // Grant control
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /request control/i }));
+    dispatch({
+      kind: "LeaseChanged",
+      data: {
+        session_id: SESSION_ID,
+        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+      },
+    });
+    expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
+
+    // Relay revokes lease (driver becomes null)
+    dispatch({
+      kind: "LeaseChanged",
+      data: { session_id: SESSION_ID, driver: null },
+    });
+    expect(screen.queryByText(/you are driving/i)).toBeNull();
+    expect(mockXtermProps.readOnly).toBe(true);
+  });
+
+  it("XtermWrapper receives readOnly=true in default view-only state", () => {
+    render(<WatchPage />);
+    expect(mockXtermProps.readOnly).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
+import { useEffect, useRef, useLayoutEffect, forwardRef, useImperativeHandle } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -24,6 +24,17 @@ export const XtermWrapper = forwardRef<XtermHandle, Props>(function XtermWrapper
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
 
+  // Stable refs for callbacks — updated every render so listeners installed once
+  // always dispatch to the latest prop values without needing to reinstall.
+  const onDataRef = useRef(onData);
+  const onResizeRef = useRef(onResize);
+  useLayoutEffect(() => {
+    onDataRef.current = onData;
+  });
+  useLayoutEffect(() => {
+    onResizeRef.current = onResize;
+  });
+
   // Expose write method via imperative handle
   useImperativeHandle(
     ref,
@@ -35,12 +46,14 @@ export const XtermWrapper = forwardRef<XtermHandle, Props>(function XtermWrapper
     [],
   );
 
+  // One-time mount effect — no prop deps so toggling readOnly/onData/onResize
+  // never disposes the terminal (which would wipe scrollback).
   useEffect(() => {
     if (!containerRef.current) return;
 
     const term = new Terminal({
-      cursorBlink: !readOnly,
-      disableStdin: readOnly,
+      cursorBlink: false, // Controlled separately by the readOnly effect below
+      disableStdin: true, // Controlled separately by the readOnly effect below
       theme: {
         background: "#1e1e1e",
         foreground: "#d4d4d4",
@@ -67,16 +80,16 @@ export const XtermWrapper = forwardRef<XtermHandle, Props>(function XtermWrapper
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    // Handle user input
-    if (!readOnly && onData) {
-      term.onData((str) => {
-        onData(new TextEncoder().encode(str));
-      });
-    }
+    // Install data listener once — dispatches to current ref value.
+    // disableStdin prevents xterm from emitting input when read-only,
+    // so the listener simply won't fire; no guard needed here.
+    term.onData((str) => {
+      onDataRef.current?.(new TextEncoder().encode(str));
+    });
 
-    // Handle resize
+    // Install resize listener once
     term.onResize(({ cols, rows }) => {
-      onResize?.(cols, rows);
+      onResizeRef.current?.(cols, rows);
     });
 
     // Observe container resize
@@ -91,7 +104,16 @@ export const XtermWrapper = forwardRef<XtermHandle, Props>(function XtermWrapper
       terminalRef.current = null;
       fitAddonRef.current = null;
     };
-  }, [readOnly, onData, onResize]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Live-toggle readOnly without reinitialising the terminal.
+  // Runs after mount (terminalRef is populated) and on every readOnly change.
+  useEffect(() => {
+    const term = terminalRef.current;
+    if (!term) return;
+    term.options.disableStdin = readOnly;
+    term.options.cursorBlink = !readOnly;
+  }, [readOnly]);
 
   return (
     <div
