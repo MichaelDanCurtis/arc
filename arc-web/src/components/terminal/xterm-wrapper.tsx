@@ -1,10 +1,14 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
+
+export interface XtermHandle {
+  write: (data: Uint8Array | string) => void;
+}
 
 interface Props {
   onData?: (data: Uint8Array) => void;
@@ -12,15 +16,24 @@ interface Props {
   readOnly?: boolean;
 }
 
-export function XtermWrapper({ onData, onResize, readOnly = false }: Props) {
+export const XtermWrapper = forwardRef<XtermHandle, Props>(function XtermWrapper(
+  { onData, onResize, readOnly = false },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
 
-  // Expose write method via stable callback
-  const write = useCallback((data: Uint8Array | string) => {
-    terminalRef.current?.write(data);
-  }, []);
+  // Expose write method via imperative handle
+  useImperativeHandle(
+    ref,
+    () => ({
+      write: (data: Uint8Array | string) => {
+        terminalRef.current?.write(data);
+      },
+    }),
+    [],
+  );
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -80,25 +93,12 @@ export function XtermWrapper({ onData, onResize, readOnly = false }: Props) {
     };
   }, [readOnly, onData, onResize]);
 
-  // Attach write to the container element so parent can call it
-  useEffect(() => {
-    const el = containerRef.current;
-    if (el) {
-      (el as any).__xtermWrite = write;
-    }
-  }, [write]);
-
   return (
     <div
       ref={containerRef}
       className="h-64 w-full rounded border bg-[#1e1e1e]"
     />
   );
-}
+});
 
-// Helper to write to an XtermWrapper via its container ref
-export function writeToXterm(containerEl: HTMLDivElement | null, data: Uint8Array | string) {
-  if (containerEl && (containerEl as any).__xtermWrite) {
-    (containerEl as any).__xtermWrite(data);
-  }
-}
+XtermWrapper.displayName = "XtermWrapper";

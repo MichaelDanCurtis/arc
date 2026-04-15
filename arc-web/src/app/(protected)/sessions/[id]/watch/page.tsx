@@ -23,7 +23,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useRef, useCallback, useState, useEffect, useLayoutEffect } from "react";
 import { useWebSocket } from "@/hooks/use-websocket";
-import { XtermWrapper, writeToXterm } from "@/components/terminal/xterm-wrapper";
+import { XtermWrapper, type XtermHandle } from "@/components/terminal/xterm-wrapper";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { ArcToClient, DriverInfo, WatcherInfo, ClientToArc } from "@/types/protocol";
@@ -31,7 +31,7 @@ import type { ArcToClient, DriverInfo, WatcherInfo, ClientToArc } from "@/types/
 export default function WatchPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
-  const xtermContainerRef = useRef<HTMLDivElement>(null);
+  const xtermRef = useRef<XtermHandle>(null);
 
   // Mirror state
   const [driver, setDriver] = useState<DriverInfo | null>(null);
@@ -61,7 +61,7 @@ export default function WatchPage() {
           // replay:true is historical content — write it verbatim.
           // We intentionally do NOT show a "new activity" indicator for
           // replay frames since they represent already-completed history.
-          writeToXterm(xtermContainerRef.current, new Uint8Array(msg.data.bytes));
+          xtermRef.current?.write(new Uint8Array(msg.data.bytes));
           // Track highest seq for discontinuity resume
           if (lastSeenSeqRef.current === null || msg.data.seq > lastSeenSeqRef.current) {
             lastSeenSeqRef.current = msg.data.seq;
@@ -199,8 +199,8 @@ export default function WatchPage() {
       <div className="flex flex-1 overflow-hidden">
         {/* Read-only xterm terminal */}
         <div className="flex min-w-0 flex-1 flex-col">
-          <div ref={xtermContainerRef} className="flex-1">
-            <XtermWrapper readOnly={true} />
+          <div className="flex-1">
+            <XtermWrapper ref={xtermRef} readOnly={true} />
           </div>
         </div>
 

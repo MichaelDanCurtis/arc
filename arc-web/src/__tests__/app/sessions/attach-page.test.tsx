@@ -18,10 +18,15 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
 }));
 
-// Mock XtermWrapper + writeToXterm — jsdom has no canvas
+// Mock XtermWrapper as a forwardRef component — jsdom has no canvas.
+// Expose a module-scoped write mock so tests can assert bytes were written.
+import React from "react";
+const mockXtermWrite = vi.fn();
 vi.mock("@/components/terminal/xterm-wrapper", () => ({
-  XtermWrapper: () => <div data-testid="xterm-wrapper" />,
-  writeToXterm: vi.fn(),
+  XtermWrapper: React.forwardRef((_props: unknown, ref: React.Ref<{ write: (data: Uint8Array | string) => void }>) => {
+    React.useImperativeHandle(ref, () => ({ write: mockXtermWrite }), []);
+    return <div data-testid="xterm-wrapper" />;
+  }),
 }));
 
 // Mock heavy UI sub-components that are not under test here
@@ -83,6 +88,7 @@ describe("SessionAttachPage — mirror control events", () => {
     capturedOnMessage = null;
     capturedSend = vi.fn();
     mockPush.mockReset();
+    mockXtermWrite.mockReset();
   });
 
   // ── ControlRequested ───────────────────────────────────────────────────────

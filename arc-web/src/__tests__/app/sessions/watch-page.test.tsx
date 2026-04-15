@@ -19,10 +19,15 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
 }));
 
-// Mock XtermWrapper + writeToXterm so jsdom doesn't need a real canvas
+// Mock XtermWrapper as a forwardRef component — jsdom has no canvas.
+// Expose a module-scoped write mock so tests can assert bytes were written.
+import React from "react";
+const mockXtermWrite = vi.fn();
 vi.mock("@/components/terminal/xterm-wrapper", () => ({
-  XtermWrapper: () => <div data-testid="xterm-wrapper" />,
-  writeToXterm: vi.fn(),
+  XtermWrapper: React.forwardRef((_props: unknown, ref: React.Ref<{ write: (data: Uint8Array | string) => void }>) => {
+    React.useImperativeHandle(ref, () => ({ write: mockXtermWrite }), []);
+    return <div data-testid="xterm-wrapper" />;
+  }),
 }));
 
 // Capture onMessage from useWebSocket so tests can drive inbound messages.
@@ -40,7 +45,6 @@ vi.mock("@/hooks/use-websocket", () => ({
 
 // Import AFTER mocks are established
 import WatchPage from "@/app/(protected)/sessions/[id]/watch/page";
-import { writeToXterm } from "@/components/terminal/xterm-wrapper";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -64,7 +68,7 @@ describe("WatchPage", () => {
     capturedOnMessage = null;
     capturedSend = vi.fn();
     mockPush.mockReset();
-    vi.mocked(writeToXterm).mockReset();
+    mockXtermWrite.mockReset();
   });
 
   // ── Navigation ──────────────────────────────────────────────────────────
@@ -272,10 +276,10 @@ describe("WatchPage", () => {
       kind: "SessionOutput",
       data: { session_id: SESSION_ID, bytes, seq: 1, replay: false },
     });
-    expect(writeToXterm).toHaveBeenCalled();
-    const args = vi.mocked(writeToXterm).mock.calls[0];
-    expect(args[1]).toBeInstanceOf(Uint8Array);
-    expect(args[1]).toEqual(new Uint8Array([0x68, 0x69]));
+    expect(mockXtermWrite).toHaveBeenCalled();
+    const args = mockXtermWrite.mock.calls[0];
+    expect(args[0]).toBeInstanceOf(Uint8Array);
+    expect(args[0]).toEqual(new Uint8Array([0x68, 0x69]));
   });
 
   it("writes replay:true SessionOutput bytes to xterm (history)", () => {
@@ -285,7 +289,7 @@ describe("WatchPage", () => {
       kind: "SessionOutput",
       data: { session_id: SESSION_ID, bytes, seq: 5, replay: true },
     });
-    expect(writeToXterm).toHaveBeenCalled();
+    expect(mockXtermWrite).toHaveBeenCalled();
   });
 
   it("ignores SessionOutput for a different session_id", () => {
@@ -294,7 +298,7 @@ describe("WatchPage", () => {
       kind: "SessionOutput",
       data: { session_id: OTHER_ID, bytes: new Uint8Array([0x61]), seq: 1, replay: false },
     });
-    expect(writeToXterm).not.toHaveBeenCalled();
+    expect(mockXtermWrite).not.toHaveBeenCalled();
   });
 
   // ── Unmount / UnsubscribeSession ──────────────────────────────────────────

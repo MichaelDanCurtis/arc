@@ -5,7 +5,7 @@ import { useRef, useCallback, useState } from "react";
 import { useWebSocket } from "@/hooks/use-websocket";
 import { useBlocks } from "@/hooks/use-blocks";
 import { BlockList } from "@/components/blocks/block-list";
-import { XtermWrapper, writeToXterm } from "@/components/terminal/xterm-wrapper";
+import { XtermWrapper, type XtermHandle } from "@/components/terminal/xterm-wrapper";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ShadowDiffPanel } from "@/components/session/shadow-diff-panel";
@@ -21,7 +21,7 @@ interface ControlRequest {
 export default function SessionAttachPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
-  const xtermContainerRef = useRef<HTMLDivElement>(null);
+  const xtermRef = useRef<XtermHandle>(null);
   const [showShadowDiff, setShowShadowDiff] = useState(false);
   const { blocks, replaying, replayTotal, replayLoaded, handleMessage } =
     useBlocks();
@@ -44,10 +44,7 @@ export default function SessionAttachPage() {
 
       // Write live output chunks directly to xterm
       if (msg.kind === "BlockOutputChunk") {
-        writeToXterm(
-          xtermContainerRef.current,
-          new Uint8Array(msg.data.bytes),
-        );
+        xtermRef.current?.write(new Uint8Array(msg.data.bytes));
       }
 
       switch (msg.kind) {
@@ -214,13 +211,12 @@ export default function SessionAttachPage() {
           </div>
 
           {/* Live terminal (xterm.js) */}
-          <div ref={xtermContainerRef}>
-            <XtermWrapper
-              onData={handleInput}
-              onResize={handleResize}
-              readOnly={false}
-            />
-          </div>
+          <XtermWrapper
+            ref={xtermRef}
+            onData={handleInput}
+            onResize={handleResize}
+            readOnly={false}
+          />
         </div>
 
         {showShadowDiff && (
