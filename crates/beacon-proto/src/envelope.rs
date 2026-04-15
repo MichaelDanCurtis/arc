@@ -103,6 +103,7 @@ pub enum ArcToClient {
         session_id: SessionId,
         reason: String,
     },
+    /// The session has been terminated or evicted — it no longer exists.
     SessionGone {
         session_id: SessionId,
         reason: String,
@@ -154,6 +155,12 @@ pub enum ArcToClient {
     },
 
     // Session mirroring: output stream + control events
+
+    /// PTY output from the session. `replay: true` means this chunk is part
+    /// of the catch-up scroll-back delivered right after subscribe;
+    /// `replay: false` means it's a live byte from the session as it happened.
+    /// Downstream clients should not treat replay chunks as new terminal events
+    /// for UI purposes (no beep, no notification, no activity indicator).
     SessionOutput {
         session_id: SessionId,
         bytes: Vec<u8>,
@@ -178,11 +185,18 @@ pub enum ArcToClient {
         session_id: SessionId,
         watchers: Vec<crate::ipc::WatcherInfo>,
     },
+    /// Keystroke echo from the session's current driver (host), forwarded to
+    /// every subscribed watcher so their local UI can show what's being typed.
+    /// Paired with `ClientToArc::SessionInput` (which travels the other direction:
+    /// watcher-turned-driver → Arc → host).
     HostInput {
         session_id: SessionId,
         bytes: Vec<u8>,
         from_user: String,
     },
+    /// The user's subscription was revoked but the session still exists
+    /// (e.g. host stopped sharing with this user, or a permission change).
+    /// Contrast with `SessionGone`, which means the session is actually gone.
     SessionRevoked {
         session_id: SessionId,
         reason: String,

@@ -28,6 +28,8 @@ fn session_output_round_trip() {
         replay: false,
     };
     let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains("\"kind\":\"SessionOutput\""), "expected kind tag: {json}");
+    assert!(json.contains("\"replay\":false"), "expected replay field: {json}");
     let back: ArcToClient = serde_json::from_str(&json).unwrap();
     match back {
         ArcToClient::SessionOutput { session_id, bytes, seq, replay } => {
@@ -84,4 +86,16 @@ fn host_input_round_trip() {
     let json = serde_json::to_string(&msg).unwrap();
     let back: ArcToClient = serde_json::from_str(&json).unwrap();
     assert!(matches!(back, ArcToClient::HostInput { .. }));
+}
+
+#[test]
+fn subscribe_session_none_round_trip() {
+    let sid: SessionId = "01KP70H1HSPDGYSKPAD42FY8BN".parse().unwrap();
+    let msg = ClientToArc::SubscribeSession { session_id: sid, since_seq: None };
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: ClientToArc = serde_json::from_str(&json).unwrap();
+    match back {
+        ClientToArc::SubscribeSession { since_seq, .. } => assert_eq!(since_seq, None),
+        other => panic!("wrong variant: {other:?}"),
+    }
 }
