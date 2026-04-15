@@ -193,6 +193,30 @@ describe("SessionAttachPage — mirror control events", () => {
     expect(screen.queryByText(/Ghost's Machine/i)).toBeNull();
   });
 
+  it("dedupes ControlRequested by request_id", () => {
+    render(<AttachPage />);
+    dispatch({
+      kind: "ControlRequested",
+      data: {
+        session_id: SESSION_ID,
+        request_id: "req-dup",
+        from_user: "alice",
+        from_device: "Alice's Mac",
+      },
+    });
+    dispatch({
+      kind: "ControlRequested",
+      data: {
+        session_id: SESSION_ID,
+        request_id: "req-dup",
+        from_user: "alice-2",
+        from_device: "Alice's Other Mac",
+      },
+    });
+    const banners = screen.getAllByTestId("control-request-banner");
+    expect(banners.length).toBe(1);
+  });
+
   it("correctly handles Grant for one of multiple pending requests", () => {
     render(<AttachPage />);
     dispatch({

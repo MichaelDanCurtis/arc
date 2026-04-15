@@ -33,6 +33,13 @@ export default function SessionAttachPage() {
 
   const onMessage = useCallback(
     (msg: ArcToClient) => {
+      // Mirror-mode events — only process envelopes for this session.
+      // All message types carrying session_id (BlockOutputChunk, replay frames,
+      // mirror control envelopes) are gated here first.
+      if (msg.data !== null && "session_id" in msg.data) {
+        if ((msg.data as { session_id: string }).session_id !== id) return;
+      }
+
       handleMessage(msg);
 
       // Write live output chunks directly to xterm
@@ -43,22 +50,15 @@ export default function SessionAttachPage() {
         );
       }
 
-      // Mirror-mode events — only process envelopes for this session
-      if (msg.data !== null && "session_id" in msg.data) {
-        if ((msg.data as { session_id: string }).session_id !== id) return;
-      }
-
       switch (msg.kind) {
-        case "ControlRequested":
-          setPendingRequests((prev) => [
-            ...prev,
-            {
-              request_id: msg.data.request_id,
-              from_user: msg.data.from_user,
-              from_device: msg.data.from_device,
-            },
-          ]);
+        case "ControlRequested": {
+          const { request_id, from_user, from_device } = msg.data;
+          setPendingRequests((prev) => {
+            if (prev.some((r) => r.request_id === request_id)) return prev;
+            return [...prev, { request_id, from_user, from_device }];
+          });
           break;
+        }
         case "LeaseChanged":
           setCurrentDriver(msg.data.driver);
           break;
@@ -178,6 +178,8 @@ export default function SessionAttachPage() {
       {pendingRequests.map((req) => (
         <div
           key={req.request_id}
+          role="alert"
+          aria-live="polite"
           className="flex items-center gap-3 border-b border-yellow-500/30 bg-yellow-500/10 px-4 py-2 text-sm"
           data-testid="control-request-banner"
         >

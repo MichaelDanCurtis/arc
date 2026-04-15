@@ -166,6 +166,8 @@ export default function WatchPage() {
             size="sm"
             disabled={controlPending}
             onClick={() => {
+              // Stuck-pending is a known v0 limitation; mirrors Phase 4.7 Mac pattern.
+              // Relay's LeaseChanged signal is reliable in practice and clears this state.
               setControlPending(true);
               sendRef.current({ kind: "RequestControl", data: { session_id: id } });
             }}
