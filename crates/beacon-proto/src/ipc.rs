@@ -82,6 +82,22 @@ pub enum IpcRequest {
     RevokeControl {
         session_id: SessionId,
     },
+    // ── Plugin variants ───────────────────────────────────────────────────
+    /// List all plugins with state, pid, rss, last activity, crashes, dropped chunks.
+    ListPlugins,
+    /// User invoked a plugin-registered palette command.
+    InvokeCommand {
+        plugin: String,
+        id: String,
+        session_id: String,
+    },
+    /// User invoked a plugin-added block action.
+    InvokeBlockAction {
+        plugin: String,
+        id: String,
+        block_id: String,
+        session_id: String,
+    },
 }
 
 /// Response from hostd to a terminal app over IPC.
@@ -91,6 +107,19 @@ pub enum IpcResponse {
     Ok,
     SessionList { sessions: Vec<IpcSessionInfo> },
     Error { message: String },
+    Plugins(Vec<PluginInfo>),
+}
+
+/// Plugin info returned in ListPlugins responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginInfo {
+    pub name: String,
+    pub status: String, // "running" | "idle" | "quarantined" | "not_spawned"
+    pub pid: Option<u32>,
+    pub rss_bytes: Option<u64>,
+    pub last_activity_secs_ago: Option<u64>,
+    pub crashes: u32,
+    pub dropped_chunks: u64,
 }
 
 /// Session info returned in Status responses.
@@ -138,17 +167,32 @@ pub enum IpcEvent {
         session_id: SessionId,
         reason: String,
     },
+    /// A plugin emitted a UI-facing event (command registration, block action, etc.).
+    PluginUiEvent(PluginUiEvent),
+}
+
+/// Plugin-emitted UI event variants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "data")]
+pub enum PluginUiEvent {
+    CommandRegistered { plugin: String, id: String, label: String },
+    CommandUnregistered { plugin: String, id: String },
+    BlockActionAdded { plugin: String, block_id: String, id: String, label: String },
+    BlockActionRemoved { plugin: String, block_id: String, id: String },
+    EmitSessionNote { session_id: String, text: String },
+    QuarantineChanged { plugin: String, quarantined: bool },
 }
 
 impl IpcEvent {
     /// Return the session ID this event is associated with.
-    pub fn session_id(&self) -> &SessionId {
+    pub fn session_id(&self) -> Option<&SessionId> {
         match self {
             Self::RemoteInput { session_id, .. }
             | Self::LeaseChanged { session_id, .. }
             | Self::ControlRequested { session_id, .. }
             | Self::PresenceChanged { session_id, .. }
-            | Self::SessionRevoked { session_id, .. } => session_id,
+            | Self::SessionRevoked { session_id, .. } => Some(session_id),
+            Self::PluginUiEvent(_) => None,
         }
     }
 }
@@ -286,5 +330,24 @@ mod tests {
         let bytes = encode(&resp).unwrap();
         let back: IpcResponse = decode(&bytes).unwrap();
         assert!(matches!(back, IpcResponse::SessionList { .. }));
+    }
+
+    #[test]
+    fn plugin_ui_event_roundtrips() {
+        let evt = IpcEvent::PluginUiEvent(PluginUiEvent::CommandRegistered {
+            plugin: "beacon-hello".into(),
+            id: "stats".into(),
+            label: "Show Stats".into(),
+        });
+        let bytes = rmp_serde::to_vec_named(&evt).unwrap();
+        let back: IpcEvent = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back, evt);
+    }
+
+    #[test]
+    fn list_plugins_request_roundtrips() {
+        let req = IpcRequest::ListPlugins;
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let _back: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
     }
 }

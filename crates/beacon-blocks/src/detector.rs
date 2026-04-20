@@ -8,6 +8,36 @@ pub enum BlockEvent {
     OutputStart,
     CommandEnd { exit_code: Option<i32> },
     OutputByte(u8),
+    /// OSC 7 — shell reported a new current working directory.
+    CwdChanged(String),
+}
+
+/// Extract the absolute path from an OSC 7 `file://host/path` payload.
+/// Returns `None` if the payload isn't a recognized `file://` URL.
+fn parse_osc7_cwd(payload: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(payload).ok()?;
+    let rest = s.strip_prefix("file://")?;
+    // Skip the hostname — rest is `host/path`. Path starts at the first `/`.
+    let slash = rest.find('/')?;
+    let raw = &rest[slash..];
+    // Percent-decode just the common cases (%20 etc.). Keep it minimal.
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(hi) = (bytes[i + 1] as char).to_digit(16) {
+                if let Some(lo) = (bytes[i + 2] as char).to_digit(16) {
+                    out.push(((hi * 16 + lo) as u8) as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    Some(out)
 }
 
 #[derive(Default)]
@@ -42,6 +72,14 @@ impl Perform for DetectorPerform {
                     Osc133Event::OutputStart => BlockEvent::OutputStart,
                     Osc133Event::CommandEnd { exit_code } => BlockEvent::CommandEnd { exit_code },
                 });
+            }
+            return;
+        }
+        if params.first().map(|p| *p == b"7").unwrap_or(false) {
+            if let Some(payload) = params.get(1) {
+                if let Some(path) = parse_osc7_cwd(payload) {
+                    self.events.push(BlockEvent::CwdChanged(path));
+                }
             }
         }
     }
@@ -116,6 +154,24 @@ mod tests {
             "missing output, got {:?}",
             String::from_utf8_lossy(&out)
         );
+    }
+
+    #[test]
+    fn osc7_file_url_emits_cwd_changed() {
+        let events = run(b"\x1b]7;file://myhost/Users/alice/proj\x1b\\");
+        let cwd = events.iter().find_map(|e| {
+            if let BlockEvent::CwdChanged(p) = e { Some(p.clone()) } else { None }
+        });
+        assert_eq!(cwd, Some("/Users/alice/proj".to_string()));
+    }
+
+    #[test]
+    fn osc7_percent_encoded_spaces_decoded() {
+        let events = run(b"\x1b]7;file://host/tmp/a%20b\x1b\\");
+        let cwd = events.iter().find_map(|e| {
+            if let BlockEvent::CwdChanged(p) = e { Some(p.clone()) } else { None }
+        });
+        assert_eq!(cwd, Some("/tmp/a b".to_string()));
     }
 
     #[test]
