@@ -14,6 +14,7 @@ use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
+pub mod plugin_routes;
 pub mod session_routes;
 pub mod shadow_routes;
 pub mod team_routes;
@@ -58,6 +59,23 @@ pub fn build_router(state: AppState) -> Router {
             get(team_routes::list_teams).post(team_routes::create_team),
         )
         .route("/teams/:id/members", get(team_routes::list_members))
+        .route(
+            "/plugins/sync",
+            post(plugin_routes::sync_plugins),
+        )
+        .route(
+            "/plugins",
+            get(plugin_routes::list_plugins).post(plugin_routes::register_plugin),
+        )
+        .route(
+            "/plugins/:id",
+            axum::routing::delete(plugin_routes::delete_plugin)
+                .patch(plugin_routes::patch_plugin),
+        )
+        .route(
+            "/plugins/:id/config",
+            get(plugin_routes::get_plugin_config).put(plugin_routes::write_plugin_config),
+        )
         .layer(middleware::from_fn_with_state(
             jwt_secret,
             inject_jwt_secret,
