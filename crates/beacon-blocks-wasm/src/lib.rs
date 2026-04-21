@@ -204,6 +204,9 @@ impl WasmBlockDetector {
                     BlockEvent::OutputByte(b) => {
                         out.push(BlockEventJs::OutputByte { b });
                     }
+
+                    // Ignore CWD changes in the WASM block detector for now.
+                    BlockEvent::CwdChanged(_) => {}
                 }
             }
 
