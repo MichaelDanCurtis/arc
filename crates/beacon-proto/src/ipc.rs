@@ -16,6 +16,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Strategy when installing over an existing plugin of the same name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum InstallStrategy {
+    Fresh,
+    ReplaceKeepConfig,
+    ReplaceFresh,
+}
+
 /// Request from a terminal app to hostd over IPC.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data")]
@@ -98,6 +107,38 @@ pub enum IpcRequest {
         block_id: String,
         session_id: String,
     },
+    // ── Plugin management variants (plugins-pane milestone) ───────────────
+    /// Install a plugin from a validated bundle path or directory.
+    InstallPlugin {
+        bundle_path: std::path::PathBuf,
+        strategy: InstallStrategy,
+    },
+    /// Uninstall a plugin by name; optionally preserve config.toml.
+    UninstallPlugin {
+        name: String,
+        keep_config: bool,
+    },
+    /// Enable or disable a plugin. Disabling kills the subprocess.
+    SetPluginEnabled {
+        name: String,
+        enabled: bool,
+    },
+    /// Read user-editable config.toml text.
+    ReadPluginConfig { name: String },
+    /// Write new config.toml text (validated as TOML before persisting).
+    WritePluginConfig { name: String, toml: String },
+    /// Tail the last `max_lines` of a plugin's log file.
+    ReadPluginLog { name: String, max_lines: u32 },
+    /// Begin streaming PluginLogChunk events for `name`.
+    SubscribePluginLog { name: String },
+    /// Stop streaming log chunks.
+    UnsubscribePluginLog { name: String },
+    /// Synchronous UI→plugin RPC. Plugin returns JSON.
+    CallPluginUI {
+        name: String,
+        method: String,
+        args_json: String,
+    },
 }
 
 /// Response from hostd to a terminal app over IPC.
@@ -108,18 +149,33 @@ pub enum IpcResponse {
     SessionList { sessions: Vec<IpcSessionInfo> },
     Error { message: String },
     Plugins(Vec<PluginInfo>),
+    /// Response body for ReadPluginConfig / WritePluginConfig-success.
+    PluginConfig { toml: String },
+    /// Response body for ReadPluginLog.
+    PluginLog { text: String },
+    /// Response body for CallPluginUI.
+    PluginUiResult { result_json: String },
 }
 
 /// Plugin info returned in ListPlugins responses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginInfo {
     pub name: String,
-    pub status: String, // "running" | "idle" | "quarantined" | "not_spawned"
+    pub status: String, // "running" | "idle" | "quarantined" | "not_spawned" | "disabled" | "install_error"
     pub pid: Option<u32>,
     pub rss_bytes: Option<u64>,
     pub last_activity_secs_ago: Option<u64>,
     pub crashes: u32,
     pub dropped_chunks: u64,
+    // New fields for the Plugins pane.
+    pub version: String,
+    pub author: String,
+    pub description: String,
+    pub config_path: Option<std::path::PathBuf>,
+    pub ui_entrypoint: Option<String>,
+    pub has_icon: bool,
+    pub permissions: Vec<String>,
+    pub install_error: Option<String>,
 }
 
 /// Session info returned in Status responses.
@@ -169,6 +225,8 @@ pub enum IpcEvent {
     },
     /// A plugin emitted a UI-facing event (command registration, block action, etc.).
     PluginUiEvent(PluginUiEvent),
+    /// One live chunk of a plugin's stderr log. Fires only while subscribed.
+    PluginLogChunk { plugin: String, bytes: Vec<u8> },
 }
 
 /// Plugin-emitted UI event variants.
@@ -192,7 +250,7 @@ impl IpcEvent {
             | Self::ControlRequested { session_id, .. }
             | Self::PresenceChanged { session_id, .. }
             | Self::SessionRevoked { session_id, .. } => Some(session_id),
-            Self::PluginUiEvent(_) => None,
+            Self::PluginUiEvent(_) | Self::PluginLogChunk { .. } => None,
         }
     }
 }
@@ -349,5 +407,35 @@ mod tests {
         let req = IpcRequest::ListPlugins;
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let _back: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+    }
+
+    #[test]
+    fn install_plugin_round_trip() {
+        let req = IpcRequest::InstallPlugin {
+            bundle_path: "/tmp/foo.beaconplug".into(),
+            strategy: InstallStrategy::Fresh,
+        };
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let back: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(matches!(back, IpcRequest::InstallPlugin { .. }));
+    }
+
+    #[test]
+    fn plugin_log_chunk_event_round_trip() {
+        let evt = IpcEvent::PluginLogChunk {
+            plugin: "hello".into(),
+            bytes: b"line\n".to_vec(),
+        };
+        let bytes = rmp_serde::to_vec_named(&evt).unwrap();
+        let back: IpcEvent = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(matches!(back, IpcEvent::PluginLogChunk { .. }));
+    }
+
+    #[test]
+    fn read_plugin_config_response_round_trip() {
+        let resp = IpcResponse::PluginConfig { toml: "k = 1".into() };
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
+        let back: IpcResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(matches!(back, IpcResponse::PluginConfig { .. }));
     }
 }
