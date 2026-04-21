@@ -239,6 +239,8 @@ pub enum PluginUiEvent {
     BlockActionRemoved { plugin: String, block_id: String, id: String },
     EmitSessionNote { session_id: String, text: String },
     QuarantineChanged { plugin: String, quarantined: bool },
+    /// Forwarded plugin→UI event (e.g. progress updates, data pushes).
+    UiEvent { plugin: String, method: String, data_json: String },
 }
 
 impl IpcEvent {
