@@ -139,6 +139,11 @@ pub enum IpcRequest {
         method: String,
         args_json: String,
     },
+    /// Preview a plugin bundle: extract + validate without installing.
+    /// Returns manifest metadata, permissions, and icon bytes if present.
+    PreviewPlugin {
+        bundle_path: std::path::PathBuf,
+    },
 }
 
 /// Response from hostd to a terminal app over IPC.
@@ -155,6 +160,17 @@ pub enum IpcResponse {
     PluginLog { text: String },
     /// Response body for CallPluginUI.
     PluginUiResult { result_json: String },
+    /// Response body for PreviewPlugin.
+    PluginPreview {
+        /// JSON-serialized `{name, version, author, description}` from manifest.
+        manifest_json: String,
+        /// Human-readable permission strings from the manifest.
+        permissions: Vec<String>,
+        /// Whether an `icon.png` exists in the bundle.
+        has_icon: bool,
+        /// Raw PNG bytes if present and ≤ 256 KB, else None.
+        icon_png: Option<Vec<u8>>,
+    },
 }
 
 /// Plugin info returned in ListPlugins responses.
@@ -439,5 +455,42 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&resp).unwrap();
         let back: IpcResponse = rmp_serde::from_slice(&bytes).unwrap();
         assert!(matches!(back, IpcResponse::PluginConfig { .. }));
+    }
+
+    #[test]
+    fn preview_plugin_request_round_trip() {
+        let req = IpcRequest::PreviewPlugin {
+            bundle_path: "/tmp/foo.beaconplug".into(),
+        };
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let back: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(matches!(back, IpcRequest::PreviewPlugin { .. }));
+    }
+
+    #[test]
+    fn plugin_preview_response_round_trip() {
+        let resp = IpcResponse::PluginPreview {
+            manifest_json: r#"{"name":"test","version":"0.1.0","author":"me","description":"d"}"#
+                .into(),
+            permissions: vec!["read_session_blocks".into()],
+            has_icon: true,
+            icon_png: Some(vec![0x89, 0x50, 0x4e, 0x47]),
+        };
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
+        let back: IpcResponse = rmp_serde::from_slice(&bytes).unwrap();
+        match back {
+            IpcResponse::PluginPreview {
+                manifest_json,
+                permissions,
+                has_icon,
+                icon_png,
+            } => {
+                assert!(manifest_json.contains("test"));
+                assert_eq!(permissions, vec!["read_session_blocks"]);
+                assert!(has_icon);
+                assert_eq!(icon_png, Some(vec![0x89, 0x50, 0x4e, 0x47]));
+            }
+            _ => panic!("expected PluginPreview"),
+        }
     }
 }
