@@ -14,6 +14,7 @@ use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
+pub mod marketplace_routes;
 pub mod oauth_routes;
 pub mod plugin_routes;
 pub mod session_routes;
@@ -84,6 +85,16 @@ pub fn build_router(state: AppState) -> Router {
             inject_jwt_secret,
         ));
 
+    // ── Public marketplace routes (no JWT required) ──────────────────────────
+    let marketplace = Router::new()
+        .route("/plugins", get(marketplace_routes::list_plugins))
+        .route("/plugins/:slug", get(marketplace_routes::get_plugin))
+        .route(
+            "/plugins/:slug/versions",
+            get(marketplace_routes::get_plugin_versions),
+        )
+        .route("/categories", get(marketplace_routes::list_categories));
+
     // ── Setup routes (public, no JWT required) ──────────────────────────────
     let setup = Router::new()
         .route("/status", get(crate::setup::get_setup_status))
@@ -100,6 +111,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .nest("/api/auth", auth)
+        .nest("/api/marketplace", marketplace)
         .nest("/api", api)
         .nest("/api/setup", setup)
         .nest("/api/audit", audit)
@@ -249,6 +261,26 @@ pub(crate) mod tests {
             StatusCode::UNAUTHORIZED,
             "/api/teams/:id/members needs auth"
         );
+    }
+
+    #[tokio::test]
+    async fn marketplace_plugins_route_exists() {
+        let s = status(build_router(test_state()), "GET", "/api/marketplace/plugins").await;
+        // 500 (lazy pool, no DB) means route exists; 404 means it doesn't
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/marketplace/plugins must exist");
+    }
+
+    #[tokio::test]
+    async fn marketplace_categories_route_exists() {
+        let s = status(build_router(test_state()), "GET", "/api/marketplace/categories").await;
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/marketplace/categories must exist");
+    }
+
+    #[tokio::test]
+    async fn oauth_redirect_route_exists() {
+        let s = status(build_router(test_state()), "GET", "/api/auth/oauth/google").await;
+        // Should be 501 (not configured) not 404 (route missing)
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/auth/oauth/:provider must exist");
     }
 
     #[tokio::test]
