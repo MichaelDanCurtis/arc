@@ -128,7 +128,10 @@ pub async fn login(
     })?;
 
     // Verify password
-    let valid = password::verify_password(&req.password, &existing.password_hash).map_err(|e| {
+    let hash = existing.password_hash.as_deref().ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, "This account uses OAuth login".to_string())
+    })?;
+    let valid = password::verify_password(&req.password, hash).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Password verification error: {e}"),
