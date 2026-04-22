@@ -123,3 +123,46 @@ export interface AuditQuery {
   actor?: string;
   action?: string;
 }
+
+// --- Marketplace ---
+
+export interface MarketplacePlugin {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  category: string | null;
+  icon_url: string | null;
+  homepage_url: string | null;
+  repository_url: string | null;
+  license: string | null;
+  payment_type: string;
+  price_cents: number;
+  author_name: string | null;
+  download_count: number;
+  latest_version: string | null;
+  updated_at: string;
+}
+
+export interface MarketplaceVersion {
+  id: string;
+  plugin_id: string;
+  version: string;
+  release_notes: string | null;
+  platform: string;
+  size_bytes: number | null;
+  download_count: number;
+  created_at: string;
+}
+
+export interface CategoriesResponse {
+  categories: string[];
+}
+
+// --- Organization ---
+
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
+}
