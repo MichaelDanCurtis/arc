@@ -85,6 +85,27 @@ export interface ShadowDiffResponse {
   diff: string;
 }
 
+// --- Plugin ---
+
+export interface PluginEntry {
+  id: string;
+  team_id: string;
+  name: string;
+  version: string;
+  manifest: Record<string, unknown>;
+  source_url: string | null;
+  enabled: boolean;
+  installed_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PluginConfigEntry {
+  config_key: string;
+  config_val: unknown;
+  updated_at: string;
+}
+
 // --- Audit log ---
 
 export interface AuditEntry {
