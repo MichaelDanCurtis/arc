@@ -19,6 +19,28 @@ pub struct ArcConfig {
     /// ARC_MAX_BLOCKS_PER_SESSION — hard cap on blocks per session (default: 5000)
     #[allow(dead_code)]
     pub max_blocks_per_session: u32,
+    /// ARC_OAUTH_GOOGLE_CLIENT_ID
+    pub oauth_google_client_id: Option<String>,
+    /// ARC_OAUTH_GOOGLE_CLIENT_SECRET
+    pub oauth_google_client_secret: Option<String>,
+    /// ARC_OAUTH_MICROSOFT_CLIENT_ID
+    pub oauth_microsoft_client_id: Option<String>,
+    /// ARC_OAUTH_MICROSOFT_CLIENT_SECRET
+    pub oauth_microsoft_client_secret: Option<String>,
+    /// ARC_OAUTH_GITHUB_CLIENT_ID
+    pub oauth_github_client_id: Option<String>,
+    /// ARC_OAUTH_GITHUB_CLIENT_SECRET
+    pub oauth_github_client_secret: Option<String>,
+    /// ARC_OAUTH_REDIRECT_BASE — base URL for OAuth redirect URIs (default: "http://localhost:3000")
+    pub oauth_redirect_base: String,
+    /// R2_ACCOUNT_ID
+    pub r2_account_id: Option<String>,
+    /// R2_ACCESS_KEY
+    pub r2_access_key: Option<String>,
+    /// R2_SECRET_KEY
+    pub r2_secret_key: Option<String>,
+    /// R2_BUCKET
+    pub r2_bucket: Option<String>,
 }
 
 impl ArcConfig {
@@ -52,6 +74,9 @@ impl ArcConfig {
         let max_sessions_per_user = parse_env_u32("ARC_MAX_SESSIONS_PER_USER", 50)?;
         let max_blocks_per_session = parse_env_u32("ARC_MAX_BLOCKS_PER_SESSION", 5000)?;
 
+        let oauth_redirect_base = env::var("ARC_OAUTH_REDIRECT_BASE")
+            .unwrap_or_else(|_| "http://localhost:3000".to_string());
+
         Ok(Self {
             bind_addr,
             database_url,
@@ -60,6 +85,17 @@ impl ArcConfig {
             refresh_token_ttl_secs,
             max_sessions_per_user,
             max_blocks_per_session,
+            oauth_google_client_id: env::var("ARC_OAUTH_GOOGLE_CLIENT_ID").ok(),
+            oauth_google_client_secret: env::var("ARC_OAUTH_GOOGLE_CLIENT_SECRET").ok(),
+            oauth_microsoft_client_id: env::var("ARC_OAUTH_MICROSOFT_CLIENT_ID").ok(),
+            oauth_microsoft_client_secret: env::var("ARC_OAUTH_MICROSOFT_CLIENT_SECRET").ok(),
+            oauth_github_client_id: env::var("ARC_OAUTH_GITHUB_CLIENT_ID").ok(),
+            oauth_github_client_secret: env::var("ARC_OAUTH_GITHUB_CLIENT_SECRET").ok(),
+            oauth_redirect_base,
+            r2_account_id: env::var("R2_ACCOUNT_ID").ok(),
+            r2_access_key: env::var("R2_ACCESS_KEY").ok(),
+            r2_secret_key: env::var("R2_SECRET_KEY").ok(),
+            r2_bucket: env::var("R2_BUCKET").ok(),
         })
     }
 }
@@ -78,6 +114,17 @@ impl Default for ArcConfig {
             refresh_token_ttl_secs: 2_592_000,
             max_sessions_per_user: 50,
             max_blocks_per_session: 5000,
+            oauth_google_client_id: None,
+            oauth_google_client_secret: None,
+            oauth_microsoft_client_id: None,
+            oauth_microsoft_client_secret: None,
+            oauth_github_client_id: None,
+            oauth_github_client_secret: None,
+            oauth_redirect_base: "http://localhost:3000".to_string(),
+            r2_account_id: None,
+            r2_access_key: None,
+            r2_secret_key: None,
+            r2_bucket: None,
         }
     }
 }
