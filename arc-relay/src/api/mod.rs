@@ -14,6 +14,7 @@ use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
+pub mod oauth_routes;
 pub mod plugin_routes;
 pub mod session_routes;
 pub mod shadow_routes;
@@ -39,7 +40,9 @@ pub fn build_router(state: AppState) -> Router {
     let auth = Router::new()
         .route("/register", post(auth_routes::register))
         .route("/login", post(auth_routes::login))
-        .route("/refresh", post(auth_routes::refresh));
+        .route("/refresh", post(auth_routes::refresh))
+        .route("/oauth/:provider", get(oauth_routes::oauth_redirect))
+        .route("/oauth/:provider/callback", get(oauth_routes::oauth_callback));
 
     // ── Protected API routes (Bearer JWT required) ───────────────────────────
     //
