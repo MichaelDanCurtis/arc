@@ -144,6 +144,8 @@ pub enum IpcRequest {
     PreviewPlugin {
         bundle_path: std::path::PathBuf,
     },
+    /// Request a plugin sync from Arc (manual resync from Mac UI).
+    SyncPlugins,
 }
 
 /// Response from hostd to a terminal app over IPC.
@@ -170,6 +172,12 @@ pub enum IpcResponse {
         has_icon: bool,
         /// Raw PNG bytes if present and ≤ 256 KB, else None.
         icon_png: Option<Vec<u8>>,
+    },
+    /// Result of a SyncPlugins request.
+    PluginSync {
+        installed: Vec<String>,
+        removed: Vec<String>,
+        config_updated: Vec<String>,
     },
 }
 
@@ -257,6 +265,8 @@ pub enum PluginUiEvent {
     QuarantineChanged { plugin: String, quarantined: bool },
     /// Forwarded plugin→UI event (e.g. progress updates, data pushes).
     UiEvent { plugin: String, method: String, data_json: String },
+    EnvInjected { plugin: String, key: String, value: String },
+    PanelRegistered { plugin: String, panel_id: String, title: String, icon: String },
 }
 
 impl IpcEvent {
@@ -465,6 +475,50 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&req).unwrap();
         let back: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
         assert!(matches!(back, IpcRequest::PreviewPlugin { .. }));
+    }
+
+    #[test]
+    fn sync_plugins_round_trip() {
+        let req = IpcRequest::SyncPlugins;
+        let bytes = rmp_serde::to_vec_named(&req).unwrap();
+        let _back: IpcRequest = rmp_serde::from_slice(&bytes).unwrap();
+    }
+
+    #[test]
+    fn plugin_sync_response_round_trip() {
+        let resp = IpcResponse::PluginSync {
+            installed: vec!["beacon-claude-code".into()],
+            removed: vec![],
+            config_updated: vec!["beacon-shell".into()],
+        };
+        let bytes = rmp_serde::to_vec_named(&resp).unwrap();
+        let back: IpcResponse = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(matches!(back, IpcResponse::PluginSync { .. }));
+    }
+
+    #[test]
+    fn env_injected_event_round_trip() {
+        let evt = IpcEvent::PluginUiEvent(PluginUiEvent::EnvInjected {
+            plugin: "beacon-shell".into(),
+            key: "MY_VAR".into(),
+            value: "hello".into(),
+        });
+        let bytes = rmp_serde::to_vec_named(&evt).unwrap();
+        let back: IpcEvent = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(matches!(back, IpcEvent::PluginUiEvent(PluginUiEvent::EnvInjected { .. })));
+    }
+
+    #[test]
+    fn panel_registered_event_round_trip() {
+        let evt = IpcEvent::PluginUiEvent(PluginUiEvent::PanelRegistered {
+            plugin: "beacon-shell".into(),
+            panel_id: "my-panel".into(),
+            title: "My Panel".into(),
+            icon: "star".into(),
+        });
+        let bytes = rmp_serde::to_vec_named(&evt).unwrap();
+        let back: IpcEvent = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(matches!(back, IpcEvent::PluginUiEvent(PluginUiEvent::PanelRegistered { .. })));
     }
 
     #[test]

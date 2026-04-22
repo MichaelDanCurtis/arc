@@ -31,6 +31,11 @@ export function Sidebar() {
           label="Teams"
         />
         <NavItem
+          href="/plugins"
+          icon={<PluginIcon />}
+          label="Plugins"
+        />
+        <NavItem
           href="/audit"
           icon={<AuditIcon />}
           label="Audit log"
@@ -78,6 +83,16 @@ function UsersIcon() {
       <circle cx="9" cy="7" r="4" />
       <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
       <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+
+function PluginIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z" />
+      <line x1="16" y1="8" x2="2" y2="22" />
+      <line x1="17.5" y1="15" x2="9" y2="15" />
     </svg>
   );
 }

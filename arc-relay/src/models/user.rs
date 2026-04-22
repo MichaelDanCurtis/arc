@@ -8,7 +8,10 @@ pub struct User {
     pub id: Uuid,
     pub email: String,
     pub name: Option<String>,
-    pub password_hash: String,
+    pub password_hash: Option<String>,
+    pub avatar_url: Option<String>,
+    pub oauth_provider: Option<String>,
+    pub oauth_provider_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -42,6 +45,35 @@ pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, sq
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+pub async fn upsert_oauth_user(
+    pool: &PgPool,
+    email: &str,
+    name: Option<&str>,
+    avatar_url: Option<&str>,
+    oauth_provider: &str,
+    oauth_provider_id: &str,
+) -> Result<User, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query_as::<_, User>(
+        "INSERT INTO users (id, email, name, avatar_url, oauth_provider, oauth_provider_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (email) DO UPDATE SET \
+             name = COALESCE(EXCLUDED.name, users.name), \
+             avatar_url = COALESCE(EXCLUDED.avatar_url, users.avatar_url), \
+             oauth_provider = EXCLUDED.oauth_provider, \
+             oauth_provider_id = EXCLUDED.oauth_provider_id \
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(email)
+    .bind(name)
+    .bind(avatar_url)
+    .bind(oauth_provider)
+    .bind(oauth_provider_id)
+    .fetch_one(pool)
+    .await
 }
 
 #[cfg(test)]

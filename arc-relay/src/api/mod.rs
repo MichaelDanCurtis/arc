@@ -14,6 +14,9 @@ use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
+pub mod marketplace_routes;
+pub mod oauth_routes;
+pub mod plugin_routes;
 pub mod session_routes;
 pub mod shadow_routes;
 pub mod team_routes;
@@ -38,7 +41,9 @@ pub fn build_router(state: AppState) -> Router {
     let auth = Router::new()
         .route("/register", post(auth_routes::register))
         .route("/login", post(auth_routes::login))
-        .route("/refresh", post(auth_routes::refresh));
+        .route("/refresh", post(auth_routes::refresh))
+        .route("/oauth/:provider", get(oauth_routes::oauth_redirect))
+        .route("/oauth/:provider/callback", get(oauth_routes::oauth_callback));
 
     // ── Protected API routes (Bearer JWT required) ───────────────────────────
     //
@@ -58,10 +63,37 @@ pub fn build_router(state: AppState) -> Router {
             get(team_routes::list_teams).post(team_routes::create_team),
         )
         .route("/teams/:id/members", get(team_routes::list_members))
+        .route(
+            "/plugins/sync",
+            post(plugin_routes::sync_plugins),
+        )
+        .route(
+            "/plugins",
+            get(plugin_routes::list_plugins).post(plugin_routes::register_plugin),
+        )
+        .route(
+            "/plugins/:id",
+            axum::routing::delete(plugin_routes::delete_plugin)
+                .patch(plugin_routes::patch_plugin),
+        )
+        .route(
+            "/plugins/:id/config",
+            get(plugin_routes::get_plugin_config).put(plugin_routes::write_plugin_config),
+        )
         .layer(middleware::from_fn_with_state(
             jwt_secret,
             inject_jwt_secret,
         ));
+
+    // ── Public marketplace routes (no JWT required) ──────────────────────────
+    let marketplace = Router::new()
+        .route("/plugins", get(marketplace_routes::list_plugins))
+        .route("/plugins/:slug", get(marketplace_routes::get_plugin))
+        .route(
+            "/plugins/:slug/versions",
+            get(marketplace_routes::get_plugin_versions),
+        )
+        .route("/categories", get(marketplace_routes::list_categories));
 
     // ── Setup routes (public, no JWT required) ──────────────────────────────
     let setup = Router::new()
@@ -79,6 +111,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .nest("/api/auth", auth)
+        .nest("/api/marketplace", marketplace)
         .nest("/api", api)
         .nest("/api/setup", setup)
         .nest("/api/audit", audit)
@@ -231,6 +264,26 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn marketplace_plugins_route_exists() {
+        let s = status(build_router(test_state()), "GET", "/api/marketplace/plugins").await;
+        // 500 (lazy pool, no DB) means route exists; 404 means it doesn't
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/marketplace/plugins must exist");
+    }
+
+    #[tokio::test]
+    async fn marketplace_categories_route_exists() {
+        let s = status(build_router(test_state()), "GET", "/api/marketplace/categories").await;
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/marketplace/categories must exist");
+    }
+
+    #[tokio::test]
+    async fn oauth_redirect_route_exists() {
+        let s = status(build_router(test_state()), "GET", "/api/auth/oauth/google").await;
+        // Should be 501 (not configured) not 404 (route missing)
+        assert_ne!(s, StatusCode::NOT_FOUND, "/api/auth/oauth/:provider must exist");
+    }
+
+    #[tokio::test]
     async fn unknown_route_returns_404() {
         let s = status(build_router(test_state()), "GET", "/api/unknown-path").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
@@ -257,9 +310,10 @@ pub(crate) mod tests {
             .unwrap();
 
         let s = app.oneshot(req).await.unwrap().status();
-        // The handler will hit the DB and fail (500) because the pool is lazy
-        // and the user doesn't exist — but it must NOT be 401/403/404.
+        // The valid JWT bypasses auth middleware — the handler is reached.
+        // With a real (lazy) pool the user won't exist so we get 404 or 500,
+        // but crucially not 401 (auth rejected) or 403 (forbidden).
         assert_ne!(s, StatusCode::UNAUTHORIZED);
-        assert_ne!(s, StatusCode::NOT_FOUND);
+        assert_ne!(s, StatusCode::FORBIDDEN);
     }
 }

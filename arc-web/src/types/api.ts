@@ -85,6 +85,27 @@ export interface ShadowDiffResponse {
   diff: string;
 }
 
+// --- Plugin ---
+
+export interface PluginEntry {
+  id: string;
+  team_id: string;
+  name: string;
+  version: string;
+  manifest: Record<string, unknown>;
+  source_url: string | null;
+  enabled: boolean;
+  installed_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PluginConfigEntry {
+  config_key: string;
+  config_val: unknown;
+  updated_at: string;
+}
+
 // --- Audit log ---
 
 export interface AuditEntry {
@@ -101,4 +122,47 @@ export interface AuditQuery {
   offset?: number;
   actor?: string;
   action?: string;
+}
+
+// --- Marketplace ---
+
+export interface MarketplacePlugin {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  category: string | null;
+  icon_url: string | null;
+  homepage_url: string | null;
+  repository_url: string | null;
+  license: string | null;
+  payment_type: string;
+  price_cents: number;
+  author_name: string | null;
+  download_count: number;
+  latest_version: string | null;
+  updated_at: string;
+}
+
+export interface MarketplaceVersion {
+  id: string;
+  plugin_id: string;
+  version: string;
+  release_notes: string | null;
+  platform: string;
+  size_bytes: number | null;
+  download_count: number;
+  created_at: string;
+}
+
+export interface CategoriesResponse {
+  categories: string[];
+}
+
+// --- Organization ---
+
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
 }

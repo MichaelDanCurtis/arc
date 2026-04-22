@@ -2,8 +2,7 @@
 # Uses the official Rust image; wasm-pack is installed here and the compiled
 # .wasm/.js/.d.ts files are handed off to the Next.js builder stage.
 # The Rust toolchain never touches the runtime image.
-FROM rust:1.85-bookworm AS wasm-builder
-# Install wasm-pack pinned to 0.14.0 (current stable on crates.io as of 2026-04-15)
+FROM rust:1.90-bookworm AS wasm-builder
 RUN cargo install wasm-pack --version 0.14.0 --locked
 
 WORKDIR /workspace
@@ -41,11 +40,24 @@ RUN for crate in \
       beacon-hostd \
       beacon-complete \
       beacon-ai \
+      beacon-plugin-proto \
+      beacon-plugin-host \
+      beacon-plugin-sdk \
     ; do \
       mkdir -p beacon-core/crates/${crate}/src && \
       printf '[package]\nname = "%s"\nversion.workspace = true\nedition.workspace = true\n' "${crate}" \
         > beacon-core/crates/${crate}/Cargo.toml && \
       echo "// stub" > beacon-core/crates/${crate}/src/lib.rs ; \
+    done && \
+    mkdir -p beacon-core/crates/beacon-plugin-host/tests/fixture_plugin/src && \
+    printf '[package]\nname = "beacon-fixture-plugin"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n' \
+      > beacon-core/crates/beacon-plugin-host/tests/fixture_plugin/Cargo.toml && \
+    echo "fn main() {}" > beacon-core/crates/beacon-plugin-host/tests/fixture_plugin/src/main.rs && \
+    for plugin in beacon-claude-code beacon-shell; do \
+      mkdir -p beacon-core/plugins/${plugin}/src && \
+      printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\n' "${plugin}" \
+        > beacon-core/plugins/${plugin}/Cargo.toml && \
+      echo "// stub" > beacon-core/plugins/${plugin}/src/lib.rs ; \
     done
 
 # Stub src/lib.rs for the three real crates so `cargo fetch` can complete
@@ -60,7 +72,7 @@ COPY beacon-core/rust-toolchain.toml beacon-core/rust-toolchain.toml
 
 # Add the wasm32 target and fetch all third-party dependencies.
 # This layer is cached as long as Cargo.toml / Cargo.lock are unchanged.
-RUN rustup target add wasm32-unknown-unknown
+RUN cd beacon-core && rustup target add wasm32-unknown-unknown
 RUN cargo fetch --manifest-path beacon-core/Cargo.toml
 
 # ── Pass 2: real source for beacon-blocks* + beacon-model ──────────────────
