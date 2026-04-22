@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
 
 export default function LoginPage() {
   const { login } = useAuth();
@@ -78,6 +79,40 @@ export default function LoginPage() {
             <Button type="submit" disabled={loading}>
               {loading ? "Signing in..." : "Sign in"}
             </Button>
+            <div className="my-4 flex items-center gap-3">
+              <Separator className="flex-1" />
+              <span className="text-xs text-muted-foreground">or</span>
+              <Separator className="flex-1" />
+            </div>
+            <div className="space-y-2">
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() =>
+                  (window.location.href = `${getRelayUrl()}/api/auth/oauth/google`)
+                }
+              >
+                Sign in with Google
+              </Button>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() =>
+                  (window.location.href = `${getRelayUrl()}/api/auth/oauth/microsoft`)
+                }
+              >
+                Sign in with Microsoft
+              </Button>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() =>
+                  (window.location.href = `${getRelayUrl()}/api/auth/oauth/github`)
+                }
+              >
+                Sign in with GitHub
+              </Button>
+            </div>
             <p className="text-center text-sm text-muted-foreground">
               No account?{" "}
               <Link href="/register" className="underline">
