@@ -2,9 +2,10 @@
 
 import { type ReactNode } from "react";
 import Link from "next/link";
-import { Button } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
 import { getAccessToken } from "@/lib/auth";
 import { getRelayUrl } from "@/lib/config";
+import { cn } from "@/lib/utils";
 
 export default function MarketplaceLayout({ children }: { children: ReactNode }) {
   const isLoggedIn = typeof window !== "undefined" && !!getAccessToken();
@@ -23,17 +24,23 @@ export default function MarketplaceLayout({ children }: { children: ReactNode })
           </nav>
           <div className="flex gap-2">
             {isLoggedIn ? (
-              <Button variant="outline" size="sm" asChild>
-                <Link href="/submit">Submit Plugin</Link>
-              </Button>
+              <Link href="/submit" className={cn(buttonVariants({ variant: "outline", size: "sm" }))}>
+                Submit Plugin
+              </Link>
             ) : (
               <>
-                <Button variant="ghost" size="sm" asChild>
-                  <a href={`${getRelayUrl()}/api/auth/oauth/github`}>Sign In</a>
-                </Button>
-                <Button size="sm" asChild>
-                  <a href={`${getRelayUrl()}/api/auth/oauth/github`}>Submit Plugin</a>
-                </Button>
+                <a
+                  href={`${getRelayUrl()}/api/auth/oauth/github`}
+                  className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}
+                >
+                  Sign In
+                </a>
+                <a
+                  href={`${getRelayUrl()}/api/auth/oauth/github`}
+                  className={cn(buttonVariants({ size: "sm" }))}
+                >
+                  Submit Plugin
+                </a>
               </>
             )}
           </div>

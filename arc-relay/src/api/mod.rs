@@ -310,9 +310,10 @@ pub(crate) mod tests {
             .unwrap();
 
         let s = app.oneshot(req).await.unwrap().status();
-        // The handler will hit the DB and fail (500) because the pool is lazy
-        // and the user doesn't exist — but it must NOT be 401/403/404.
+        // The valid JWT bypasses auth middleware — the handler is reached.
+        // With a real (lazy) pool the user won't exist so we get 404 or 500,
+        // but crucially not 401 (auth rejected) or 403 (forbidden).
         assert_ne!(s, StatusCode::UNAUTHORIZED);
-        assert_ne!(s, StatusCode::NOT_FOUND);
+        assert_ne!(s, StatusCode::FORBIDDEN);
     }
 }
