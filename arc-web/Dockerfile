@@ -49,6 +49,10 @@ RUN for crate in \
         > beacon-core/crates/${crate}/Cargo.toml && \
       echo "// stub" > beacon-core/crates/${crate}/src/lib.rs ; \
     done && \
+    mkdir -p beacon-core/crates/beacon-cli/src && \
+    printf '[package]\nname = "beacon-cli"\nversion.workspace = true\nedition.workspace = true\n\n[[bin]]\nname = "beacon"\npath = "src/main.rs"\n' \
+      > beacon-core/crates/beacon-cli/Cargo.toml && \
+    echo "fn main() {}" > beacon-core/crates/beacon-cli/src/main.rs && \
     mkdir -p beacon-core/crates/beacon-plugin-host/tests/fixture_plugin/src && \
     printf '[package]\nname = "beacon-fixture-plugin"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n' \
       > beacon-core/crates/beacon-plugin-host/tests/fixture_plugin/Cargo.toml && \
