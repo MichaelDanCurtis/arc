@@ -16,8 +16,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const baseUrl = getRelayUrl();
   const token = getAccessToken();
 
+  const isFormData = options.body instanceof FormData;
   const headers: Record<string, string> = {
-    "Content-Type": "application/json",
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
     ...((options.headers as Record<string, string>) || {}),
   };
   if (token) {
@@ -89,5 +90,12 @@ export const apiClient = {
   },
   del<T>(path: string): Promise<T> {
     return request<T>(path, { method: "DELETE" });
+  },
+  upload<T>(path: string, formData: FormData): Promise<T> {
+    return request<T>(path, {
+      method: "POST",
+      body: formData,
+      headers: {},
+    });
   },
 };
