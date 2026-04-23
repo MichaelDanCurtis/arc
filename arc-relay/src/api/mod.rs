@@ -15,6 +15,7 @@ use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
 pub mod marketplace_author_routes;
+pub mod marketplace_review_routes;
 pub mod marketplace_routes;
 pub mod oauth_routes;
 pub mod plugin_routes;
@@ -101,6 +102,9 @@ pub fn build_router(state: AppState) -> Router {
             "/plugins/:id/versions",
             post(marketplace_author_routes::upload_version),
         )
+        .route("/review", get(marketplace_review_routes::list_pending))
+        .route("/review/:id/approve", post(marketplace_review_routes::approve))
+        .route("/review/:id/reject", post(marketplace_review_routes::reject))
         .layer(middleware::from_fn_with_state(jwt_secret_clone, inject_jwt_secret));
 
     // ── Public marketplace routes (no JWT required) ──────────────────────────
