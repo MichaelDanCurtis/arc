@@ -29,6 +29,17 @@ pub async fn find_org_by_domain(pool: &PgPool, domain: &str) -> Result<Option<Or
         .await
 }
 
+pub async fn is_org_admin(pool: &PgPool, user_id: Uuid, org_id: Uuid) -> Result<bool, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT role FROM org_memberships WHERE user_id = $1 AND org_id = $2",
+    )
+    .bind(user_id)
+    .bind(org_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(matches!(row.as_ref().map(|r| r.0.as_str()), Some("admin" | "owner")))
+}
+
 pub async fn add_org_member(
     pool: &PgPool,
     user_id: Uuid,
