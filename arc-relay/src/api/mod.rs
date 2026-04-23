@@ -134,6 +134,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         // ── install
         .route("/install", post(marketplace_install_routes::install))
+        // ── signing key routes
+        .route("/signing-key", axum::routing::put(marketplace_author_routes::set_signing_key))
+        .route("/signing-key/server", get(marketplace_author_routes::get_server_public_key))
         .layer(middleware::from_fn_with_state(jwt_secret_clone, inject_jwt_secret));
 
     // ── Setup routes (public, no JWT required) ──────────────────────────────

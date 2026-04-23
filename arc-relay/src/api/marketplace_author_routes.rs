@@ -222,6 +222,40 @@ pub async fn upload_version(
     Ok((StatusCode::CREATED, Json(ver)))
 }
 
+/// PUT /api/marketplace/signing-key — upload developer's public key
+pub async fn set_signing_key(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    body: String,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !body.contains("BEGIN PUBLIC KEY") {
+        return Err((StatusCode::BAD_REQUEST, "Expected PEM-encoded public key".to_string()));
+    }
+
+    crate::models::user::set_signing_key(&state.pool, user_id, &body)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/marketplace/signing-key/server — get marketplace server public key
+pub async fn get_server_public_key(
+    State(state): State<AppState>,
+) -> Result<String, (StatusCode, String)> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM server_config WHERE key = 'signing_public_key'",
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
+
+    match row {
+        Some((pem,)) => Ok(pem),
+        None => Err((StatusCode::NOT_FOUND, "Server key not yet generated".to_string())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
