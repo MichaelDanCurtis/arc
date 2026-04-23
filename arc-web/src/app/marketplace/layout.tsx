@@ -21,6 +21,12 @@ export default function MarketplaceLayout({ children }: { children: ReactNode })
           <nav className="flex items-center gap-4 text-sm text-muted-foreground">
             <Link href="/" className="hover:text-foreground">Browse</Link>
             <Link href="/categories" className="hover:text-foreground">Categories</Link>
+            {isLoggedIn && (
+              <Link href="/submissions" className="hover:text-foreground">My Submissions</Link>
+            )}
+            {isLoggedIn && (
+              <Link href="/admin/review" className="hover:text-foreground">Admin</Link>
+            )}
           </nav>
           <div className="flex gap-2">
             {isLoggedIn ? (

@@ -76,6 +76,16 @@ pub async fn upsert_oauth_user(
     .await
 }
 
+pub async fn is_admin(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 AS n FROM org_memberships WHERE user_id = $1 AND role = 'admin' LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

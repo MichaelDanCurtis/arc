@@ -152,6 +152,7 @@ export interface MarketplaceVersion {
   platform: string;
   size_bytes: number | null;
   download_count: number;
+  status: string;
   created_at: string;
 }
 
@@ -165,4 +166,55 @@ export interface Organization {
   id: string;
   name: string;
   slug: string;
+}
+
+// --- Marketplace Submissions ---
+
+export interface CreatePluginRequest {
+  name: string;
+  slug: string;
+  description?: string;
+  category?: string;
+  homepage_url?: string;
+  repository_url?: string;
+  license?: string;
+  payment_type?: string;
+  price_cents?: number;
+}
+
+export interface UpdatePluginRequest {
+  name?: string;
+  description?: string;
+  category?: string;
+  homepage_url?: string;
+  repository_url?: string;
+  license?: string;
+}
+
+export interface MarketplacePluginFull {
+  id: string;
+  author_id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  category: string | null;
+  icon_url: string | null;
+  homepage_url: string | null;
+  repository_url: string | null;
+  license: string | null;
+  status: string;
+  payment_type: string;
+  price_cents: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InstallRequest {
+  plugin_id: string;
+  version: string;
+  team_id: string;
+}
+
+export interface ReviewAction {
+  reason?: string;
 }

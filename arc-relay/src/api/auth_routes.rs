@@ -312,6 +312,7 @@ mod tests {
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool),
+            r2: None,
         };
 
         let email = format!("register_{}@test.invalid", uuid::Uuid::new_v4());
@@ -346,6 +347,7 @@ mod tests {
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
+            r2: None,
         };
 
         // First register a user
@@ -388,6 +390,7 @@ mod tests {
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
+            r2: None,
         };
 
         let email = format!("badpw_{}@test.invalid", uuid::Uuid::new_v4());

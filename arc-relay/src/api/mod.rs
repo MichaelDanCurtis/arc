@@ -14,6 +14,10 @@ use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
+pub mod marketplace_author_routes;
+pub mod marketplace_install_routes;
+pub mod marketplace_org_routes;
+pub mod marketplace_review_routes;
 pub mod marketplace_routes;
 pub mod oauth_routes;
 pub mod plugin_routes;
@@ -31,6 +35,7 @@ pub struct AppState {
     pub audit: AuditLog,
     pub mirror_registry: MirrorRegistry,
     pub invitations: InvitationStore,
+    pub r2: Option<crate::storage::R2Client>,
 }
 
 /// Assemble the top-level Axum router.
@@ -85,15 +90,51 @@ pub fn build_router(state: AppState) -> Router {
             inject_jwt_secret,
         ));
 
-    // ── Public marketplace routes (no JWT required) ──────────────────────────
+    // ── Combined marketplace router ──────────────────────────────────────────
+    // Public and authed routes are merged into one router to avoid param-name
+    // conflicts (/:slug vs /:id at the same path position). The JWT middleware
+    // runs on all marketplace routes; handlers that require auth use the
+    // AuthUser extractor which returns 401 when the header is absent.
+    let jwt_secret_clone = state.config.jwt_secret.clone();
     let marketplace = Router::new()
-        .route("/plugins", get(marketplace_routes::list_plugins))
-        .route("/plugins/:slug", get(marketplace_routes::get_plugin))
+        // ── public read routes ──────────────────────────────────────────────
+        .route(
+            "/plugins",
+            get(marketplace_routes::list_plugins)
+                .post(marketplace_author_routes::create_plugin),
+        )
+        .route("/categories", get(marketplace_routes::list_categories))
+        .route("/my-plugins", get(marketplace_author_routes::my_plugins))
+        // ── plugin detail + CRUD (same :slug param used for both GET and PATCH/DELETE)
+        .route(
+            "/plugins/:slug",
+            get(marketplace_routes::get_plugin)
+                .patch(marketplace_author_routes::update_plugin)
+                .delete(marketplace_author_routes::delete_plugin),
+        )
+        // ── versions (GET public list, POST upload new version)
         .route(
             "/plugins/:slug/versions",
-            get(marketplace_routes::get_plugin_versions),
+            get(marketplace_routes::get_plugin_versions)
+                .post(marketplace_author_routes::upload_version),
         )
-        .route("/categories", get(marketplace_routes::list_categories));
+        // ── admin review queue
+        .route("/review", get(marketplace_review_routes::list_pending))
+        .route("/review/:id/approve", post(marketplace_review_routes::approve))
+        .route("/review/:id/reject", post(marketplace_review_routes::reject))
+        // ── org allowlist
+        .route(
+            "/org/:org_id/allowlist",
+            get(marketplace_org_routes::get_allowlist)
+                .post(marketplace_org_routes::add_to_allowlist),
+        )
+        .route(
+            "/org/:org_id/allowlist/:plugin_id",
+            axum::routing::delete(marketplace_org_routes::remove_from_allowlist),
+        )
+        // ── install
+        .route("/install", post(marketplace_install_routes::install))
+        .layer(middleware::from_fn_with_state(jwt_secret_clone, inject_jwt_secret));
 
     // ── Setup routes (public, no JWT required) ──────────────────────────────
     let setup = Router::new()
@@ -153,6 +194,7 @@ pub(crate) mod tests {
             audit: crate::audit::AuditLog::new(),
             mirror_registry: MirrorRegistry::default(),
             invitations: InvitationStore::new(pool),
+            r2: None,
         }
     }
 

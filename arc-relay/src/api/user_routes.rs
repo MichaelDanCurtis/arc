@@ -110,6 +110,7 @@ mod tests {
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool),
+            r2: None,
         };
 
         let email = format!("getme_{}@test.invalid", uuid::Uuid::new_v4());

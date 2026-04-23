@@ -18,6 +18,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let relay_router = Arc::new(relay::router::RelayRouter::new());
     let audit_log = audit::AuditLog::with_pool(pool.clone());
+    // Initialise R2 client if credentials are present in the environment.
+    let r2 = match (
+        std::env::var("R2_ACCOUNT_ID").ok(),
+        std::env::var("R2_ACCESS_KEY").ok(),
+        std::env::var("R2_SECRET_KEY").ok(),
+        std::env::var("R2_BUCKET").ok(),
+    ) {
+        (Some(account_id), Some(access_key), Some(secret_key), Some(bucket)) => {
+            Some(arc_relay::storage::R2Client::from_env(&account_id, &access_key, &secret_key, &bucket).await)
+        }
+        _ => None,
+    };
+
     let app_state = api::AppState {
         pool: pool.clone(),
         config: Arc::new(config.clone()),
@@ -25,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit: audit_log,
         mirror_registry: arc_relay::mirror::MirrorRegistry::default(),
         invitations: arc_relay::mirror::invitation::InvitationStore::new(pool.clone()),
+        r2,
     };
 
     retention::spawn_retention_task(pool.clone());

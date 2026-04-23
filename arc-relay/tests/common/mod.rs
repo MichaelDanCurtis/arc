@@ -100,6 +100,7 @@ pub async fn try_spawn_relay() -> Option<Relay> {
         audit: AuditLog::new(),
         mirror_registry: MirrorRegistry::default(),
         invitations: InvitationStore::new(pool),
+        r2: None,
     };
 
     let router = build_router(state);

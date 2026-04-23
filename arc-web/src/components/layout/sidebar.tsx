@@ -36,6 +36,11 @@ export function Sidebar() {
           label="Plugins"
         />
         <NavItem
+          href="/org-plugins"
+          icon={<OrgPluginsIcon />}
+          label="Org Plugins"
+        />
+        <NavItem
           href="/audit"
           icon={<AuditIcon />}
           label="Audit log"
@@ -93,6 +98,15 @@ function PluginIcon() {
       <path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z" />
       <line x1="16" y1="8" x2="2" y2="22" />
       <line x1="17.5" y1="15" x2="9" y2="15" />
+    </svg>
+  );
+}
+
+function OrgPluginsIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
     </svg>
   );
 }
