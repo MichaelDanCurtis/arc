@@ -24,6 +24,9 @@ export default function MarketplaceLayout({ children }: { children: ReactNode })
             {isLoggedIn && (
               <Link href="/submissions" className="hover:text-foreground">My Submissions</Link>
             )}
+            {isLoggedIn && (
+              <Link href="/admin/review" className="hover:text-foreground">Admin</Link>
+            )}
           </nav>
           <div className="flex gap-2">
             {isLoggedIn ? (
