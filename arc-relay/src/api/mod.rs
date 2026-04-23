@@ -14,6 +14,7 @@ use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
 pub mod auth_routes;
+pub mod marketplace_author_routes;
 pub mod marketplace_routes;
 pub mod oauth_routes;
 pub mod plugin_routes;
@@ -31,6 +32,7 @@ pub struct AppState {
     pub audit: AuditLog,
     pub mirror_registry: MirrorRegistry,
     pub invitations: InvitationStore,
+    pub r2: Option<crate::storage::R2Client>,
 }
 
 /// Assemble the top-level Axum router.
@@ -85,8 +87,25 @@ pub fn build_router(state: AppState) -> Router {
             inject_jwt_secret,
         ));
 
+    // ── Authenticated marketplace routes (JWT required) ──────────────────────
+    let jwt_secret_clone = state.config.jwt_secret.clone();
+    let marketplace_authed = Router::new()
+        .route("/plugins", post(marketplace_author_routes::create_plugin))
+        .route("/my-plugins", get(marketplace_author_routes::my_plugins))
+        .route(
+            "/plugins/:id",
+            axum::routing::patch(marketplace_author_routes::update_plugin)
+                .delete(marketplace_author_routes::delete_plugin),
+        )
+        .route(
+            "/plugins/:id/versions",
+            post(marketplace_author_routes::upload_version),
+        )
+        .layer(middleware::from_fn_with_state(jwt_secret_clone, inject_jwt_secret));
+
     // ── Public marketplace routes (no JWT required) ──────────────────────────
     let marketplace = Router::new()
+        .merge(marketplace_authed)
         .route("/plugins", get(marketplace_routes::list_plugins))
         .route("/plugins/:slug", get(marketplace_routes::get_plugin))
         .route(
@@ -153,6 +172,7 @@ pub(crate) mod tests {
             audit: crate::audit::AuditLog::new(),
             mirror_registry: MirrorRegistry::default(),
             invitations: InvitationStore::new(pool),
+            r2: None,
         }
     }
 
