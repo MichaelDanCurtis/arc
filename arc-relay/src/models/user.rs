@@ -76,6 +76,25 @@ pub async fn upsert_oauth_user(
     .await
 }
 
+pub async fn get_signing_key(pool: &PgPool, user_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT signing_public_key FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(k,)| k))
+}
+
+pub async fn set_signing_key(pool: &PgPool, user_id: Uuid, public_key_pem: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET signing_public_key = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(public_key_pem)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn is_admin(pool: &PgPool, user_id: Uuid) -> Result<bool, sqlx::Error> {
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT 1 AS n FROM org_memberships WHERE user_id = $1 AND role = 'admin' LIMIT 1",
