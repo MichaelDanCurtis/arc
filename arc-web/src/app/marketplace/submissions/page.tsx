@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { apiClient } from "@/lib/api";
-import { Button } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import type { MarketplacePluginFull } from "@/types/api";
 
@@ -44,9 +44,7 @@ export default function SubmissionsPage() {
             Plugins you have submitted to the marketplace.
           </p>
         </div>
-        <Button asChild>
-          <Link href="/submit">+ New Plugin</Link>
-        </Button>
+        <Link href="/submit" className={buttonVariants()}>+ New Plugin</Link>
       </div>
 
       {loading && (
@@ -59,9 +57,7 @@ export default function SubmissionsPage() {
           <p className="text-muted-foreground">
             You have not submitted any plugins yet.
           </p>
-          <Button asChild className="mt-4">
-            <Link href="/submit">Submit your first plugin</Link>
-          </Button>
+          <Link href="/submit" className={buttonVariants({ className: "mt-4" })}>Submit your first plugin</Link>
         </div>
       )}
 

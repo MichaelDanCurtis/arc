@@ -44,6 +44,7 @@ async fn spawn_relay() -> std::net::SocketAddr {
         audit: AuditLog::new(),
         mirror_registry: arc_relay::mirror::MirrorRegistry::default(),
         invitations: arc_relay::mirror::invitation::InvitationStore::new(pool),
+        r2: None,
     };
 
     let router = build_router(state);
