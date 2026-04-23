@@ -36,13 +36,15 @@ pub async fn create_plugin(
     }
 }
 
-/// PATCH /api/marketplace/plugins/:id — update own plugin
+/// PATCH /api/marketplace/plugins/:slug — update own plugin (slug may be a UUID or slug string)
 pub async fn update_plugin(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
-    Path(plugin_id): Path<Uuid>,
+    Path(slug): Path<String>,
     Json(req): Json<UpdatePluginRequest>,
 ) -> Result<Json<MarketplacePlugin>, (StatusCode, String)> {
+    let plugin_id = Uuid::parse_str(&slug)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plugin ID".to_string()))?;
     match marketplace::update_plugin(&state.pool, plugin_id, user_id, &req).await {
         Ok(Some(plugin)) => Ok(Json(plugin)),
         Ok(None) => Err((StatusCode::NOT_FOUND, "Plugin not found or not yours".to_string())),
@@ -50,12 +52,14 @@ pub async fn update_plugin(
     }
 }
 
-/// DELETE /api/marketplace/plugins/:id — delete own plugin
+/// DELETE /api/marketplace/plugins/:slug — delete own plugin
 pub async fn delete_plugin(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
-    Path(plugin_id): Path<Uuid>,
+    Path(slug): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let plugin_id = Uuid::parse_str(&slug)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plugin ID".to_string()))?;
     match marketplace::delete_plugin(&state.pool, plugin_id, user_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "Plugin not found or not yours".to_string())),
@@ -74,13 +78,16 @@ pub async fn my_plugins(
     }
 }
 
-/// POST /api/marketplace/plugins/:id/versions — upload a new plugin version
+/// POST /api/marketplace/plugins/:slug/versions — upload a new plugin version
 pub async fn upload_version(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
-    Path(plugin_id): Path<Uuid>,
+    Path(slug): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<MarketplaceVersion>), (StatusCode, String)> {
+    let plugin_id = Uuid::parse_str(&slug)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid plugin ID".to_string()))?;
+
     // Check R2 is configured
     let r2 = state
         .r2

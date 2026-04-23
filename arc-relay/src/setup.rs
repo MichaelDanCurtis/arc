@@ -231,6 +231,7 @@ mod tests {
             audit: crate::audit::AuditLog::new(),
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool),
+            r2: None,
         };
         let req = SetupRequest {
             owner_name: "Alice".to_string(),

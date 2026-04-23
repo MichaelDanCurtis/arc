@@ -90,23 +90,39 @@ pub fn build_router(state: AppState) -> Router {
             inject_jwt_secret,
         ));
 
-    // ── Authenticated marketplace routes (JWT required) ──────────────────────
+    // ── Combined marketplace router ──────────────────────────────────────────
+    // Public and authed routes are merged into one router to avoid param-name
+    // conflicts (/:slug vs /:id at the same path position). The JWT middleware
+    // runs on all marketplace routes; handlers that require auth use the
+    // AuthUser extractor which returns 401 when the header is absent.
     let jwt_secret_clone = state.config.jwt_secret.clone();
-    let marketplace_authed = Router::new()
-        .route("/plugins", post(marketplace_author_routes::create_plugin))
-        .route("/my-plugins", get(marketplace_author_routes::my_plugins))
+    let marketplace = Router::new()
+        // ── public read routes ──────────────────────────────────────────────
         .route(
-            "/plugins/:id",
-            axum::routing::patch(marketplace_author_routes::update_plugin)
+            "/plugins",
+            get(marketplace_routes::list_plugins)
+                .post(marketplace_author_routes::create_plugin),
+        )
+        .route("/categories", get(marketplace_routes::list_categories))
+        .route("/my-plugins", get(marketplace_author_routes::my_plugins))
+        // ── plugin detail + CRUD (same :slug param used for both GET and PATCH/DELETE)
+        .route(
+            "/plugins/:slug",
+            get(marketplace_routes::get_plugin)
+                .patch(marketplace_author_routes::update_plugin)
                 .delete(marketplace_author_routes::delete_plugin),
         )
+        // ── versions (GET public list, POST upload new version)
         .route(
-            "/plugins/:id/versions",
-            post(marketplace_author_routes::upload_version),
+            "/plugins/:slug/versions",
+            get(marketplace_routes::get_plugin_versions)
+                .post(marketplace_author_routes::upload_version),
         )
+        // ── admin review queue
         .route("/review", get(marketplace_review_routes::list_pending))
         .route("/review/:id/approve", post(marketplace_review_routes::approve))
         .route("/review/:id/reject", post(marketplace_review_routes::reject))
+        // ── org allowlist
         .route(
             "/org/:org_id/allowlist",
             get(marketplace_org_routes::get_allowlist)
@@ -116,19 +132,9 @@ pub fn build_router(state: AppState) -> Router {
             "/org/:org_id/allowlist/:plugin_id",
             axum::routing::delete(marketplace_org_routes::remove_from_allowlist),
         )
+        // ── install
         .route("/install", post(marketplace_install_routes::install))
         .layer(middleware::from_fn_with_state(jwt_secret_clone, inject_jwt_secret));
-
-    // ── Public marketplace routes (no JWT required) ──────────────────────────
-    let marketplace = Router::new()
-        .merge(marketplace_authed)
-        .route("/plugins", get(marketplace_routes::list_plugins))
-        .route("/plugins/:slug", get(marketplace_routes::get_plugin))
-        .route(
-            "/plugins/:slug/versions",
-            get(marketplace_routes::get_plugin_versions),
-        )
-        .route("/categories", get(marketplace_routes::list_categories));
 
     // ── Setup routes (public, no JWT required) ──────────────────────────────
     let setup = Router::new()
