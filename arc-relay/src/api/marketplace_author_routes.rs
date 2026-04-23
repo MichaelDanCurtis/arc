@@ -178,6 +178,21 @@ pub async fn upload_version(
 
     let size_bytes = bytes.len() as i64;
 
+    // Verify developer signature if provided
+    if let Some(ref sig) = signature_str {
+        let user_key = crate::models::user::get_signing_key(&state.pool, user_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
+
+        if let Some(pub_pem) = user_key {
+            let valid = crate::signing::verify_developer_signature(&pub_pem, &archive_sha256, sig)
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("Signature error: {e}")))?;
+            if !valid {
+                return Err((StatusCode::BAD_REQUEST, "Invalid signature".to_string()));
+            }
+        }
+    }
+
     // Upload to R2
     let key = crate::storage::R2Client::archive_key(&plugin.slug, &version, &platform);
     let archive_url = r2

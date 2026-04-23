@@ -67,10 +67,27 @@ pub async fn approve(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if let Some(ver) = version {
+    if let Some(ver) = &version {
         marketplace::approve_plugin_if_first(&state.pool, ver.plugin_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+
+    // Countersign the archive SHA-256
+    if let Some(ref ver) = version {
+        let server_key = crate::signing::get_or_create_server_key(&state.pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        let countersig_hex = crate::signing::countersign(&server_key, &ver.archive_sha256)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        sqlx::query("UPDATE marketplace_versions SET countersig = $2 WHERE id = $1")
+            .bind(version_id)
+            .bind(&countersig_hex)
+            .execute(&state.pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
     }
 
     Ok(StatusCode::NO_CONTENT)
