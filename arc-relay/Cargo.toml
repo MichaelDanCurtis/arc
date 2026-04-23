@@ -16,7 +16,7 @@ path = "src/main.rs"
 beacon-model = { path = "../beacon-core/crates/beacon-model" }
 beacon-proto = { path = "../beacon-core/crates/beacon-proto" }
 axum = { version = "0.7", features = ["ws"] }
-axum-extra = { version = "0.9", features = ["typed-header"] }
+axum-extra = { version = "0.9", features = ["typed-header", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +36,10 @@ tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
 oauth2 = "4"
 reqwest = { version = "0.12", features = ["json"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+sha2 = "0.10"
+hex = "0.4"
 
 [features]
 # Use a 1-second revalidation tick so integration tests finish in ~4s.

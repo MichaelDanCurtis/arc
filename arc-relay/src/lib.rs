@@ -14,4 +14,5 @@ pub mod models;
 pub mod relay;
 pub mod retention;
 pub mod setup;
+pub mod storage;
 pub mod ws;
