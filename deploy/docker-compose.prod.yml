@@ -1,0 +1,139 @@
+# deploy/hostinger/docker-compose.prod.yml
+#
+# Production compose for the Arc stack on Hostinger VPS 1147025 (thecurtis.cloud).
+# Delivered via the Hostinger MCP `VPS_createNewProjectV1` endpoint with
+# project_name=arc, so it lands at /root/arc/docker-compose.yml on the box.
+#
+# Design choices (see docs/deployment/hostinger-setup.md and the plan doc
+# for why):
+#   - Image-based only. Build locally, push to Docker Hub under
+#     `michaeldancurtis/arc-{relay,web}`; this compose references those tags.
+#   - NO bundled Traefik. The existing `root-traefik-1` already owns :80/:443
+#     and provides Let's Encrypt via the `mytlschallenge` resolver (TLS-ALPN-01
+#     on :443) with entrypoints `web` (:80, redirects to :443) and `websecure`
+#     (:443) — we attach via the external network `root_default` and labels.
+#   - Because TLS-ALPN-01 terminates TLS at Traefik, DNS for arc.ailuxis.com
+#     and beam.ailuxis.com must be DNS-only at Cloudflare (grey cloud), not
+#     proxied.
+#   - NO host-port publishes for arc-web or arc-postgres. Traefik proxies
+#     arc-web; arc-postgres is cluster-internal only.
+#   - arc-relay still publishes 9900 on the host for the Beacon Mac client's
+#     direct WebSocket connection (see hostinger-setup.md#185).
+#   - Fail-loud on missing secrets: ${VAR:?} aborts startup with a clear
+#     error instead of silently using a dev default.
+
+services:
+  arc-postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: arc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      POSTGRES_DB: arc
+    volumes:
+      - arc-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arc -d arc"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - internal
+
+  arc-relay:
+    image: michaeldancurtis/arc-relay:${ARC_TAG:-latest}
+    # Direct WebSocket port for the Beacon Mac client. Traefik handles
+    # /api/* routing via labels below; :9900 is for raw WS only.
+    ports:
+      - "9900:9900"
+    environment:
+      ARC_DATABASE_URL: postgres://arc:${POSTGRES_PASSWORD}@arc-postgres:5432/arc
+      ARC_JWT_SECRET: ${ARC_JWT_SECRET:?ARC_JWT_SECRET required (openssl rand -hex 32)}
+      ARC_BIND_ADDR: "0.0.0.0:9900"
+      ARC_OAUTH_REDIRECT_BASE: ${ARC_OAUTH_REDIRECT_BASE:-https://arc.ailuxis.com}
+      ARC_OAUTH_GOOGLE_CLIENT_ID: ${ARC_OAUTH_GOOGLE_CLIENT_ID:-}
+      ARC_OAUTH_GOOGLE_CLIENT_SECRET: ${ARC_OAUTH_GOOGLE_CLIENT_SECRET:-}
+      ARC_OAUTH_MICROSOFT_CLIENT_ID: ${ARC_OAUTH_MICROSOFT_CLIENT_ID:-}
+      ARC_OAUTH_MICROSOFT_CLIENT_SECRET: ${ARC_OAUTH_MICROSOFT_CLIENT_SECRET:-}
+      ARC_OAUTH_GITHUB_CLIENT_ID: ${ARC_OAUTH_GITHUB_CLIENT_ID:-}
+      ARC_OAUTH_GITHUB_CLIENT_SECRET: ${ARC_OAUTH_GITHUB_CLIENT_SECRET:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY: ${R2_ACCESS_KEY:-}
+      R2_SECRET_KEY: ${R2_SECRET_KEY:-}
+      R2_BUCKET: ${R2_BUCKET:-beacon-plugins}
+      RUST_LOG: ${RUST_LOG:-arc_relay=info}
+    depends_on:
+      arc-postgres:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      # Pin the network so Traefik picks the correct IP when a container is
+      # on multiple networks (internal + root_default).
+      - "traefik.docker.network=root_default"
+      # /api/* on both hosts → arc-relay. Higher priority than arc-web so
+      # the catch-all doesn't eat it; rule-length is already longer but we
+      # set priority explicitly for safety.
+      - "traefik.http.routers.arc-relay.rule=(Host(`arc.ailuxis.com`) || Host(`beam.ailuxis.com`)) && PathPrefix(`/api`)"
+      - "traefik.http.routers.arc-relay.entrypoints=websecure"
+      - "traefik.http.routers.arc-relay.tls=true"
+      - "traefik.http.routers.arc-relay.tls.certresolver=mytlschallenge"
+      - "traefik.http.routers.arc-relay.priority=100"
+      - "traefik.http.services.arc-relay.loadbalancer.server.port=9900"
+      # Beacon WS endpoint /ws on both hosts → arc-relay (kept as a
+      # separate router so /ws isn't accidentally caught by /api rules).
+      - "traefik.http.routers.arc-ws.rule=(Host(`arc.ailuxis.com`) || Host(`beam.ailuxis.com`)) && PathPrefix(`/ws`)"
+      - "traefik.http.routers.arc-ws.entrypoints=websecure"
+      - "traefik.http.routers.arc-ws.tls=true"
+      - "traefik.http.routers.arc-ws.tls.certresolver=mytlschallenge"
+      - "traefik.http.routers.arc-ws.priority=110"
+      - "traefik.http.routers.arc-ws.service=arc-relay"
+    restart: unless-stopped
+    networks:
+      - internal
+      - traefik
+
+  arc-web:
+    image: michaeldancurtis/arc-web:${ARC_TAG:-latest}
+    environment:
+      # NEXT_PUBLIC_* is baked into the browser bundle at build time, so the
+      # arc-web Dockerfile build on the registry side MUST be done with this
+      # value set or the prod build will contain `http://arc-relay:9900` and
+      # the browser won't be able to reach it. If you need to flip it here
+      # at runtime only, the code must read it server-side.
+      NEXT_PUBLIC_ARC_RELAY_URL: ${NEXT_PUBLIC_ARC_RELAY_URL:-https://arc.ailuxis.com}
+      # Next.js 13+ standalone server binds to whatever HOSTNAME is set to.
+      # Docker auto-sets HOSTNAME to the container short-ID, so the server
+      # ends up listening on `<short-id>:3000` which Traefik can't reach
+      # over the bridge network (→ 502 Bad Gateway). Override to 0.0.0.0.
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    depends_on:
+      - arc-relay
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=root_default"
+      # Catch-all for both hosts → arc-web. Lower priority so /api and /ws
+      # don't hit it.
+      - "traefik.http.routers.arc-web.rule=Host(`arc.ailuxis.com`) || Host(`beam.ailuxis.com`)"
+      - "traefik.http.routers.arc-web.entrypoints=websecure"
+      - "traefik.http.routers.arc-web.tls=true"
+      - "traefik.http.routers.arc-web.tls.certresolver=mytlschallenge"
+      - "traefik.http.routers.arc-web.priority=10"
+      - "traefik.http.services.arc-web.loadbalancer.server.port=3000"
+    restart: unless-stopped
+    networks:
+      - internal
+      - traefik
+
+volumes:
+  arc-pgdata:
+
+networks:
+  # Internal bridge only arc-* services share. arc-postgres is only on this
+  # net, so nothing outside the arc stack can reach it.
+  internal:
+  # Existing Traefik's default network from the `root` compose project.
+  # External → we don't create it; we attach to what's already there.
+  traefik:
+    name: root_default
+    external: true
