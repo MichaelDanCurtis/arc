@@ -236,3 +236,32 @@ client does not parse it — only the HTTP status code matters.
    flushed immediately (disable response buffering). The Mac SSE parser expects line-by-line delivery.
 
 6. **CORS** — not required (Mac native client, no browser).
+
+---
+
+## Environment variables (server-side)
+
+These variables must be set on the relay process to enable the corresponding
+provider. Missing keys cause the handler to return `501 Not Implemented` with
+a JSON body `{"error": "..."}`.
+
+| Variable            | Provider  | Required for                               |
+|---------------------|-----------|--------------------------------------------|
+| `ANTHROPIC_API_KEY` | Anthropic | `/v1/ai/chat`, `/v1/ai/stream_chat`, `/v1/ai/complete` when `provider == "anthropic"` (or empty); also gates Anthropic entries in `/v1/ai/list_models` |
+
+### Adding a new provider
+
+1. Pick an env-var name (e.g. `OPENAI_API_KEY`) and document it in this table.
+2. Add a match arm for `"openai"` in `fan_out_chat`, `fan_out_stream`, and
+   `fan_out_complete` in `arc-relay/src/api/ai_routes.rs`.
+3. Add the provider's model entries to `list_models_handler` gated on
+   `std::env::var("OPENAI_API_KEY").is_ok()`.
+
+### Provider routing logic
+
+- If `provider` is empty the relay defaults to `"anthropic"`.
+- Any `provider` value other than `"anthropic"` currently returns `501 Not
+  Implemented`.
+- The `complete` endpoint infers the provider from the model id prefix
+  (e.g. `"anthropic:claude-haiku-4-5"` → provider `"anthropic"`, model
+  `"claude-haiku-4-5"`).
