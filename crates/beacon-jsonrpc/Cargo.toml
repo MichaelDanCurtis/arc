@@ -1,0 +1,26 @@
+[package]
+name = "beacon-jsonrpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "JSON-RPC 2.0 message types, dispatcher, and framed transport for Beacon"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+async-trait = { workspace = true }
+
+[features]
+default = []
+# Enable framed length-prefixed transport helpers over AsyncRead/AsyncWrite
+transport = ["tokio", "tokio-util", "bytes", "futures-util"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+pretty_assertions = { workspace = true }
