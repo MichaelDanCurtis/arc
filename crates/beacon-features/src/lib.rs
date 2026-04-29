@@ -102,7 +102,10 @@ impl fmt::Display for FeatureFlag {
 /// developer to edit their `features.toml`.  Remove it once the flag is GA
 /// (or permanently off).
 pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
-    // e.g. FeatureFlag::ArcRouting,
+    FeatureFlag::NewPersistence,
+    FeatureFlag::CommandSignaturesV2,
+    FeatureFlag::RemoteV2,
+    FeatureFlag::JsonRpcSpine,
 ];
 
 // ---------------------------------------------------------------------------
@@ -420,8 +423,13 @@ mod tests {
 
     #[test]
     fn test_dogfood_flags_constant_exists() {
-        // DOGFOOD_FLAGS is currently empty; just verify it compiles and is accessible.
-        let _count = DOGFOOD_FLAGS.len();
+        // Currently exercises NewPersistence + CommandSignaturesV2 + RemoteV2 + JsonRpcSpine
+        // by default in debug builds (4 flags as of 2026-04-29).
+        assert!(DOGFOOD_FLAGS.len() >= 4);
+        assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::NewPersistence));
+        assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::CommandSignaturesV2));
+        assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::RemoteV2));
+        assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::JsonRpcSpine));
     }
 
     #[cfg(debug_assertions)]
