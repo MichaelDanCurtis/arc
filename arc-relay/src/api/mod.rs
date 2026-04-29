@@ -13,6 +13,7 @@ use crate::mirror::invitation::InvitationStore;
 use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 
+pub mod ai_routes;
 pub mod auth_routes;
 pub mod marketplace_author_routes;
 pub mod marketplace_install_routes;
@@ -49,6 +50,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/refresh", post(auth_routes::refresh))
         .route("/oauth/:provider", get(oauth_routes::oauth_redirect))
         .route("/oauth/:provider/callback", get(oauth_routes::oauth_callback));
+
+    // ── AI fan-out routes (Bearer JWT required) ─────────────────────────────
+    let jwt_secret_ai = state.config.jwt_secret.clone();
+    let ai = Router::new()
+        .route("/chat", post(ai_routes::chat_handler))
+        .route("/stream_chat", post(ai_routes::stream_chat_handler))
+        .route("/complete", post(ai_routes::complete_handler))
+        .route("/list_models", get(ai_routes::list_models_handler))
+        .layer(middleware::from_fn_with_state(
+            jwt_secret_ai,
+            inject_jwt_secret,
+        ));
 
     // ── Protected API routes (Bearer JWT required) ───────────────────────────
     //
@@ -157,6 +170,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/auth", auth)
         .nest("/api/marketplace", marketplace)
         .nest("/api", api)
+        .nest("/v1/ai", ai)
         .nest("/api/setup", setup)
         .nest("/api/audit", audit)
         .merge(ws)
