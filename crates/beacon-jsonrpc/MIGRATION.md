@@ -13,29 +13,46 @@ Source files: `beacon-core/crates/beacon-ffi/src/lib.rs`,
 
 ### Methods (request/response)
 
-| Method name             | Params shape                              | Result shape                  | Source fn / type          |
-|-------------------------|-------------------------------------------|-------------------------------|---------------------------|
-| `session.create`        | `{workspace_id, shell, cwd}`              | `{session_id}`                | `FfiHostd::create_session`|
-| `session.attach`        | `{session_id}`                            | `{ok: bool}`                  | `FfiHostd::attach`        |
-| `session.resize`        | `{session_id, cols, rows}`               | `{ok: bool}`                  | `FfiHostd::resize`        |
-| `session.write`         | `{session_id, data: string}`              | `{ok: bool}`                  | `FfiHostd::write`         |
-| `session.close`         | `{session_id}`                            | `{ok: bool}`                  | `FfiHostd::close_session` |
-| `memory.search`         | `{query, top_k, workspace_id?}`           | `[{text, score}]`             | `FfiMemoryStore::search`  |
-| `memory.upsert`         | `{entry: MemoryEntry}`                    | `{id: string}`                | `FfiMemoryStore::upsert`  |
-| `ai.send_message`       | `{session_id, message}`                   | streaming via notifications   | `FfiAiSession::send_message` |
-| `command.describe`      | `{command: string}`                       | `{description: string}`       | **DONE** — see beacon-command/src/rpc.rs |
+| Method name             | Params shape                              | Result shape                  | Source fn / type          | Status |
+|-------------------------|-------------------------------------------|-------------------------------|---------------------------|--------|
+| `session.create`        | `{workspace_id, shell, cwd}`              | `{session_id}`                | `FfiHostd::create_session`| **DONE** — see beacon-hostd/src/rpc.rs |
+| `session.attach`        | `{session_id}`                            | `{ok: bool}`                  | `FfiHostd::attach`        | **DONE** — see beacon-hostd/src/rpc.rs |
+| `session.resize`        | `{session_id, cols, rows}`               | `{ok: bool}`                  | `FfiHostd::resize`        | **DONE** — see beacon-hostd/src/rpc.rs |
+| `session.write`         | `{session_id, data: string}`              | `{ok: bool}`                  | `FfiHostd::write`         | **DONE** — see beacon-hostd/src/rpc.rs |
+| `session.close`         | `{session_id}`                            | `{ok: bool}`                  | `FfiHostd::close_session` | **DONE** — see beacon-hostd/src/rpc.rs |
+| `memory.search`         | `{query, top_k, workspace_id?}`           | `[{text, score}]`             | `FfiMemoryStore::search`  | still uniffi — deferred to follow-up |
+| `memory.upsert`         | `{entry: MemoryEntry}`                    | `{id: string}`                | `FfiMemoryStore::upsert`  | still uniffi — deferred to follow-up |
+| `ai.send_message`       | `{session_id, message}`                   | streaming via notifications   | `FfiAiSession::send_message` | still uniffi — deferred to follow-up |
+| `command.describe`      | `{command: string}`                       | `{description: string}`       | **DONE** — see beacon-command/src/rpc.rs | **DONE** |
 
 ### Notifications (server → client, no response)
 
-| Notification name        | Params shape                              | Emitted when                  |
-|--------------------------|-------------------------------------------|-------------------------------|
-| `session.output`         | `{session_id, data: string}`              | PTY produces bytes            |
-| `session.title_changed`  | `{session_id, title: string}`             | OSC 0/2 sequence              |
-| `session.cwd_changed`    | `{session_id, cwd: string}`               | OSC 7 sequence                |
-| `session.block_end`      | `{session_id, block: Block}`              | OSC 133;D closes a block      |
-| `ai.chunk`               | `{session_id, delta: string}`             | Streaming AI token            |
-| `ai.done`                | `{session_id, usage?}`                    | AI response complete          |
-| `ai.error`               | `{session_id, error: string}`             | AI call failed                |
+| Notification name        | Params shape                              | Emitted when                  | Status |
+|--------------------------|-------------------------------------------|-------------------------------|--------|
+| `session.output`         | `{session_id, data: string}`              | PTY produces bytes            | **DONE** — `emit_output()` in beacon-hostd/src/rpc.rs |
+| `session.title_changed`  | `{session_id, title: string}`             | OSC 0/2 sequence              | **DONE** — `emit_title_changed()` in beacon-hostd/src/rpc.rs |
+| `session.cwd_changed`    | `{session_id, cwd: string}`               | OSC 7 sequence                | **DONE** — `emit_cwd_changed()` in beacon-hostd/src/rpc.rs |
+| `session.block_end`      | `{session_id, block: Block}`              | OSC 133;D closes a block      | **DONE** — `emit_block_end()` in beacon-hostd/src/rpc.rs |
+| `ai.chunk`               | `{session_id, delta: string}`             | Streaming AI token            | still uniffi — deferred to follow-up |
+| `ai.done`                | `{session_id, usage?}`                    | AI response complete          | still uniffi — deferred to follow-up |
+| `ai.error`               | `{session_id, error: string}`             | AI call failed                | still uniffi — deferred to follow-up |
+
+### Notification channel design (feat/jsonrpc-hostd)
+
+Notifications are delivered via `tokio::sync::broadcast::Sender<String>` held inside
+each `SessionEntry` in `beacon-hostd::rpc::SessionStore`. Each notification string is
+a fully-serialised JSON-RPC 2.0 `Notification` object.
+
+Callers subscribe by calling `FfiHostdRpc::subscribe_notifications(session_id)` which
+returns an `Arc<FfiNotifReceiver>`. They poll it with `FfiNotifReceiver::poll_next()`.
+This polling approach was chosen over FFI callbacks to avoid the cross-thread
+complexity of callback interfaces when the notification may fire from any async task.
+
+### ai.* and memory.* status (feat/jsonrpc-hostd)
+
+`ai.send_message`, `ai.chunk`, `ai.done`, `ai.error`, `memory.search`, `memory.upsert`
+remain on the uniffi surface. Migrating them requires streaming-over-RPC design
+(ai.*) and memory store wiring (memory.*) which are deferred to follow-up branches.
 
 ---
 
@@ -106,11 +123,15 @@ excludes plugin-host gRPC from the unification scope.
 
 ## Estimated migration order
 
-1. `command.describe` — **DONE** (this PR, gated by `FeatureFlag::JsonRpcSpine`)
-2. `session.*` + `session.*` notifications — highest-frequency; unblocks live mirror
-3. `ai.*` — needed for streaming tokens over WebSocket
-4. `arc.*` — dependent on arc-relay WebSocket refactor
-5. `remote.*` — can run in parallel with arc.* once P6 SSH is fleshed out
+1. `command.describe` — **DONE** (branch `refactor/jsonrpc-spine`, gated by `FeatureFlag::JsonRpcSpine`)
+2. `session.*` (5 methods) + 4 session notifications — **DONE** (branch `feat/jsonrpc-hostd`)
+   - `SessionRpcHandler` in `beacon-hostd/src/rpc.rs`
+   - `FfiHostdRpc` + `FfiNotifReceiver` + `FfiSessionStore` in `beacon-ffi/src/lib.rs`
+   - Notification channel: `broadcast::Sender<String>` per session, polled via `FfiNotifReceiver::poll_next()`
+3. `memory.*` (`memory.search`, `memory.upsert`) — still uniffi; migrate after session cutover is validated
+4. `ai.*` (`ai.send_message` + streaming notifications) — still uniffi; requires streaming-over-RPC design
+5. `arc.*` — dependent on arc-relay WebSocket refactor
+6. `remote.*` — can run in parallel with arc.* once P6 SSH is fleshed out
 
 Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until
 the full boundary is cut over, then the flag can be removed.
