@@ -47,6 +47,9 @@ pub enum FeatureFlag {
     JsonRpcSpine,
     /// Command signatures v2 corpus for ghost-text ranking. (P5 placeholder)
     CommandSignaturesV2,
+    /// Prompt the user before an AI agent writes to a block for the first time.
+    /// Default OFF in P3e2; Mac UI work lands in a follow-up phase.
+    AgentFirstWritePrompt,
 }
 
 impl FeatureFlag {
@@ -58,6 +61,7 @@ impl FeatureFlag {
             FeatureFlag::RemoteV2 => "remote_v2",
             FeatureFlag::JsonRpcSpine => "json_rpc_spine",
             FeatureFlag::CommandSignaturesV2 => "command_signatures_v2",
+            FeatureFlag::AgentFirstWritePrompt => "agent_first_write_prompt",
         }
     }
 
@@ -74,6 +78,7 @@ impl FeatureFlag {
             "remote_v2" => Some(FeatureFlag::RemoteV2),
             "json_rpc_spine" => Some(FeatureFlag::JsonRpcSpine),
             "command_signatures_v2" => Some(FeatureFlag::CommandSignaturesV2),
+            "agent_first_write_prompt" => Some(FeatureFlag::AgentFirstWritePrompt),
             _ => None,
         }
     }
@@ -325,6 +330,8 @@ mod tests {
         assert_eq!(FeatureFlag::RemoteV2.as_str(), "remote_v2");
         assert_eq!(FeatureFlag::JsonRpcSpine.as_str(), "json_rpc_spine");
         assert_eq!(FeatureFlag::CommandSignaturesV2.as_str(), "command_signatures_v2");
+        // P3e2: Tier 2 flag
+        assert_eq!(FeatureFlag::AgentFirstWritePrompt.as_str(), "agent_first_write_prompt");
     }
 
     #[test]
@@ -341,6 +348,8 @@ mod tests {
             FeatureFlag::RemoteV2,
             FeatureFlag::JsonRpcSpine,
             FeatureFlag::CommandSignaturesV2,
+            // P3e2: Tier 2 flag
+            FeatureFlag::AgentFirstWritePrompt,
         ];
         for flag in all {
             assert_eq!(FeatureFlag::from_str_key(flag.as_str()), Some(flag));
@@ -363,6 +372,8 @@ mod tests {
             FeatureFlag::RemoteV2,
             FeatureFlag::JsonRpcSpine,
             FeatureFlag::CommandSignaturesV2,
+            // P3e2: Tier 2 flag
+            FeatureFlag::AgentFirstWritePrompt,
         ];
         for flag in flags {
             let json = serde_json::to_string(&flag).unwrap();
@@ -377,6 +388,39 @@ mod tests {
         assert_eq!(json, r#""arc_routing""#);
         let json = serde_json::to_string(&FeatureFlag::CommandSignaturesV2).unwrap();
         assert_eq!(json, r#""command_signatures_v2""#);
+    }
+
+    // --- P3e2 Tier 2: AgentFirstWritePrompt flag ---
+
+    #[test]
+    fn agent_first_write_prompt_str_roundtrip() {
+        // as_str → from_str_key must be identity.
+        let flag = FeatureFlag::AgentFirstWritePrompt;
+        assert_eq!(flag.as_str(), "agent_first_write_prompt");
+        assert_eq!(FeatureFlag::from_str_key("agent_first_write_prompt"), Some(flag));
+    }
+
+    #[test]
+    fn agent_first_write_prompt_default_is_off() {
+        // Built-in default must be false (not in DOGFOOD_FLAGS).
+        assert!(!FeatureFlag::AgentFirstWritePrompt.builtin_default());
+        assert!(!DOGFOOD_FLAGS.contains(&FeatureFlag::AgentFirstWritePrompt));
+    }
+
+    #[test]
+    fn agent_first_write_prompt_env_var_enables_flag() {
+        // Env var BEACON_FF_AGENT_FIRST_WRITE_PROMPT=1 must enable the flag.
+        with_env("BEACON_FF_AGENT_FIRST_WRITE_PROMPT", "1", || {
+            assert!(is_enabled(FeatureFlag::AgentFirstWritePrompt));
+        });
+    }
+
+    #[test]
+    fn agent_first_write_prompt_env_var_disables_flag() {
+        // Env var =0 must keep the flag off.
+        with_env("BEACON_FF_AGENT_FIRST_WRITE_PROMPT", "0", || {
+            assert!(!is_enabled(FeatureFlag::AgentFirstWritePrompt));
+        });
     }
 
     // --- env var override beats everything ---
@@ -551,6 +595,7 @@ new_persistence = false"#;
             "remote_v2",
             "json_rpc_spine",
             "command_signatures_v2",
+            "agent_first_write_prompt",
         ];
         for key in all {
             let result = set_flag_by_name(key, false);
