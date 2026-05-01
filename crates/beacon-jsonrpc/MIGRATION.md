@@ -20,8 +20,11 @@ Source files: `beacon-core/crates/beacon-ffi/src/lib.rs`,
 | `session.resize`        | `{session_id, cols, rows}`               | `{ok: bool}`                  | `FfiHostd::resize`        | **DONE** — see beacon-hostd/src/rpc.rs |
 | `session.write`         | `{session_id, data: string}`              | `{ok: bool}`                  | `FfiHostd::write`         | **DONE** — see beacon-hostd/src/rpc.rs |
 | `session.close`         | `{session_id}`                            | `{ok: bool}`                  | `FfiHostd::close_session` | **DONE** — see beacon-hostd/src/rpc.rs |
-| `memory.search`         | `{query, top_k, workspace_id?}`           | `[{text, score}]`             | `FfiMemoryStore::search`  | still uniffi — deferred to follow-up |
-| `memory.upsert`         | `{entry: MemoryEntry}`                    | `{id: string}`                | `FfiMemoryStore::upsert`  | still uniffi — deferred to follow-up |
+| `memory.list`           | `{scope}`                                 | `[{filename,name,description,memory_type}]` | `MemoryStore::list`     | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
+| `memory.load`           | `{scope, filename}`                       | `{filename,name,description,memory_type,body}` | `MemoryStore::load`  | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
+| `memory.save`           | `{scope,name,description,memory_type,body}` | `{filename}`                | `MemoryStore::save`       | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
+| `memory.delete`         | `{scope, filename}`                       | `{ok: true}`                  | `MemoryStore::delete`     | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
+| `memory.retrieval`      | `{}`                                      | `[{filename,name,description,memory_type,body,score,scope}]` | `MemoryStore::last_retrieval` | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
 | `ai.send_message`       | `{session_id, message}`                   | streaming via notifications   | `FfiAiSession::send_message` | still uniffi — deferred to follow-up |
 | `command.describe`      | `{command: string}`                       | `{description: string}`       | **DONE** — see beacon-command/src/rpc.rs | **DONE** |
 
@@ -48,11 +51,18 @@ returns an `Arc<FfiNotifReceiver>`. They poll it with `FfiNotifReceiver::poll_ne
 This polling approach was chosen over FFI callbacks to avoid the cross-thread
 complexity of callback interfaces when the notification may fire from any async task.
 
-### ai.* and memory.* status (feat/jsonrpc-hostd)
+### ai.* status (feat/jsonrpc-hostd)
 
-`ai.send_message`, `ai.chunk`, `ai.done`, `ai.error`, `memory.search`, `memory.upsert`
-remain on the uniffi surface. Migrating them requires streaming-over-RPC design
-(ai.*) and memory store wiring (memory.*) which are deferred to follow-up branches.
+`ai.send_message`, `ai.chunk`, `ai.done`, `ai.error` remain on the uniffi surface.
+Migrating them requires streaming-over-RPC design which is deferred to follow-up
+branches.
+
+### memory.* status (feat/jsonrpc-memory)
+
+`memory.list`, `memory.load`, `memory.save`, `memory.delete`, `memory.retrieval`
+shipped on `feat/jsonrpc-memory`. Handlers in `beacon-multi-agent/src/memory/rpc.rs`
+gated by `JsonRpcSpine` flag. Uniffi `memory::ffi` surface kept in parallel
+until callers cut over.
 
 ---
 
@@ -128,7 +138,7 @@ excludes plugin-host gRPC from the unification scope.
    - `SessionRpcHandler` in `beacon-hostd/src/rpc.rs`
    - `FfiHostdRpc` + `FfiNotifReceiver` + `FfiSessionStore` in `beacon-ffi/src/lib.rs`
    - Notification channel: `broadcast::Sender<String>` per session, polled via `FfiNotifReceiver::poll_next()`
-3. `memory.*` (`memory.search`, `memory.upsert`) — still uniffi; migrate after session cutover is validated
+3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`, gated by `JsonRpcSpine`)
 4. `ai.*` (`ai.send_message` + streaming notifications) — still uniffi; requires streaming-over-RPC design
 5. `arc.*` — dependent on arc-relay WebSocket refactor
 6. `remote.*` — can run in parallel with arc.* once P6 SSH is fleshed out
