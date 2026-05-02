@@ -63,9 +63,14 @@ either `ai.done` or `ai.error` as the terminal frame. Subscribers attach via
 `AiSessionStore::subscribe(session_id)` to a per-session
 `tokio::sync::broadcast::Sender<String>`.
 
-`StreamEvent::ToolUse` is currently dropped in this surface — agent tool flows
-continue to use `FfiAiSession::run_agent` (uniffi) until a future slice
-threads tool events through the RPC channel.
+`StreamEvent::ToolUse` now emits an `ai.tool_use` notification
+(`{session_id, id, name, arguments}`) on the same broadcast channel as
+`ai.chunk` / `ai.done` / `ai.error` (shipped on `feat/jsonrpc-ai-tool-events`).
+The arc surface emits the same notification name via `ArcAiStreamEvent::ToolUse`
+so watchers subscribe identically for local vs Arc. Agent tool flows still use
+`FfiAiSession::run_agent` (uniffi) for execution dispatch — RPC tool events are
+informational (chip rendering / observability) until the agent loop itself
+moves over.
 
 ### memory.* status (feat/jsonrpc-memory)
 

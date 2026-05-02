@@ -74,6 +74,13 @@ pub struct ArcAiModel {
 pub enum ArcAiStreamEvent {
     /// Partial text delta to append to the assistant message.
     Text(String),
+    /// The model wants to invoke a tool. Forwarded as an `ai.tool_use`
+    /// notification so watchers (local or Arc) can render tool chips.
+    ToolUse {
+        id: String,
+        name: String,
+        arguments: Value,
+    },
     /// Stream finished cleanly. Emitted before the underlying `Stream` drops.
     Done,
     /// Stream produced an in-band error and is terminating.
@@ -213,6 +220,22 @@ pub fn emit_error(entry: &ArcAiSessionEntry, error: &str) {
     );
 }
 
+/// Emit `ai.tool_use` into the session's broadcast channel. Reuses the same
+/// notification name as the local ai.* slice so watchers can render tool
+/// invocations identically whether the chat ran locally or through Arc.
+pub fn emit_tool_use(entry: &ArcAiSessionEntry, id: &str, name: &str, arguments: &Value) {
+    send_notif(
+        &entry.notif_tx,
+        "ai.tool_use",
+        json!({
+            "session_id": entry.session_id,
+            "id": id,
+            "name": name,
+            "arguments": arguments,
+        }),
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,6 +364,13 @@ async fn stream_and_emit(
             Ok(ArcAiStreamEvent::Text(t)) => {
                 full.push_str(&t);
                 emit_chunk(entry, &t);
+            }
+            Ok(ArcAiStreamEvent::ToolUse {
+                id,
+                name,
+                arguments,
+            }) => {
+                emit_tool_use(entry, &id, &name, &arguments);
             }
             Ok(ArcAiStreamEvent::Done) => break,
             Ok(ArcAiStreamEvent::Error(msg)) => {
@@ -474,6 +504,34 @@ mod tests {
 
         async fn list_models(&self) -> Vec<ArcAiModel> {
             self.models.clone()
+        }
+    }
+
+    /// Mock backend whose stream emits Text → ToolUse → Text → Done. Used to
+    /// verify that `ai.tool_use` notifications interleave correctly with
+    /// `ai.chunk`s and that the assembled `content` skips tool events.
+    struct ToolBackend;
+
+    #[async_trait]
+    impl ArcAiBackend for ToolBackend {
+        async fn chat(&self, _req: &ArcAiChatRequest) -> Result<String, String> {
+            Ok("beforeafter".into())
+        }
+        async fn stream_chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiStream, String> {
+            let events: Vec<Result<ArcAiStreamEvent, String>> = vec![
+                Ok(ArcAiStreamEvent::Text("before".into())),
+                Ok(ArcAiStreamEvent::ToolUse {
+                    id: "call_1".into(),
+                    name: "echo".into(),
+                    arguments: json!({"text": "hi"}),
+                }),
+                Ok(ArcAiStreamEvent::Text("after".into())),
+                Ok(ArcAiStreamEvent::Done),
+            ];
+            Ok(Box::pin(stream::iter(events)))
+        }
+        async fn list_models(&self) -> Vec<ArcAiModel> {
+            vec![]
         }
     }
 
@@ -647,6 +705,42 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "ai.error");
         assert!(events[0].1["error"].as_str().unwrap().contains("upstream offline"));
+    }
+
+    #[tokio::test]
+    async fn stream_chat_emits_tool_use_between_chunks() {
+        let backend: Arc<dyn ArcAiBackend> = Arc::new(ToolBackend);
+        let (d, store) = build(backend);
+
+        let _ = store.get_or_create("s1").await;
+        let mut rx = store.subscribe("s1").await.expect("subscribe");
+
+        let req = Request::new(
+            "arc.ai.stream_chat",
+            json!({
+                "session_id": "s1",
+                "model": "anthropic:claude-opus-4-5",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        let events = drain_until_terminal(&mut rx).await;
+        let methods: Vec<&str> = events.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec!["ai.chunk", "ai.tool_use", "ai.chunk", "ai.done"]
+        );
+
+        let tu = &events[1].1;
+        assert_eq!(tu["session_id"], "s1");
+        assert_eq!(tu["id"], "call_1");
+        assert_eq!(tu["name"], "echo");
+        assert_eq!(tu["arguments"], json!({"text": "hi"}));
+
+        // Assembled content drops tool-use; text only.
+        assert_eq!(events[3].1["content"], "beforeafter");
     }
 
     #[tokio::test]
