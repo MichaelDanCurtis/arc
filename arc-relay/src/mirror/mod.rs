@@ -6,14 +6,14 @@ pub mod presence;
 pub mod scrollback;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 use beacon_proto::envelope::ArcToClient;
 
 use crate::mirror::{
-    fanout::Fanout,
+    fanout::{BroadcastEmitter, Fanout},
     lease::LeaseManager,
     presence::PresenceTracker,
     scrollback::{ScrollbackRing, DEFAULT_MAX_BYTES, DEFAULT_MAX_AGE},
@@ -44,9 +44,21 @@ impl SessionMirror {
 
 /// Process-wide map from session_id to per-session mirror state. Cheaply
 /// `Clone`able (`Arc`-backed) so it can live inside `AppState`.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MirrorRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<Mutex<SessionMirror>>>>>,
+    /// Pluggable observers called on every [`MirrorRegistry::broadcast`]. Uses
+    /// `std::sync::RwLock` so `add_emitter` is sync (called once at startup).
+    emitters: Arc<RwLock<Vec<Arc<dyn BroadcastEmitter>>>>,
+}
+
+impl Default for MirrorRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            emitters: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
 }
 
 impl MirrorRegistry {
@@ -80,5 +92,37 @@ impl MirrorRegistry {
     /// callers remains valid.
     pub async fn remove(&self, session_id: &str) {
         self.inner.lock().await.remove(session_id);
+    }
+
+    /// Register a [`BroadcastEmitter`] that will be called for every subsequent
+    /// [`broadcast`] invocation. Call once at startup; sync so no async needed.
+    pub fn add_emitter(&self, emitter: Arc<dyn BroadcastEmitter>) {
+        self.emitters
+            .write()
+            .expect("MirrorRegistry emitters RwLock poisoned")
+            .push(emitter);
+    }
+
+    /// Fan a frame out via the msgpack path (existing `Fanout::broadcast`) AND
+    /// every registered jsonrpc [`BroadcastEmitter`].
+    ///
+    /// The msgpack path only fires when a session entry exists in the registry.
+    /// Emitters always fire regardless, allowing the jsonrpc layer to receive
+    /// frames for sessions it tracks independently.
+    pub async fn broadcast(&self, session_id: &str, frame: ArcToClient) {
+        // Msgpack path — requires session entry.
+        if let Some(mirror) = self.get(session_id).await {
+            let mut m = mirror.lock().await;
+            m.fanout.broadcast(session_id, frame.clone());
+        }
+        // Jsonrpc emitter path — always fires.
+        let emitters = self
+            .emitters
+            .read()
+            .expect("MirrorRegistry emitters RwLock poisoned")
+            .clone();
+        for e in emitters {
+            e.on_broadcast(session_id, &frame);
+        }
     }
 }

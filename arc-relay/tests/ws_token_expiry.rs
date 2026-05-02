@@ -27,10 +27,12 @@ const JWT_SECRET: &str = "test-secret-that-is-long-enough-32x";
 
 /// Spawn an axum server on a random port and return the bound address.
 async fn spawn_relay() -> std::net::SocketAddr {
+    use arc_relay::ai_rpc::ArcAiSessionStore;
     use arc_relay::api::{build_router, AppState};
     use arc_relay::audit::AuditLog;
     use arc_relay::config::ArcConfig;
     use arc_relay::relay::router::RelayRouter;
+    use arc_relay::rpc::ArcSessionStore;
 
     let pool =
         sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc").expect("lazy pool");
@@ -45,6 +47,9 @@ async fn spawn_relay() -> std::net::SocketAddr {
         mirror_registry: arc_relay::mirror::MirrorRegistry::default(),
         invitations: arc_relay::mirror::invitation::InvitationStore::new(pool),
         r2: None,
+        arc_session_store: ArcSessionStore::new(64),
+        arc_ai_session_store: ArcAiSessionStore::new(64),
+        arc_ai_backend: None,
     };
 
     let router = build_router(state);

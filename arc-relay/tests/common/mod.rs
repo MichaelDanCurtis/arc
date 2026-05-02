@@ -101,6 +101,9 @@ pub async fn try_spawn_relay() -> Option<Relay> {
         mirror_registry: MirrorRegistry::default(),
         invitations: InvitationStore::new(pool),
         r2: None,
+        arc_session_store: arc_relay::rpc::ArcSessionStore::new(64),
+        arc_ai_session_store: arc_relay::ai_rpc::ArcAiSessionStore::new(64),
+        arc_ai_backend: None,
     };
 
     let router = build_router(state);
@@ -302,6 +305,182 @@ pub async fn host_register_session(relay: &Relay, user: &UserCreds, label: &str)
     });
 
     session_id.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC test helpers (Task 1+)
+// ---------------------------------------------------------------------------
+
+/// Spin up a minimal in-process relay on a random port.
+///
+/// Does NOT require `DATABASE_URL` — uses a lazy (never-connecting) pool.
+/// The JWT secret is pinned to `"test-secret"` so that [`mint_access_token`]
+/// works without a real config.
+pub async fn spawn_test_server() -> (std::net::SocketAddr, AppState) {
+    // Ensure JsonRpcSpine is enabled for all JSON-RPC integration tests.
+    // (Also in DOGFOOD_FLAGS for debug builds, but env var is authoritative.)
+    // TODO(beacon-features test setter): replace with a proper test-mode setter on
+    // `beacon_features` once added; `set_var` is unsafe under concurrent reads and
+    // leaks process-globally to other tests in this binary.
+    std::env::set_var("BEACON_FF_JSON_RPC_SPINE", "1");
+
+    // Lazy pool — DB is not exercised in these tests.
+    let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
+        .expect("lazy pool");
+    let mut config = ArcConfig::default();
+    config.jwt_secret = "test-secret".into();
+    let arc_session_store = arc_relay::rpc::ArcSessionStore::new(64);
+    let mirror_registry = MirrorRegistry::default();
+    mirror_registry.add_emitter(std::sync::Arc::new(
+        arc_relay::rpc::ArcMirrorEmitter::new(arc_session_store.clone()),
+    ));
+    let state = AppState {
+        pool: pool.clone(),
+        config: std::sync::Arc::new(config),
+        relay: std::sync::Arc::new(RelayRouter::new()),
+        audit: AuditLog::new(),
+        mirror_registry,
+        invitations: InvitationStore::new(pool),
+        r2: None,
+        arc_session_store,
+        arc_ai_session_store: arc_relay::ai_rpc::ArcAiSessionStore::new(64),
+        arc_ai_backend: None,
+    };
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, state)
+}
+
+/// Spin up a minimal in-process relay on a random port with a custom AI backend.
+///
+/// Identical to [`spawn_test_server`] but sets `arc_ai_backend` to `Some(backend)` so
+/// that the JSON-RPC WS handler registers the `arc.ai.*` handlers.  Call this from AI
+/// integration tests; use [`spawn_test_server`] for tests that don't need AI.
+pub async fn spawn_test_server_with_ai(
+    backend: std::sync::Arc<dyn arc_relay::ai_rpc::ArcAiBackend>,
+) -> (std::net::SocketAddr, AppState) {
+    std::env::set_var("BEACON_FF_JSON_RPC_SPINE", "1");
+
+    let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
+        .expect("lazy pool");
+    let mut config = ArcConfig::default();
+    config.jwt_secret = "test-secret".into();
+    let arc_session_store = arc_relay::rpc::ArcSessionStore::new(64);
+    let mirror_registry = MirrorRegistry::default();
+    mirror_registry.add_emitter(std::sync::Arc::new(
+        arc_relay::rpc::ArcMirrorEmitter::new(arc_session_store.clone()),
+    ));
+    let state = AppState {
+        pool: pool.clone(),
+        config: std::sync::Arc::new(config),
+        relay: std::sync::Arc::new(RelayRouter::new()),
+        audit: AuditLog::new(),
+        mirror_registry,
+        invitations: InvitationStore::new(pool),
+        r2: None,
+        arc_session_store,
+        arc_ai_session_store: arc_relay::ai_rpc::ArcAiSessionStore::new(64),
+        arc_ai_backend: Some(backend),
+    };
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, state)
+}
+
+/// Mint a short-lived access token using the test JWT secret.
+pub fn mint_access_token() -> String {
+    use arc_relay::auth::jwt::generate_token_pair;
+    let pair =
+        generate_token_pair(Uuid::new_v4(), "test-secret", 900, 86_400).unwrap();
+    pair.access_token
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC WebSocket client (Task 3+)
+// ---------------------------------------------------------------------------
+
+use tokio_tungstenite::{
+    tungstenite::{client::IntoClientRequest, http::HeaderValue},
+    MaybeTlsStream, WebSocketStream as TungsteniteWsStream,
+};
+
+/// A connected JSON-RPC WebSocket client for integration tests.
+pub struct JsonRpcWs {
+    pub inner: TungsteniteWsStream<MaybeTlsStream<tokio::net::TcpStream>>,
+}
+
+impl JsonRpcWs {
+    /// Send a JSON-RPC request and wait for the first text response frame.
+    /// Ping/Pong frames are skipped transparently.
+    pub async fn request(&mut self, req: serde_json::Value) -> serde_json::Value {
+        use futures_util::{SinkExt, StreamExt};
+        self.inner
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&req).unwrap(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match self.inner.next().await.unwrap().unwrap() {
+                    tokio_tungstenite::tungstenite::Message::Text(s) => {
+                        return serde_json::from_str(&s).unwrap()
+                    }
+                    tokio_tungstenite::tungstenite::Message::Ping(_)
+                    | tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+                    m => panic!("unexpected frame: {m:?}"),
+                }
+            }
+        })
+        .await
+        .expect("JsonRpcWs::request: timed out after 10s")
+    }
+
+    /// Wait for the next JSON-RPC notification (text frame without an `id`
+    /// that has a `method` field). Ping/Pong and response frames are skipped.
+    pub async fn next_notification(&mut self) -> serde_json::Value {
+        use futures_util::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match self.inner.next().await.unwrap().unwrap() {
+                    tokio_tungstenite::tungstenite::Message::Text(s) => {
+                        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+                        if v.get("method").is_some() && v.get("id").is_none() {
+                            return v;
+                        }
+                        // response frame — skip
+                    }
+                    tokio_tungstenite::tungstenite::Message::Ping(_)
+                    | tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+                    m => panic!("unexpected frame: {m:?}"),
+                }
+            }
+        })
+        .await
+        .expect("JsonRpcWs::next_notification: timed out after 10s")
+    }
+}
+
+/// Connect to the relay at `addr` with `Sec-WebSocket-Protocol: arc.json-rpc`.
+pub async fn connect_jsonrpc(addr: &std::net::SocketAddr) -> JsonRpcWs {
+    let token = mint_access_token();
+    let mut req = format!("ws://{addr}/ws?token={token}")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static("arc.json-rpc"),
+    );
+    let (inner, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    JsonRpcWs { inner }
 }
 
 /// Send a `PushOutput` frame from the host for `session_id`.

@@ -1,6 +1,6 @@
 use axum::{
     extract::{ws::WebSocketUpgrade, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -25,6 +25,7 @@ pub struct WsParams {
 /// [`handle_connection`].
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<AppState>,
     Query(params): Query<WsParams>,
 ) -> Response {
@@ -57,7 +58,23 @@ pub async fn ws_handler(
 
     let token = params.token.clone();
     tracing::info!(user_id = %user_id, "WebSocket connection upgrading");
-    ws.on_upgrade(move |socket| handle_connection(socket, user_id, token, state))
+
+    let wants_jsonrpc = headers
+        .get("Sec-WebSocket-Protocol")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').any(|p| p.trim() == "arc.json-rpc"))
+        .unwrap_or(false);
+
+    if wants_jsonrpc {
+        ws.protocols(["arc.json-rpc"])
+            .on_upgrade(move |socket| {
+                crate::ws::jsonrpc_handler::handle_jsonrpc_connection(
+                    socket, user_id, token, state,
+                )
+            })
+    } else {
+        ws.on_upgrade(move |socket| handle_connection(socket, user_id, token, state))
+    }
 }
 
 /// Close code sent when the access token has expired mid-connection.

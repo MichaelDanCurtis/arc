@@ -348,6 +348,55 @@ impl RpcHandler for ArcSessionReleaseHandler {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ArcMirrorEmitter — bridges MirrorRegistry::broadcast to arc.mirror.* notifs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A [`crate::mirror::fanout::BroadcastEmitter`] that translates `ArcToClient`
+/// frames into `arc.mirror.*` JSON-RPC notifications on the matching
+/// [`ArcSessionEntry`].
+///
+/// `on_broadcast` is sync; `ArcSessionStore::get` is async. We spawn a task
+/// to bridge the gap.
+pub struct ArcMirrorEmitter {
+    pub store: ArcSessionStore,
+}
+
+impl ArcMirrorEmitter {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl crate::mirror::fanout::BroadcastEmitter for ArcMirrorEmitter {
+    fn on_broadcast(&self, session_id: &str, frame: &beacon_proto::envelope::ArcToClient) {
+        let store = self.store.clone();
+        let session_id = session_id.to_string();
+        let frame = frame.clone();
+        tokio::spawn(async move {
+            let Some(entry) = store.get(&session_id).await else {
+                return;
+            };
+            match &frame {
+                beacon_proto::envelope::ArcToClient::SessionOutput { bytes, .. } => {
+                    emit_mirror_frame(&entry, bytes);
+                }
+                beacon_proto::envelope::ArcToClient::LeaseChanged {
+                    driver: Some(d), ..
+                } => {
+                    emit_mirror_control_grant(&entry, &d.user_id);
+                }
+                beacon_proto::envelope::ArcToClient::LeaseChanged {
+                    driver: None, ..
+                } => {
+                    emit_mirror_control_revoke(&entry);
+                }
+                _ => {}
+            }
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Registration helpers
 // ─────────────────────────────────────────────────────────────────────────────
 

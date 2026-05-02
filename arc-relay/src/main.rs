@@ -31,14 +31,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    let arc_session_store = arc_relay::rpc::ArcSessionStore::new(64);
+    let mirror_registry = arc_relay::mirror::MirrorRegistry::default();
+    mirror_registry.add_emitter(Arc::new(
+        arc_relay::rpc::ArcMirrorEmitter::new(arc_session_store.clone()),
+    ));
+
     let app_state = api::AppState {
         pool: pool.clone(),
         config: Arc::new(config.clone()),
         relay: relay_router.clone(),
         audit: audit_log,
-        mirror_registry: arc_relay::mirror::MirrorRegistry::default(),
+        mirror_registry,
         invitations: arc_relay::mirror::invitation::InvitationStore::new(pool.clone()),
         r2,
+        arc_session_store,
+        arc_ai_session_store: arc_relay::ai_rpc::ArcAiSessionStore::new(64),
+        arc_ai_backend: None,
     };
 
     retention::spawn_retention_task(pool.clone());

@@ -6,12 +6,14 @@ use axum::{
     Router,
 };
 
+use crate::ai_rpc::{ArcAiBackend, ArcAiSessionStore};
 use crate::audit::AuditLog;
 use crate::auth::middleware::inject_jwt_secret;
 use crate::config::ArcConfig;
 use crate::mirror::invitation::InvitationStore;
 use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
+use crate::rpc::ArcSessionStore;
 
 pub mod ai_routes;
 pub mod auth_routes;
@@ -37,6 +39,9 @@ pub struct AppState {
     pub mirror_registry: MirrorRegistry,
     pub invitations: InvitationStore,
     pub r2: Option<crate::storage::R2Client>,
+    pub arc_session_store: ArcSessionStore,
+    pub arc_ai_session_store: ArcAiSessionStore,
+    pub arc_ai_backend: Option<Arc<dyn ArcAiBackend>>,
 }
 
 /// Assemble the top-level Axum router.
@@ -212,6 +217,9 @@ pub(crate) mod tests {
             mirror_registry: MirrorRegistry::default(),
             invitations: InvitationStore::new(pool),
             r2: None,
+            arc_session_store: ArcSessionStore::new(64),
+            arc_ai_session_store: ArcAiSessionStore::new(64),
+            arc_ai_backend: None,
         }
     }
 

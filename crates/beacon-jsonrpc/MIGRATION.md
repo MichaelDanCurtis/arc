@@ -116,9 +116,9 @@ Handlers in `arc-relay/src/rpc.rs` gated by `JsonRpcSpine` via
 `register_if_enabled`. Per-session state lives in `ArcSessionStore` (controller
 holder + per-session `broadcast::Sender<String>` for notifications). The
 existing msgpack `ClientToArc`/`ArcToClient` envelope through
-`ws/handler.rs` is unchanged; the jsonrpc handlers are not yet wired into a
-WS endpoint — that cut-over (and a protocol-version handshake or magic-byte
-fallback) is deferred to a later slice once `arc.mirror.*` and `arc.ai.*` ship.
+`ws/handler.rs` is unchanged; the jsonrpc handlers are wired into the WS
+endpoint via `Sec-WebSocket-Protocol: arc.json-rpc` subprotocol negotiation
+(see WS-endpoint cut-over section below).
 
 `ArcSessionAttachHandler::with_user_resolver` lets callers swap the default
 FNV-1a token hash for a real JWT decode against the relay's `jwt_secret`;
@@ -130,17 +130,46 @@ without that dep.
 `arc.ai.chat`, `arc.ai.stream_chat`, `arc.ai.list_models` shipped on
 `feat/jsonrpc-arc-ai`. Handlers in `arc-relay/src/ai_rpc.rs` gated by
 `JsonRpcSpine` via `register_if_enabled`. The handlers depend on a pluggable
-`ArcAiBackend` trait (3 methods: `chat`, `stream_chat`, `list_models`); the
-production wiring against the existing HTTP fan-out in
-`arc-relay/src/api/ai_routes.rs` is deferred to the WS-endpoint cut-over
-slice. Streaming reuses the same `ai.chunk` / `ai.done` / `ai.error`
-notification surface as the local `ai.*` slice — watchers subscribe with
-identical code regardless of whether the chat ran locally or through Arc.
+`ArcAiBackend` trait (3 methods: `chat`, `stream_chat`, `list_models`).
+Streaming reuses the same `ai.chunk` / `ai.done` / `ai.error` notification
+surface as the local `ai.*` slice — watchers subscribe with identical code
+regardless of whether the chat ran locally or through Arc.
 
 `arc.ai.stream_chat` requires a `session_id` parameter (added beyond the
 original method-table sketch); without it concurrent streams would
 interleave on a single broadcast channel. Per-session state lives in
 `ArcAiSessionStore` (just a per-session `broadcast::Sender<String>`).
+
+### WS-endpoint cut-over — DONE (feat/jsonrpc-ws-cutover)
+
+`Sec-WebSocket-Protocol: arc.json-rpc` selects the JSON-RPC pump in
+`arc-relay/src/ws/jsonrpc_handler.rs`. Absent header → existing msgpack
+pump in `arc-relay/src/ws/handler.rs::handle_connection`, unchanged.
+
+Live methods over WS: `arc.session.{attach,control,release}`,
+`arc.ai.{chat,stream_chat,list_models}`.
+
+Live notifications over WS: `arc.session.participant`,
+`arc.mirror.{frame,control_grant,control_revoke}`,
+`ai.{chunk,done,error,tool_use}`.
+
+Mirror fanout: `MirrorRegistry::broadcast` invokes registered
+`BroadcastEmitter`s alongside the existing msgpack `Fanout::broadcast` path.
+The default emitter (`ArcMirrorEmitter` in `arc-relay/src/rpc.rs`) maps
+`ArcToClient::{SessionOutput, LeaseChanged}` → matching `arc.mirror.*`
+notifications on the per-session `broadcast::Sender<String>` watched by
+the JSON-RPC pump. Both wire formats fan out from the same call site
+(`src/ws/host.rs::PushOutput`).
+
+Production `HttpAiBackend` wiring against `arc-relay/src/api/ai_routes.rs`
+is deferred — the ai_routes fan-out fns return axum-tied types
+(`Result<_, Response>`, SSE `Event` streams) that need translation to the
+`ArcAiBackend` trait. Test-only mock backend ships in this slice; production
+adapter is a follow-up.
+
+Client adoption (Mac via `beacon-net`, arc-web watch page) lands in a
+follow-up plan once the wire path settles in production. `JsonRpcSpine`
+flag flip + msgpack-path removal is a separate cleanup slice.
 
 ---
 

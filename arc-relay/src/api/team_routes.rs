@@ -205,6 +205,9 @@ mod tests {
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
             r2: None,
+            arc_session_store: crate::rpc::ArcSessionStore::new(64),
+            arc_ai_session_store: crate::ai_rpc::ArcAiSessionStore::new(64),
+            arc_ai_backend: None,
         };
 
         let owner_id = uuid::Uuid::new_v4();
@@ -252,6 +255,9 @@ mod tests {
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool.clone()),
             r2: None,
+            arc_session_store: crate::rpc::ArcSessionStore::new(64),
+            arc_ai_session_store: crate::ai_rpc::ArcAiSessionStore::new(64),
+            arc_ai_backend: None,
         };
 
         let owner_id = uuid::Uuid::new_v4();

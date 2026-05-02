@@ -18,12 +18,14 @@ use axum::{
 };
 use tower::ServiceExt; // for oneshot
 
+use arc_relay::ai_rpc::ArcAiSessionStore;
 use arc_relay::api::{build_router, AppState};
 use arc_relay::auth::jwt::generate_token_pair;
 use arc_relay::config::ArcConfig;
 use arc_relay::mirror::invitation::InvitationStore;
 use arc_relay::mirror::MirrorRegistry;
 use arc_relay::relay::router::RelayRouter;
+use arc_relay::rpc::ArcSessionStore;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -40,6 +42,9 @@ fn test_state() -> AppState {
         mirror_registry: MirrorRegistry::default(),
         invitations: InvitationStore::new(pool),
         r2: None,
+        arc_session_store: ArcSessionStore::new(64),
+        arc_ai_session_store: ArcAiSessionStore::new(64),
+        arc_ai_backend: None,
     }
 }
 

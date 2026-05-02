@@ -111,6 +111,9 @@ mod tests {
             mirror_registry: crate::mirror::MirrorRegistry::default(),
             invitations: crate::mirror::invitation::InvitationStore::new(pool),
             r2: None,
+            arc_session_store: crate::rpc::ArcSessionStore::new(64),
+            arc_ai_session_store: crate::ai_rpc::ArcAiSessionStore::new(64),
+            arc_ai_backend: None,
         };
 
         let email = format!("getme_{}@test.invalid", uuid::Uuid::new_v4());

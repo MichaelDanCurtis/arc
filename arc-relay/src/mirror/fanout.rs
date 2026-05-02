@@ -20,6 +20,20 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BroadcastEmitter trait
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Pluggable observer called by [`crate::mirror::MirrorRegistry::broadcast`]
+/// for every outbound `ArcToClient` frame.
+///
+/// Implementations must be `Send + Sync` and may NOT block: the trait method
+/// is sync. If async work is required (e.g. `ArcSessionStore::get` which takes
+/// a `tokio::Mutex`), spawn a task inside `on_broadcast`.
+pub trait BroadcastEmitter: Send + Sync {
+    fn on_broadcast(&self, session_id: &str, frame: &ArcToClient);
+}
+
 /// Maximum number of frames buffered per watcher before they are evicted.
 const QUEUE_DEPTH: usize = 256;
 

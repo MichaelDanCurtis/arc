@@ -340,9 +340,11 @@ pub async fn handle_host(
                             }) => {
                                 let sid = session_id.to_string();
                                 if let Some(mirror) = mirror_registry.get(&sid).await {
-                                    let mut m = mirror.lock().await;
-                                    let canonical_seq = m.scrollback.append(bytes.clone());
-                                    m.fanout.broadcast(
+                                    let canonical_seq = {
+                                        let mut m = mirror.lock().await;
+                                        m.scrollback.append(bytes.clone())
+                                    };
+                                    mirror_registry.broadcast(
                                         &sid,
                                         ArcToClient::SessionOutput {
                                             session_id,
@@ -350,7 +352,7 @@ pub async fn handle_host(
                                             seq: canonical_seq,
                                             replay: false,
                                         },
-                                    );
+                                    ).await;
                                 } else {
                                     tracing::debug!(
                                         user_id = %user_id,

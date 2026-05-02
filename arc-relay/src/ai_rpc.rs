@@ -416,6 +416,17 @@ impl RpcHandler for ArcAiListModelsHandler {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Production adapter — DEFERRED
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Production HttpAiBackend adapter deferred — see plan
+// docs/superpowers/plans/2026-05-01-ws-jsonrpc-cutover.md Task 5.
+// ai_routes.rs fan_out_chat/fan_out_stream return axum-tied types
+// (Result<_, Response>, SSE Event streams) that need non-trivial
+// translation to ArcAiBackend. Test backends + flag-gated wire path
+// ship in this commit; production wiring is a follow-up.
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Registration
 // ─────────────────────────────────────────────────────────────────────────────
 
