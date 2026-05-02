@@ -25,7 +25,8 @@ Source files: `beacon-core/crates/beacon-ffi/src/lib.rs`,
 | `memory.save`           | `{scope,name,description,memory_type,body}` | `{filename}`                | `MemoryStore::save`       | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
 | `memory.delete`         | `{scope, filename}`                       | `{ok: true}`                  | `MemoryStore::delete`     | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
 | `memory.retrieval`      | `{}`                                      | `[{filename,name,description,memory_type,body,score,scope}]` | `MemoryStore::last_retrieval` | **DONE** — see beacon-multi-agent/src/memory/rpc.rs |
-| `ai.send_message`       | `{session_id, message}`                   | streaming via notifications   | `FfiAiSession::send_message` | still uniffi — deferred to follow-up |
+| `ai.session.create`     | `{session_id, model}`                     | `{ok: true}`                  | `AiSessionCreateHandler` | **DONE** — see beacon-multi-agent/src/ai_rpc.rs |
+| `ai.send_message`       | `{session_id, message}`                   | `{ok: true}` (streams via notifs) | `AiSendMessageHandler` | **DONE** — see beacon-multi-agent/src/ai_rpc.rs |
 | `command.describe`      | `{command: string}`                       | `{description: string}`       | **DONE** — see beacon-command/src/rpc.rs | **DONE** |
 
 ### Notifications (server → client, no response)
@@ -36,9 +37,9 @@ Source files: `beacon-core/crates/beacon-ffi/src/lib.rs`,
 | `session.title_changed`  | `{session_id, title: string}`             | OSC 0/2 sequence              | **DONE** — `emit_title_changed()` in beacon-hostd/src/rpc.rs |
 | `session.cwd_changed`    | `{session_id, cwd: string}`               | OSC 7 sequence                | **DONE** — `emit_cwd_changed()` in beacon-hostd/src/rpc.rs |
 | `session.block_end`      | `{session_id, block: Block}`              | OSC 133;D closes a block      | **DONE** — `emit_block_end()` in beacon-hostd/src/rpc.rs |
-| `ai.chunk`               | `{session_id, delta: string}`             | Streaming AI token            | still uniffi — deferred to follow-up |
-| `ai.done`                | `{session_id, usage?}`                    | AI response complete          | still uniffi — deferred to follow-up |
-| `ai.error`               | `{session_id, error: string}`             | AI call failed                | still uniffi — deferred to follow-up |
+| `ai.chunk`               | `{session_id, delta: string}`             | Streaming AI token            | **DONE** — `emit_chunk()` in beacon-multi-agent/src/ai_rpc.rs |
+| `ai.done`                | `{session_id, model, content}`            | AI response complete          | **DONE** — `emit_done()` in beacon-multi-agent/src/ai_rpc.rs |
+| `ai.error`               | `{session_id, error: string}`             | AI call failed                | **DONE** — `emit_error()` in beacon-multi-agent/src/ai_rpc.rs |
 
 ### Notification channel design (feat/jsonrpc-hostd)
 
@@ -51,11 +52,20 @@ returns an `Arc<FfiNotifReceiver>`. They poll it with `FfiNotifReceiver::poll_ne
 This polling approach was chosen over FFI callbacks to avoid the cross-thread
 complexity of callback interfaces when the notification may fire from any async task.
 
-### ai.* status (feat/jsonrpc-hostd)
+### ai.* status (feat/jsonrpc-ai)
 
-`ai.send_message`, `ai.chunk`, `ai.done`, `ai.error` remain on the uniffi surface.
-Migrating them requires streaming-over-RPC design which is deferred to follow-up
-branches.
+`ai.session.create`, `ai.send_message`, plus the three streaming notifications
+(`ai.chunk`, `ai.done`, `ai.error`) shipped on `feat/jsonrpc-ai`. Handlers in
+`beacon-multi-agent/src/ai_rpc.rs` gated by `JsonRpcSpine`. Streaming-over-RPC
+design: `ai.send_message` returns `{ok:true}` immediately, then a spawned task
+drives `Provider::stream_chat` and emits `ai.chunk` per `StreamEvent::Text` and
+either `ai.done` or `ai.error` as the terminal frame. Subscribers attach via
+`AiSessionStore::subscribe(session_id)` to a per-session
+`tokio::sync::broadcast::Sender<String>`.
+
+`StreamEvent::ToolUse` is currently dropped in this surface — agent tool flows
+continue to use `FfiAiSession::run_agent` (uniffi) until a future slice
+threads tool events through the RPC channel.
 
 ### memory.* status (feat/jsonrpc-memory)
 
@@ -139,7 +149,7 @@ excludes plugin-host gRPC from the unification scope.
    - `FfiHostdRpc` + `FfiNotifReceiver` + `FfiSessionStore` in `beacon-ffi/src/lib.rs`
    - Notification channel: `broadcast::Sender<String>` per session, polled via `FfiNotifReceiver::poll_next()`
 3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`, gated by `JsonRpcSpine`)
-4. `ai.*` (`ai.send_message` + streaming notifications) — still uniffi; requires streaming-over-RPC design
+4. `ai.*` (`ai.session.create`, `ai.send_message` + 3 streaming notifications) — **DONE** (branch `feat/jsonrpc-ai`, gated by `JsonRpcSpine`)
 5. `arc.*` — dependent on arc-relay WebSocket refactor
 6. `remote.*` — can run in parallel with arc.* once P6 SSH is fleshed out
 
