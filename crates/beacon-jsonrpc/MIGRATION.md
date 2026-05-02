@@ -88,9 +88,9 @@ Source files: `arc-relay/src/relay.rs`, `arc-relay/src/session.rs`,
 | `arc.session.attach`       | `{session_id, token}`                     | join mirrored session         | **DONE** — `ArcSessionAttachHandler` in arc-relay/src/rpc.rs |
 | `arc.session.control`      | `{session_id, requester_id}`              | claim write control           | **DONE** — `ArcSessionControlHandler` |
 | `arc.session.release`      | `{session_id}`                            | release write control         | **DONE** — `ArcSessionReleaseHandler` |
-| `arc.ai.chat`              | `{model, messages[]}`                     | P3 ArcProvider deferred route | TBD — own sub-slice (`feat/jsonrpc-arc-ai`) |
-| `arc.ai.stream_chat`       | `{model, messages[]}`                     | streaming variant             | TBD — own sub-slice |
-| `arc.ai.list_models`       | `{}`                                      | enumerate available models    | TBD — own sub-slice |
+| `arc.ai.chat`              | `{model, messages[]}`                     | non-streaming chat fan-out    | **DONE** — `ArcAiChatHandler` in arc-relay/src/ai_rpc.rs |
+| `arc.ai.stream_chat`       | `{session_id, model, messages[]}`         | streaming via ai.chunk/ai.done/ai.error | **DONE** — `ArcAiStreamChatHandler` |
+| `arc.ai.list_models`       | `{}`                                      | enumerate available models    | **DONE** — `ArcAiListModelsHandler` |
 
 ### Notifications
 
@@ -119,6 +119,23 @@ fallback) is deferred to a later slice once `arc.mirror.*` and `arc.ai.*` ship.
 FNV-1a token hash for a real JWT decode against the relay's `jwt_secret`;
 the rpc layer itself stays free of `jsonwebtoken` so consumers can mount it
 without that dep.
+
+### arc.ai.* status (feat/jsonrpc-arc-ai)
+
+`arc.ai.chat`, `arc.ai.stream_chat`, `arc.ai.list_models` shipped on
+`feat/jsonrpc-arc-ai`. Handlers in `arc-relay/src/ai_rpc.rs` gated by
+`JsonRpcSpine` via `register_if_enabled`. The handlers depend on a pluggable
+`ArcAiBackend` trait (3 methods: `chat`, `stream_chat`, `list_models`); the
+production wiring against the existing HTTP fan-out in
+`arc-relay/src/api/ai_routes.rs` is deferred to the WS-endpoint cut-over
+slice. Streaming reuses the same `ai.chunk` / `ai.done` / `ai.error`
+notification surface as the local `ai.*` slice — watchers subscribe with
+identical code regardless of whether the chat ran locally or through Arc.
+
+`arc.ai.stream_chat` requires a `session_id` parameter (added beyond the
+original method-table sketch); without it concurrent streams would
+interleave on a single broadcast channel. Per-session state lives in
+`ArcAiSessionStore` (just a per-session `broadcast::Sender<String>`).
 
 ---
 
@@ -187,7 +204,7 @@ excludes plugin-host gRPC from the unification scope.
    - Notification channel: `broadcast::Sender<String>` per session, polled via `FfiNotifReceiver::poll_next()`
 3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`, gated by `JsonRpcSpine`)
 4. `ai.*` (`ai.session.create`, `ai.send_message` + 3 streaming notifications) — **DONE** (branch `feat/jsonrpc-ai`, gated by `JsonRpcSpine`)
-5. `arc.*` — `arc.session.*` (3 methods + 1 notif) **DONE** (branch `feat/jsonrpc-arc-session`); `arc.mirror.*` (3 notifs) **DONE** (branch `feat/jsonrpc-arc-mirror`); `arc.ai.*` (3 methods) sub-slice still TBD
+5. `arc.*` — `arc.session.*` (3 methods + 1 notif) **DONE** (branch `feat/jsonrpc-arc-session`); `arc.mirror.*` (3 notifs) **DONE** (branch `feat/jsonrpc-arc-mirror`); `arc.ai.*` (3 methods) **DONE** (branch `feat/jsonrpc-arc-ai`)
 6. `remote.*` — connect/disconnect + 4 notifs **DONE** (branch `feat/jsonrpc-remote`); exec/file.read/file.write/forward.start advertised but stubbed pending russh wiring
 
 Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until
