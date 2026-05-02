@@ -46,6 +46,7 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["pem", "rand_core"] }
 rand = "0.8"
 futures-util = "0.3"
+bytes = "1"
 
 [features]
 # Use a 1-second revalidation tick so integration tests finish in ~4s.
@@ -58,5 +59,4 @@ pretty_assertions = "1"
 tower = { version = "0.5", features = ["util"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
-bytes = "1"
 uuid = { version = "1", features = ["v4"] }

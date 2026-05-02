@@ -416,15 +416,14 @@ impl RpcHandler for ArcAiListModelsHandler {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Production adapter — DEFERRED
+// Production adapter
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Production HttpAiBackend adapter deferred — see plan
-// docs/superpowers/plans/2026-05-01-ws-jsonrpc-cutover.md Task 5.
-// ai_routes.rs fan_out_chat/fan_out_stream return axum-tied types
-// (Result<_, Response>, SSE Event streams) that need non-trivial
-// translation to ArcAiBackend. Test backends + flag-gated wire path
-// ship in this commit; production wiring is a follow-up.
+// Production [`ArcAiBackend`] impl lives in [`crate::ai_backend::HttpAiBackend`].
+// It targets the Anthropic Messages API directly (mirroring the legacy
+// `/v1/ai/*` HTTP routes in `ai_routes.rs`) and is wired into `AppState`
+// from `main.rs`. The test backends below remain in this module so unit
+// tests that exercise the rpc handlers in isolation don't pull in reqwest.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Registration

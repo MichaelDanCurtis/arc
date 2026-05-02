@@ -4,6 +4,7 @@
 /// them without duplicating code.  The binary (`main.rs`) also uses this crate
 /// via `use arc_relay::...` — or simply by the modules being in scope because
 /// both share the same `src/` tree.
+pub mod ai_backend;
 pub mod ai_rpc;
 pub mod api;
 pub mod audit;

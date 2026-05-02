@@ -161,15 +161,24 @@ notifications on the per-session `broadcast::Sender<String>` watched by
 the JSON-RPC pump. Both wire formats fan out from the same call site
 (`src/ws/host.rs::PushOutput`).
 
-Production `HttpAiBackend` wiring against `arc-relay/src/api/ai_routes.rs`
-is deferred — the ai_routes fan-out fns return axum-tied types
-(`Result<_, Response>`, SSE `Event` streams) that need translation to the
-`ArcAiBackend` trait. Test-only mock backend ships in this slice; production
-adapter is a follow-up.
+~~Production `HttpAiBackend` wiring against `arc-relay/src/api/ai_routes.rs`
+is deferred~~ — DONE in `feat/http-ai-backend`; see new section below.
 
 Client adoption (Mac via `beacon-net`, arc-web watch page) lands in a
 follow-up plan once the wire path settles in production. `JsonRpcSpine`
 flag flip + msgpack-path removal is a separate cleanup slice.
+
+### HttpAiBackend production adapter — DONE (feat/http-ai-backend)
+
+`arc-relay/src/ai_backend.rs::HttpAiBackend` now drives `arc.ai.{chat,stream_chat,list_models}` against the Anthropic Messages API. Wired into `AppState.arc_ai_backend` in `arc-relay/src/main.rs`. Reads `ANTHROPIC_API_KEY` from env at each call (matches legacy `/v1/ai/*` semantics). Provider prefix `anthropic:` strips before forwarding `model` to upstream. Other prefixes return `Err`.
+
+**Out of scope for this slice (gaps with `/v1/ai/chat`):**
+- `tools` / function calling — `ArcAiChatRequest` has no `tools` field
+- explicit `temperature` / `max_tokens` — hardcoded `max_tokens=1024`
+- providers other than Anthropic
+
+These can be addressed by extending `ArcAiChatRequest` (rpc layer) and the
+backend's `build_anthropic_request`.
 
 ---
 

@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         r2,
         arc_session_store,
         arc_ai_session_store: arc_relay::ai_rpc::ArcAiSessionStore::new(64),
-        arc_ai_backend: None,
+        arc_ai_backend: Some(Arc::new(arc_relay::ai_backend::HttpAiBackend::new())),
     };
 
     retention::spawn_retention_task(pool.clone());
