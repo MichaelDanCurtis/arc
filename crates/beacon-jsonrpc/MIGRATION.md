@@ -83,25 +83,42 @@ Source files: `arc-relay/src/relay.rs`, `arc-relay/src/session.rs`,
 
 ### Methods
 
-| Method name                | Params shape                              | Notes                         |
-|----------------------------|-------------------------------------------|-------------------------------|
-| `arc.session.attach`       | `{session_id, token}`                     | join mirrored session         |
-| `arc.session.control`      | `{session_id, requester_id}`              | claim write control           |
-| `arc.session.release`      | `{session_id}`                            | release write control         |
-| `arc.ai.chat`              | `{model, messages[]}`                     | P3 ArcProvider deferred route |
-| `arc.ai.stream_chat`       | `{model, messages[]}`                     | streaming variant             |
-| `arc.ai.list_models`       | `{}`                                      | enumerate available models    |
+| Method name                | Params shape                              | Notes                         | Status |
+|----------------------------|-------------------------------------------|-------------------------------|--------|
+| `arc.session.attach`       | `{session_id, token}`                     | join mirrored session         | **DONE** — `ArcSessionAttachHandler` in arc-relay/src/rpc.rs |
+| `arc.session.control`      | `{session_id, requester_id}`              | claim write control           | **DONE** — `ArcSessionControlHandler` |
+| `arc.session.release`      | `{session_id}`                            | release write control         | **DONE** — `ArcSessionReleaseHandler` |
+| `arc.ai.chat`              | `{model, messages[]}`                     | P3 ArcProvider deferred route | TBD — own sub-slice (`feat/jsonrpc-arc-ai`) |
+| `arc.ai.stream_chat`       | `{model, messages[]}`                     | streaming variant             | TBD — own sub-slice |
+| `arc.ai.list_models`       | `{}`                                      | enumerate available models    | TBD — own sub-slice |
 
 ### Notifications
 
-| Notification name           | Params shape                              | Direction     |
-|-----------------------------|-------------------------------------------|---------------|
-| `arc.mirror.frame`          | `{session_id, data: bytes_b64}`           | relay→watcher |
-| `arc.mirror.control_grant`  | `{session_id, holder_id}`                 | relay→all     |
-| `arc.mirror.control_revoke` | `{session_id}`                            | relay→all     |
-| `arc.session.participant`   | `{session_id, user_id, joined: bool}`     | relay→all     |
+| Notification name           | Params shape                              | Direction     | Status |
+|-----------------------------|-------------------------------------------|---------------|--------|
+| `arc.mirror.frame`          | `{session_id, data: bytes_b64}`           | relay→watcher | TBD — `feat/jsonrpc-arc-mirror` |
+| `arc.mirror.control_grant`  | `{session_id, holder_id}`                 | relay→all     | TBD — `feat/jsonrpc-arc-mirror` |
+| `arc.mirror.control_revoke` | `{session_id}`                            | relay→all     | TBD — `feat/jsonrpc-arc-mirror` |
+| `arc.session.participant`   | `{session_id, user_id, joined: bool}`     | relay→all     | **DONE** — `emit_participant()` in arc-relay/src/rpc.rs |
 
 Reference: `arc-relay/docs/ai-route.md` (P3 deferred endpoint spec).
+
+### arc.session.* status (feat/jsonrpc-arc-session)
+
+`arc.session.attach`, `arc.session.control`, `arc.session.release`, plus the
+`arc.session.participant` notification shipped on `feat/jsonrpc-arc-session`.
+Handlers in `arc-relay/src/rpc.rs` gated by `JsonRpcSpine` via
+`register_if_enabled`. Per-session state lives in `ArcSessionStore` (controller
+holder + per-session `broadcast::Sender<String>` for notifications). The
+existing msgpack `ClientToArc`/`ArcToClient` envelope through
+`ws/handler.rs` is unchanged; the jsonrpc handlers are not yet wired into a
+WS endpoint — that cut-over (and a protocol-version handshake or magic-byte
+fallback) is deferred to a later slice once `arc.mirror.*` and `arc.ai.*` ship.
+
+`ArcSessionAttachHandler::with_user_resolver` lets callers swap the default
+FNV-1a token hash for a real JWT decode against the relay's `jwt_secret`;
+the rpc layer itself stays free of `jsonwebtoken` so consumers can mount it
+without that dep.
 
 ---
 
@@ -170,7 +187,7 @@ excludes plugin-host gRPC from the unification scope.
    - Notification channel: `broadcast::Sender<String>` per session, polled via `FfiNotifReceiver::poll_next()`
 3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`, gated by `JsonRpcSpine`)
 4. `ai.*` (`ai.session.create`, `ai.send_message` + 3 streaming notifications) — **DONE** (branch `feat/jsonrpc-ai`, gated by `JsonRpcSpine`)
-5. `arc.*` — dependent on arc-relay WebSocket refactor
+5. `arc.*` — `arc.session.*` (3 methods + 1 notif) **DONE** (branch `feat/jsonrpc-arc-session`); `arc.mirror.*` (3 notifs) and `arc.ai.*` (3 methods) sub-slices still TBD
 6. `remote.*` — connect/disconnect + 4 notifs **DONE** (branch `feat/jsonrpc-remote`); exec/file.read/file.write/forward.start advertised but stubbed pending russh wiring
 
 Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until

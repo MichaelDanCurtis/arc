@@ -13,6 +13,7 @@ pub mod mirror;
 pub mod models;
 pub mod relay;
 pub mod retention;
+pub mod rpc;
 pub mod setup;
 pub mod signing;
 pub mod storage;
