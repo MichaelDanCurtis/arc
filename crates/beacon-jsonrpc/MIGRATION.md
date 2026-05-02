@@ -157,7 +157,7 @@ Branch: `feat/jsonrpc-remote` (rpc spine landed today).
 |----------------------------|-------------------------------------------|-----------------------------------|--------|
 | `remote.connect`           | `{host, port?, user, auth: {type, ...}}` | allocates entry + broadcast chan; transport spin-up belongs to caller layer | **DONE** — `RemoteConnectHandler` in beacon-remote/src/rpc.rs |
 | `remote.disconnect`        | `{remote_session_id}`                    | emits final `remote.disconnected` then removes entry | **DONE** — `RemoteDisconnectHandler` |
-| `remote.exec`              | `{remote_session_id, command}`           | run one-off command               | advertised, returns server_error "not yet implemented in jsonrpc spine" — needs russh exec wiring |
+| `remote.exec`              | `{remote_session_id, command}`           | run one-off command (acks `{ok:true}`; backend emits `remote.pty_data` + `remote.exit_status`) | **DONE** (rpc layer) — `RemoteExecHandler` + pluggable `RemoteExecBackend` trait; russh-side `Channel::exec()` wiring still pending |
 | `remote.file.read`         | `{remote_session_id, path}`              | SFTP read                         | advertised, server_error stub — needs russh-sftp |
 | `remote.file.write`        | `{remote_session_id, path, content_b64}` | SFTP write                        | advertised, server_error stub — needs russh-sftp |
 | `remote.forward.start`     | `{remote_session_id, local_port, remote_port}` | port forward (deferred)   | advertised, server_error stub — needs russh forward channel |
