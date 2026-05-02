@@ -105,29 +105,49 @@ Reference: `arc-relay/docs/ai-route.md` (P3 deferred endpoint spec).
 
 ---
 
-## 3. beacon-remote  (SSH transport, currently stub)
+## 3. beacon-remote  (SSH transport)
 
-Source files: `beacon-core/crates/beacon-remote/src/lib.rs`.
+Source files: `beacon-core/crates/beacon-remote/src/lib.rs`,
+`beacon-core/crates/beacon-remote/src/rpc.rs`.
 
-Branch: `feat/beacon-remote` (P6 stub, a376d77).
+Branch: `feat/jsonrpc-remote` (rpc spine landed today).
 
 ### Methods
 
-| Method name                | Params shape                              | Notes                             |
-|----------------------------|-------------------------------------------|-----------------------------------|
-| `remote.connect`           | `{host, port, user, auth}`               | initiate SSH session              |
-| `remote.disconnect`        | `{remote_session_id}`                    | clean shutdown                    |
-| `remote.exec`              | `{remote_session_id, command}`           | run one-off command               |
-| `remote.file.read`         | `{remote_session_id, path}`              | SFTP read                         |
-| `remote.file.write`        | `{remote_session_id, path, content_b64}` | SFTP write                        |
-| `remote.forward.start`     | `{remote_session_id, local_port, remote_port}` | port forward (deferred)   |
+| Method name                | Params shape                              | Notes                             | Status |
+|----------------------------|-------------------------------------------|-----------------------------------|--------|
+| `remote.connect`           | `{host, port?, user, auth: {type, ...}}` | allocates entry + broadcast chan; transport spin-up belongs to caller layer | **DONE** — `RemoteConnectHandler` in beacon-remote/src/rpc.rs |
+| `remote.disconnect`        | `{remote_session_id}`                    | emits final `remote.disconnected` then removes entry | **DONE** — `RemoteDisconnectHandler` |
+| `remote.exec`              | `{remote_session_id, command}`           | run one-off command               | advertised, returns server_error "not yet implemented in jsonrpc spine" — needs russh exec wiring |
+| `remote.file.read`         | `{remote_session_id, path}`              | SFTP read                         | advertised, server_error stub — needs russh-sftp |
+| `remote.file.write`        | `{remote_session_id, path, content_b64}` | SFTP write                        | advertised, server_error stub — needs russh-sftp |
+| `remote.forward.start`     | `{remote_session_id, local_port, remote_port}` | port forward (deferred)   | advertised, server_error stub — needs russh forward channel |
+
+`auth.type` accepts `password` (with `password`), `private_key` (with
+`key_path`, optional `passphrase`), or `agent` (no extra fields). Unknown
+types fail with invalid_params.
 
 ### Notifications
 
-| Notification name          | Params shape                              | Direction         |
-|----------------------------|-------------------------------------------|-------------------|
-| `remote.output`            | `{remote_session_id, data}`              | daemon→client     |
-| `remote.disconnected`      | `{remote_session_id, reason}`            | daemon→client     |
+Names match the live [`RemoteEvent`] enum; the original draft's `remote.output`
+was renamed to `remote.pty_data` to match the existing transport docs.
+
+| Notification name          | Params shape                              | Direction         | Status |
+|----------------------------|-------------------------------------------|-------------------|--------|
+| `remote.connected`         | `{remote_session_id}`                    | daemon→client     | **DONE** — `emit_connected()` in beacon-remote/src/rpc.rs |
+| `remote.pty_data`          | `{remote_session_id, data_b64}`          | daemon→client     | **DONE** — `emit_pty_data()` (base64-encodes raw bytes) |
+| `remote.exit_status`       | `{remote_session_id, code}`              | daemon→client     | **DONE** — `emit_exit_status()` |
+| `remote.disconnected`      | `{remote_session_id, reason?}`           | daemon→client     | **DONE** — `emit_disconnected()` |
+
+### Notification channel design (feat/jsonrpc-remote)
+
+Identical to hostd's pattern: each `RemoteSessionEntry` in
+`RemoteSessionStore` carries a `tokio::sync::broadcast::Sender<String>` of
+JSON-encoded `Notification` strings. A higher-level wiring layer that owns
+the runtime and the `ssh` cargo feature reads `entry.notif_tx` and bridges
+`SshTransport`'s `mpsc<RemoteEvent>` into `emit_*` calls; the rpc layer
+itself stays free of cargo feature gymnastics so consumers can mount it
+without compiling russh.
 
 ---
 
@@ -151,7 +171,7 @@ excludes plugin-host gRPC from the unification scope.
 3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`, gated by `JsonRpcSpine`)
 4. `ai.*` (`ai.session.create`, `ai.send_message` + 3 streaming notifications) — **DONE** (branch `feat/jsonrpc-ai`, gated by `JsonRpcSpine`)
 5. `arc.*` — dependent on arc-relay WebSocket refactor
-6. `remote.*` — can run in parallel with arc.* once P6 SSH is fleshed out
+6. `remote.*` — connect/disconnect + 4 notifs **DONE** (branch `feat/jsonrpc-remote`); exec/file.read/file.write/forward.start advertised but stubbed pending russh wiring
 
 Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until
 the full boundary is cut over, then the flag can be removed.
