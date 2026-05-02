@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use beacon_jsonrpc::{BoxFuture, Notification, RpcDispatcher, RpcError, RpcHandler};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Mutex};
@@ -131,6 +132,51 @@ pub fn emit_participant(entry: &ArcSessionEntry, user_id: &str, joined: bool) {
             "session_id": entry.session_id,
             "user_id": user_id,
             "joined": joined,
+        }),
+    );
+}
+
+/// Emit `arc.mirror.frame` with base64-encoded raw bytes.
+///
+/// Direction: relay→watcher. Carries a single PTY output frame from the
+/// session's host to every subscribed watcher. Pairs with the existing
+/// msgpack `ArcToClient::SessionOutput` envelope; future cut-over slices
+/// will bridge `Fanout::broadcast` into this emit fn instead.
+pub fn emit_mirror_frame(entry: &ArcSessionEntry, data: &[u8]) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.frame",
+        json!({
+            "session_id": entry.session_id,
+            "data": BASE64.encode(data),
+        }),
+    );
+}
+
+/// Emit `arc.mirror.control_grant`.
+///
+/// Direction: relay→all. Fires when write control transfers to a new holder.
+pub fn emit_mirror_control_grant(entry: &ArcSessionEntry, holder_id: &str) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.control_grant",
+        json!({
+            "session_id": entry.session_id,
+            "holder_id": holder_id,
+        }),
+    );
+}
+
+/// Emit `arc.mirror.control_revoke`.
+///
+/// Direction: relay→all. Fires when the current holder releases write
+/// control with no successor.
+pub fn emit_mirror_control_revoke(entry: &ArcSessionEntry) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.control_revoke",
+        json!({
+            "session_id": entry.session_id,
         }),
     );
 }
@@ -252,7 +298,8 @@ impl RpcHandler for ArcSessionControlHandler {
                     "arc session not found: {session_id}"
                 )));
             };
-            *entry.controller.lock().await = Some(requester_id);
+            *entry.controller.lock().await = Some(requester_id.clone());
+            emit_mirror_control_grant(&entry, &requester_id);
             Ok(json!({"ok": true}))
         })
     }
@@ -291,7 +338,10 @@ impl RpcHandler for ArcSessionReleaseHandler {
                     "arc session not found: {session_id}"
                 )));
             };
-            *entry.controller.lock().await = None;
+            let had_holder = entry.controller.lock().await.take().is_some();
+            if had_holder {
+                emit_mirror_control_revoke(&entry);
+            }
             Ok(json!({"ok": true}))
         })
     }
@@ -515,5 +565,80 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.starts_with("u_"));
+    }
+
+    #[tokio::test]
+    async fn control_emits_mirror_grant() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s1").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.control",
+            json!({"session_id": "s1", "requester_id": "bob"}),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.control_grant");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["holder_id"], "bob");
+    }
+
+    #[tokio::test]
+    async fn release_emits_mirror_revoke_when_holder_was_set() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s1").await;
+        *entry.controller.lock().await = Some("bob".into());
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.release",
+            json!({"session_id": "s1"}),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.control_revoke");
+        assert_eq!(v["params"]["session_id"], "s1");
+    }
+
+    #[tokio::test]
+    async fn release_no_revoke_when_no_holder() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s1").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.release",
+            json!({"session_id": "s1"}),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        // No revoke notif since there was no holder to clear.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_frame_base64_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s1").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let payload = b"\x1b[1;31mhello\x1b[0m";
+        emit_mirror_frame(&entry, payload);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.frame");
+        assert_eq!(v["params"]["session_id"], "s1");
+        let b64 = v["params"]["data"].as_str().unwrap();
+        let decoded = BASE64.decode(b64).unwrap();
+        assert_eq!(decoded, payload);
     }
 }

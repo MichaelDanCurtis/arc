@@ -96,9 +96,9 @@ Source files: `arc-relay/src/relay.rs`, `arc-relay/src/session.rs`,
 
 | Notification name           | Params shape                              | Direction     | Status |
 |-----------------------------|-------------------------------------------|---------------|--------|
-| `arc.mirror.frame`          | `{session_id, data: bytes_b64}`           | relay→watcher | TBD — `feat/jsonrpc-arc-mirror` |
-| `arc.mirror.control_grant`  | `{session_id, holder_id}`                 | relay→all     | TBD — `feat/jsonrpc-arc-mirror` |
-| `arc.mirror.control_revoke` | `{session_id}`                            | relay→all     | TBD — `feat/jsonrpc-arc-mirror` |
+| `arc.mirror.frame`          | `{session_id, data: bytes_b64}`           | relay→watcher | **DONE** — `emit_mirror_frame()` in arc-relay/src/rpc.rs |
+| `arc.mirror.control_grant`  | `{session_id, holder_id}`                 | relay→all     | **DONE** — `emit_mirror_control_grant()`; auto-fired by `arc.session.control` |
+| `arc.mirror.control_revoke` | `{session_id}`                            | relay→all     | **DONE** — `emit_mirror_control_revoke()`; auto-fired by `arc.session.release` (when a holder existed) |
 | `arc.session.participant`   | `{session_id, user_id, joined: bool}`     | relay→all     | **DONE** — `emit_participant()` in arc-relay/src/rpc.rs |
 
 Reference: `arc-relay/docs/ai-route.md` (P3 deferred endpoint spec).
@@ -187,7 +187,7 @@ excludes plugin-host gRPC from the unification scope.
    - Notification channel: `broadcast::Sender<String>` per session, polled via `FfiNotifReceiver::poll_next()`
 3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`, gated by `JsonRpcSpine`)
 4. `ai.*` (`ai.session.create`, `ai.send_message` + 3 streaming notifications) — **DONE** (branch `feat/jsonrpc-ai`, gated by `JsonRpcSpine`)
-5. `arc.*` — `arc.session.*` (3 methods + 1 notif) **DONE** (branch `feat/jsonrpc-arc-session`); `arc.mirror.*` (3 notifs) and `arc.ai.*` (3 methods) sub-slices still TBD
+5. `arc.*` — `arc.session.*` (3 methods + 1 notif) **DONE** (branch `feat/jsonrpc-arc-session`); `arc.mirror.*` (3 notifs) **DONE** (branch `feat/jsonrpc-arc-mirror`); `arc.ai.*` (3 methods) sub-slice still TBD
 6. `remote.*` — connect/disconnect + 4 notifs **DONE** (branch `feat/jsonrpc-remote`); exec/file.read/file.write/forward.start advertised but stubbed pending russh wiring
 
 Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until
