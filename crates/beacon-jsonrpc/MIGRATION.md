@@ -259,6 +259,14 @@ excludes plugin-host gRPC from the unification scope.
 Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until
 the full boundary is cut over, then the flag can be removed.
 
+### `JsonRpcSpine` default → ON (2026-05-02)
+
+`FeatureFlag::JsonRpcSpine.builtin_default()` now returns `true` (release + debug). All
+`register_if_enabled` call sites continue to honour env (`BEACON_FF_JSON_RPC_SPINE=0`)
+and TOML overrides, so callers can still disable the spine if needed. Removal of the
+gating helpers (turning `register_if_enabled` into unconditional `register`) is a
+follow-up cleanup once the wire-side cut-over (msgpack → JSON-RPC) is complete.
+
 ---
 
 ## beacon-net JSON-RPC client — DONE (2026-05-02)

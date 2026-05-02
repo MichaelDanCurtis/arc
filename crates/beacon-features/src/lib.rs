@@ -85,8 +85,12 @@ impl FeatureFlag {
 
     /// Built-in default for this flag (independent of debug/release mode).
     fn builtin_default(self) -> bool {
-        // All flags default OFF unless listed in DOGFOOD_FLAGS (for debug builds).
-        false
+        match self {
+            // GA — JSON-RPC spine handlers are now always registered.
+            FeatureFlag::JsonRpcSpine => true,
+            // All other flags default OFF unless listed in DOGFOOD_FLAGS (for debug builds).
+            _ => false,
+        }
     }
 }
 
@@ -110,7 +114,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::NewPersistence,
     FeatureFlag::CommandSignaturesV2,
     FeatureFlag::RemoteV2,
-    FeatureFlag::JsonRpcSpine,
 ];
 
 // ---------------------------------------------------------------------------
@@ -459,7 +462,8 @@ mod tests {
         // In debug cfg, DOGFOOD_FLAGS is also empty, so still false.
         assert!(!FeatureFlag::NewPersistence.builtin_default());
         assert!(!FeatureFlag::RemoteV2.builtin_default());
-        assert!(!FeatureFlag::JsonRpcSpine.builtin_default());
+        // JsonRpcSpine is now GA → builtin_default = true.
+        assert!(FeatureFlag::JsonRpcSpine.builtin_default());
         assert!(!FeatureFlag::CommandSignaturesV2.builtin_default());
     }
 
@@ -467,13 +471,14 @@ mod tests {
 
     #[test]
     fn test_dogfood_flags_constant_exists() {
-        // Currently exercises NewPersistence + CommandSignaturesV2 + RemoteV2 + JsonRpcSpine
-        // by default in debug builds (4 flags as of 2026-04-29).
-        assert!(DOGFOOD_FLAGS.len() >= 4);
+        // Currently exercises NewPersistence + CommandSignaturesV2 + RemoteV2
+        // by default in debug builds (3 flags as of 2026-05-02 — JsonRpcSpine
+        // graduated to GA via builtin_default = true and was removed from this list).
+        assert!(DOGFOOD_FLAGS.len() >= 3);
         assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::NewPersistence));
         assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::CommandSignaturesV2));
         assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::RemoteV2));
-        assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::JsonRpcSpine));
+        assert!(!DOGFOOD_FLAGS.contains(&FeatureFlag::JsonRpcSpine));
     }
 
     #[cfg(debug_assertions)]
