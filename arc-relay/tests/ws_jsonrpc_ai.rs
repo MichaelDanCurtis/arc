@@ -10,7 +10,9 @@ use common::{connect_jsonrpc, spawn_test_server_with_ai};
 
 use std::sync::Arc;
 
-use arc_relay::ai_rpc::{ArcAiBackend, ArcAiChatRequest, ArcAiModel, ArcAiStream, ArcAiStreamEvent};
+use arc_relay::ai_rpc::{
+    ArcAiBackend, ArcAiChatRequest, ArcAiChatResponse, ArcAiModel, ArcAiStream, ArcAiStreamEvent,
+};
 use async_trait::async_trait;
 use futures_util::stream;
 use serde_json::json;
@@ -24,8 +26,11 @@ struct ChunkBackend;
 
 #[async_trait]
 impl ArcAiBackend for ChunkBackend {
-    async fn chat(&self, _req: &ArcAiChatRequest) -> Result<String, String> {
-        Ok("hello world".into())
+    async fn chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String> {
+        Ok(ArcAiChatResponse {
+            content: Some("hello world".into()),
+            tool_calls: Vec::new(),
+        })
     }
 
     async fn stream_chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiStream, String> {

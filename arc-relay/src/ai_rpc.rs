@@ -45,18 +45,85 @@ use tokio::sync::{broadcast, Mutex};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Single chat message in the OpenAI-compat shape used on the wire.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ArcAiMessage {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ArcAiToolCall>,
+}
+
+/// One tool invocation requested by the assistant. Mirrors OpenAI's
+/// `tool_calls[]` entry; identical to legacy `RequestToolCall` in `ai_routes.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArcAiToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ArcAiToolCallFunction,
+}
+
+/// Function name and JSON-serialized arguments, matching OpenAI's
+/// `tool_calls[].function` shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArcAiToolCallFunction {
+    pub name: String,
+    /// Arguments are an opaque JSON string (matches OpenAI). Backends are
+    /// responsible for parsing if they need a structured value.
+    pub arguments: String,
+}
+
+/// Tool definition supplied by the caller in the request envelope.
+/// Mirrors legacy `ToolDef` in `ai_routes.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArcAiTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ArcAiToolFunction,
+}
+
+/// Tool function metadata: name, description, JSON-Schema parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArcAiToolFunction {
+    pub name: String,
+    pub description: String,
+    /// JSON-Schema for the tool's input. Forwarded as-is to upstream.
+    pub parameters: Value,
+}
+
+/// Response payload returned by [`ArcAiBackend::chat`]. Mirrors the legacy
+/// `/v1/ai/chat` `ChatResponse.choices[0].message` shape: `content` may be
+/// null when the model only requested tools.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ArcAiChatResponse {
+    /// Assistant text. `None` when the model only emitted tool_use blocks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Tool calls requested by the model. Empty when the model returned
+    /// only text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ArcAiToolCall>,
 }
 
 /// Request envelope passed from RPC handlers to the [`ArcAiBackend`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ArcAiChatRequest {
     pub model: String,
     pub messages: Vec<ArcAiMessage>,
+    /// Explicit system prompt. If `None`, the backend may extract a
+    /// `role:"system"` message from `messages` (legacy behaviour).
+    pub system: Option<String>,
+    /// Tools advertised to the model. Empty `Vec` = no tools.
+    pub tools: Vec<ArcAiTool>,
+    /// Sampling temperature forwarded to the upstream provider. `None` uses
+    /// provider default.
+    pub temperature: Option<f32>,
+    /// Token budget for the response. `None` falls back to
+    /// `DEFAULT_MAX_TOKENS` in `HttpAiBackend`.
+    pub max_tokens: Option<u32>,
 }
 
 /// One model entry returned by `arc.ai.list_models`.
@@ -98,8 +165,9 @@ pub type ArcAiStream =
 /// implementations to assert event ordering without an external dependency.
 #[async_trait]
 pub trait ArcAiBackend: Send + Sync {
-    /// Non-streaming chat. Returns the assembled assistant content.
-    async fn chat(&self, req: &ArcAiChatRequest) -> Result<String, String>;
+    /// Non-streaming chat. Returns the assembled response with optional text
+    /// content and any tool_use blocks.
+    async fn chat(&self, req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String>;
 
     /// Streaming chat. Returns a boxed stream of events terminating in
     /// `Done` (or `Error` on failure).
@@ -263,6 +331,44 @@ fn parse_messages(params: &Value) -> Result<Vec<ArcAiMessage>, RpcError> {
     Ok(out)
 }
 
+/// Parse a `ChatRequest`-shaped param object into an [`ArcAiChatRequest`].
+/// Required: `model` (non-empty), `messages` (array). Optional: `system`,
+/// `tools`, `temperature`, `max_tokens`.
+fn parse_chat_request(params: &Value) -> Result<ArcAiChatRequest, RpcError> {
+    let model = require_str(params, "model")?.to_string();
+    let messages = parse_messages(params)?;
+
+    let system = params
+        .get("system")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let tools = match params.get("tools") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(v) => serde_json::from_value::<Vec<ArcAiTool>>(v.clone())
+            .map_err(|e| RpcError::invalid_params(format!("invalid 'tools': {e}")))?,
+    };
+
+    let temperature = params
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32);
+
+    let max_tokens = params
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+
+    Ok(ArcAiChatRequest {
+        model,
+        messages,
+        system,
+        tools,
+        temperature,
+        max_tokens,
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // arc.ai.chat
 // ─────────────────────────────────────────────────────────────────────────────
@@ -286,11 +392,10 @@ impl RpcHandler for ArcAiChatHandler {
 
     fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
         Box::pin(async move {
-            let model = require_str(&params, "model")?.to_string();
-            let messages = parse_messages(&params)?;
-            let req = ArcAiChatRequest { model, messages };
+            let req = parse_chat_request(&params)?;
             match self.backend.chat(&req).await {
-                Ok(content) => Ok(json!({"content": content})),
+                Ok(resp) => serde_json::to_value(&resp)
+                    .map_err(|e| RpcError::server_error(format!("serialize response: {e}"))),
                 Err(e) => Err(RpcError::server_error(e)),
             }
         })
@@ -324,12 +429,8 @@ impl RpcHandler for ArcAiStreamChatHandler {
     fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
         Box::pin(async move {
             let session_id = require_str(&params, "session_id")?.to_string();
-            let model = require_str(&params, "model")?.to_string();
-            let messages = parse_messages(&params)?;
-            let req = ArcAiChatRequest {
-                model: model.clone(),
-                messages,
-            };
+            let req = parse_chat_request(&params)?;
+            let model = req.model.clone();
 
             let entry = self.store.get_or_create(&session_id).await;
             let backend = self.backend.clone();
@@ -498,8 +599,8 @@ mod tests {
 
     #[async_trait]
     impl ArcAiBackend for MockBackend {
-        async fn chat(&self, _req: &ArcAiChatRequest) -> Result<String, String> {
-            Ok(self.chat_response.clone())
+        async fn chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String> {
+            Ok(ArcAiChatResponse { content: Some(self.chat_response.clone()), tool_calls: Vec::new() })
         }
 
         async fn stream_chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiStream, String> {
@@ -524,8 +625,8 @@ mod tests {
 
     #[async_trait]
     impl ArcAiBackend for ToolBackend {
-        async fn chat(&self, _req: &ArcAiChatRequest) -> Result<String, String> {
-            Ok("beforeafter".into())
+        async fn chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String> {
+            Ok(ArcAiChatResponse { content: Some("beforeafter".into()), tool_calls: Vec::new() })
         }
         async fn stream_chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiStream, String> {
             let events: Vec<Result<ArcAiStreamEvent, String>> = vec![
@@ -550,7 +651,7 @@ mod tests {
 
     #[async_trait]
     impl ArcAiBackend for FailingBackend {
-        async fn chat(&self, _req: &ArcAiChatRequest) -> Result<String, String> {
+        async fn chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String> {
             Err("upstream offline".into())
         }
 
@@ -802,5 +903,141 @@ mod tests {
         assert!(methods.contains(&"arc.ai.chat"));
         assert!(methods.contains(&"arc.ai.stream_chat"));
         assert!(methods.contains(&"arc.ai.list_models"));
+    }
+
+    #[tokio::test]
+    async fn arc_ai_chat_handler_threads_tools_temperature_max_tokens() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CaptureBackend {
+            seen_tools: std::sync::Arc<std::sync::Mutex<Vec<ArcAiTool>>>,
+            seen_temperature: std::sync::Arc<std::sync::Mutex<Option<f32>>>,
+            seen_max_tokens: std::sync::Arc<std::sync::Mutex<Option<u32>>>,
+            seen_system: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+            called: std::sync::Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl ArcAiBackend for CaptureBackend {
+            async fn chat(&self, req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String> {
+                *self.seen_tools.lock().unwrap() = req.tools.clone();
+                *self.seen_temperature.lock().unwrap() = req.temperature;
+                *self.seen_max_tokens.lock().unwrap() = req.max_tokens;
+                *self.seen_system.lock().unwrap() = req.system.clone();
+                self.called.store(true, Ordering::SeqCst);
+                Ok(ArcAiChatResponse { content: Some("ok".into()), tool_calls: Vec::new() })
+            }
+            async fn stream_chat(&self, _: &ArcAiChatRequest) -> Result<ArcAiStream, String> {
+                unimplemented!()
+            }
+            async fn list_models(&self) -> Vec<ArcAiModel> { vec![] }
+        }
+
+        let seen_tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_temperature = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_max_tokens = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_system = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+
+        let backend: Arc<dyn ArcAiBackend> = Arc::new(CaptureBackend {
+            seen_tools: seen_tools.clone(),
+            seen_temperature: seen_temperature.clone(),
+            seen_max_tokens: seen_max_tokens.clone(),
+            seen_system: seen_system.clone(),
+            called: called.clone(),
+        });
+        let handler = ArcAiChatHandler::new(backend);
+
+        let params = json!({
+            "model": "anthropic:claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": "be brief",
+            "temperature": 0.5,
+            "max_tokens": 256,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "ls",
+                    "description": "list files",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }]
+        });
+
+        let res = handler.handle(params).await.expect("handle ok");
+        assert_eq!(res["content"], "ok");
+        assert!(called.load(Ordering::SeqCst));
+        assert_eq!(seen_temperature.lock().unwrap().unwrap(), 0.5);
+        assert_eq!(seen_max_tokens.lock().unwrap().unwrap(), 256);
+        assert_eq!(seen_system.lock().unwrap().as_deref(), Some("be brief"));
+        let tools = seen_tools.lock().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "ls");
+    }
+
+    #[tokio::test]
+    async fn arc_ai_chat_handler_serializes_tool_calls() {
+        struct ToolCallBackend;
+
+        #[async_trait]
+        impl ArcAiBackend for ToolCallBackend {
+            async fn chat(&self, _req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String> {
+                Ok(ArcAiChatResponse {
+                    content: None,
+                    tool_calls: vec![ArcAiToolCall {
+                        id: "call_1".into(),
+                        kind: "function".into(),
+                        function: ArcAiToolCallFunction {
+                            name: "ls".into(),
+                            arguments: "{\"path\":\".\"}".into(),
+                        },
+                    }],
+                })
+            }
+            async fn stream_chat(&self, _: &ArcAiChatRequest) -> Result<ArcAiStream, String> {
+                unimplemented!()
+            }
+            async fn list_models(&self) -> Vec<ArcAiModel> { vec![] }
+        }
+
+        let handler = ArcAiChatHandler::new(Arc::new(ToolCallBackend));
+        let res = handler.handle(json!({
+            "model": "anthropic:claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "list files"}]
+        })).await.expect("ok");
+
+        assert!(res.get("content").is_none());
+        let calls = res.get("tool_calls").expect("tool_calls").as_array().expect("array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "ls");
+    }
+
+    #[test]
+    fn arc_ai_message_round_trips_tool_call_fields() {
+        let json = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_42",
+                "type": "function",
+                "function": { "name": "ls", "arguments": "{\"path\":\".\"}" }
+            }]
+        });
+        let m: ArcAiMessage = serde_json::from_value(json).expect("parse");
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, None);
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].id, "call_42");
+        assert_eq!(m.tool_calls[0].kind, "function");
+        assert_eq!(m.tool_calls[0].function.name, "ls");
+        assert_eq!(m.tool_calls[0].function.arguments, "{\"path\":\".\"}");
+
+        let tool_msg: ArcAiMessage = serde_json::from_value(serde_json::json!({
+            "role": "tool",
+            "content": "ok",
+            "tool_call_id": "call_42"
+        })).expect("parse tool msg");
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_42"));
     }
 }

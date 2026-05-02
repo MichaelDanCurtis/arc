@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::ai_rpc::{
-    ArcAiBackend, ArcAiChatRequest, ArcAiModel, ArcAiStream, ArcAiStreamEvent,
+    ArcAiBackend, ArcAiChatRequest, ArcAiChatResponse, ArcAiMessage, ArcAiModel, ArcAiStream,
+    ArcAiStreamEvent, ArcAiToolCall, ArcAiToolCallFunction,
 };
 
 const ANTHROPIC_VERSION_HEADER: &str = "2023-06-01";
@@ -89,12 +90,41 @@ struct AnthropicRequest {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<AnthropicTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
 struct AnthropicMessage {
     role: String,
-    content: String,
+    content: AnthropicContent,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(untagged)]
+enum AnthropicContent {
+    Text(String),
+    Blocks(Vec<AnthropicBlock>),
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "type")]
+enum AnthropicBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String, input: Value },
+    #[serde(rename = "tool_result")]
+    ToolResult { tool_use_id: String, content: String },
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: Value,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,11 +144,8 @@ enum AnthropicResponseBlock {
     Text { text: String },
     #[serde(rename = "tool_use")]
     ToolUse {
-        #[allow(dead_code)]
         id: String,
-        #[allow(dead_code)]
         name: String,
-        #[allow(dead_code)]
         input: Value,
     },
 }
@@ -173,37 +200,106 @@ enum AnthropicDelta {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build an Anthropic Messages API request from an `ArcAiChatRequest`.
-/// Extracts the first system message from `req.messages` (if any) into the
-/// top-level `system` field; remaining non-system messages are mapped into
-/// `messages`.
+///
+/// - `system`: prefer `req.system`, else extract first `role:"system"` message.
+/// - `tools`: forward all `req.tools` as Anthropic tool definitions.
+/// - `temperature`: forward as-is (skipped from wire when `None`).
+/// - `max_tokens`: prefer `req.max_tokens`, else `DEFAULT_MAX_TOKENS`.
+/// - Messages with `role:"tool"` become Anthropic `role:"user"` with a
+///   `tool_result` content block. Assistant messages with `tool_calls`
+///   become a blocks array mixing `text` + `tool_use`. Plain messages stay
+///   as `AnthropicContent::Text`.
 fn build_anthropic_request(
     bare_model: &str,
     req: &ArcAiChatRequest,
     stream: bool,
 ) -> AnthropicRequest {
-    let mut system: Option<String> = None;
-    let mut messages: Vec<AnthropicMessage> = Vec::new();
+    let system = req.system.clone().or_else(|| {
+        req.messages
+            .iter()
+            .find(|m| m.role == "system")
+            .and_then(|m| m.content.clone())
+    });
 
-    for m in &req.messages {
-        if m.role == "system" {
-            if system.is_none() {
-                system = m.content.clone();
-            }
-            continue;
-        }
-        messages.push(AnthropicMessage {
-            role: m.role.clone(),
-            content: m.content.clone().unwrap_or_default(),
-        });
-    }
+    let messages = build_anthropic_messages(&req.messages);
+
+    let tools = req
+        .tools
+        .iter()
+        .map(|t| AnthropicTool {
+            name: t.function.name.clone(),
+            description: t.function.description.clone(),
+            input_schema: t.function.parameters.clone(),
+        })
+        .collect();
 
     AnthropicRequest {
         model: bare_model.to_string(),
-        max_tokens: DEFAULT_MAX_TOKENS,
+        max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         messages,
         system,
         stream: stream.then_some(true),
+        tools,
+        temperature: req.temperature,
     }
+}
+
+/// Map OpenAI-compat messages to Anthropic wire format.
+/// - `role:"system"` is skipped (extracted by the caller).
+/// - `role:"tool"` becomes `role:"user"` with a single `tool_result` block.
+/// - `role:"assistant"` with non-empty `tool_calls` becomes a blocks array
+///   (`text` block if content present, then one `tool_use` block per call).
+/// - All other roles pass through with `AnthropicContent::Text`.
+fn build_anthropic_messages(messages: &[ArcAiMessage]) -> Vec<AnthropicMessage> {
+    let mut out = Vec::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => continue, // handled separately
+            "tool" => {
+                let content_text = msg.content.clone().unwrap_or_default();
+                let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
+                out.push(AnthropicMessage {
+                    role: "user".to_string(),
+                    content: AnthropicContent::Blocks(vec![AnthropicBlock::ToolResult {
+                        tool_use_id,
+                        content: content_text,
+                    }]),
+                });
+            }
+            "assistant" if !msg.tool_calls.is_empty() => {
+                let mut blocks: Vec<AnthropicBlock> = Vec::new();
+                if let Some(text) = &msg.content {
+                    if !text.is_empty() {
+                        blocks.push(AnthropicBlock::Text { text: text.clone() });
+                    }
+                }
+                for tc in &msg.tool_calls {
+                    // arguments is an opaque JSON string from the model; fall back to {} rather
+                    // than propagating a parse error that would abort the entire tool roundtrip.
+                    let input: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(Value::Object(Default::default()));
+                    blocks.push(AnthropicBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        input,
+                    });
+                }
+                out.push(AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: AnthropicContent::Blocks(blocks),
+                });
+            }
+            role => {
+                out.push(AnthropicMessage {
+                    role: role.to_string(),
+                    content: AnthropicContent::Text(msg.content.clone().unwrap_or_default()),
+                });
+            }
+        }
+    }
+
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -377,7 +473,7 @@ where
 
 #[async_trait]
 impl ArcAiBackend for HttpAiBackend {
-    async fn chat(&self, req: &ArcAiChatRequest) -> Result<String, String> {
+    async fn chat(&self, req: &ArcAiChatRequest) -> Result<ArcAiChatResponse, String> {
         let (provider, bare_model) = parse_provider(&req.model);
         if provider != "anthropic" {
             return Err(format!("provider '{provider}' is not implemented on this relay"));
@@ -409,13 +505,39 @@ impl ArcAiBackend for HttpAiBackend {
             .await
             .map_err(|e| format!("upstream response parse error: {e}"))?;
 
-        let mut out = String::new();
+        let mut content: Option<String> = None;
+        let mut tool_calls: Vec<ArcAiToolCall> = Vec::new();
+
         for block in parsed.content {
-            if let AnthropicResponseBlock::Text { text } = block {
-                out.push_str(&text);
+            match block {
+                AnthropicResponseBlock::Text { text } => {
+                    content = Some(match content.take() {
+                        Some(prev) => prev + &text,
+                        None => text,
+                    });
+                }
+                AnthropicResponseBlock::ToolUse { id, name, input } => {
+                    let arguments = serde_json::to_string(&input)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    tool_calls.push(ArcAiToolCall {
+                        id,
+                        kind: "function".into(),
+                        function: ArcAiToolCallFunction {
+                            name,
+                            arguments,
+                        },
+                    });
+                }
             }
         }
-        Ok(out)
+
+        // Match legacy /v1/ai/chat: when only tool_use blocks came back,
+        // null out empty content (OpenAI convention).
+        if !tool_calls.is_empty() && content.as_deref().map(str::is_empty).unwrap_or(true) {
+            content = None;
+        }
+
+        Ok(ArcAiChatResponse { content, tool_calls })
     }
 
     async fn stream_chat(&self, req: &ArcAiChatRequest) -> Result<ArcAiStream, String> {
@@ -516,7 +638,9 @@ mod tests {
             messages: vec![ArcAiMessage {
                 role: "user".to_string(),
                 content: Some("hello".to_string()),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let result = backend.chat(&req).await;
         assert!(result.is_err());
@@ -536,7 +660,9 @@ mod tests {
             messages: vec![ArcAiMessage {
                 role: "user".to_string(),
                 content: Some("hello".to_string()),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         let result = backend.chat(&req).await;
         assert!(result.is_err());
@@ -548,44 +674,133 @@ mod tests {
     }
 
     #[test]
-    fn build_anthropic_request_extracts_first_system_message() {
+    fn build_anthropic_request_explicit_system_overrides_messages() {
         let req = ArcAiChatRequest {
-            model: "anthropic:claude-haiku-4-5".to_string(),
+            model: "anthropic:foo".into(),
+            system: Some("explicit".into()),
             messages: vec![
-                ArcAiMessage {
-                    role: "system".to_string(),
-                    content: Some("You are a helpful assistant.".to_string()),
-                },
-                ArcAiMessage {
-                    role: "user".to_string(),
-                    content: Some("What is 2+2?".to_string()),
-                },
+                ArcAiMessage { role: "system".into(), content: Some("ignored".into()), ..Default::default() },
+                ArcAiMessage { role: "user".into(), content: Some("hi".into()), ..Default::default() },
             ],
+            ..Default::default()
         };
-        let built = build_anthropic_request("claude-haiku-4-5", &req, false);
-        assert_eq!(
-            built.system.as_deref(),
-            Some("You are a helpful assistant.")
-        );
-        assert_eq!(built.messages.len(), 1);
-        assert_eq!(built.messages[0].role, "user");
-        assert_eq!(built.messages[0].content, "What is 2+2?");
-        assert!(built.stream.is_none());
+        let body = build_anthropic_request("foo", &req, false);
+        assert_eq!(body.system.as_deref(), Some("explicit"));
+        // System message is filtered out of the messages array
+        assert_eq!(body.messages.len(), 1);
     }
 
     #[test]
-    fn build_anthropic_request_stream_flag() {
+    fn build_anthropic_request_falls_back_to_message_system() {
         let req = ArcAiChatRequest {
-            model: "anthropic:claude-haiku-4-5".to_string(),
-            messages: vec![ArcAiMessage {
-                role: "user".to_string(),
-                content: Some("ping".to_string()),
-            }],
+            model: "anthropic:foo".into(),
+            messages: vec![
+                ArcAiMessage { role: "system".into(), content: Some("from-msg".into()), ..Default::default() },
+                ArcAiMessage { role: "user".into(), content: Some("hi".into()), ..Default::default() },
+            ],
+            ..Default::default()
         };
-        let built_no_stream = build_anthropic_request("claude-haiku-4-5", &req, false);
-        assert!(built_no_stream.stream.is_none());
+        let body = build_anthropic_request("foo", &req, false);
+        assert_eq!(body.system.as_deref(), Some("from-msg"));
+    }
 
-        let built_stream = build_anthropic_request("claude-haiku-4-5", &req, true);
-        assert_eq!(built_stream.stream, Some(true));
+    #[test]
+    fn build_anthropic_request_stream_flag_respected() {
+        let req = ArcAiChatRequest::default();
+        assert_eq!(build_anthropic_request("foo", &req, false).stream, None);
+        assert_eq!(build_anthropic_request("foo", &req, true).stream, Some(true));
+    }
+
+    #[test]
+    fn build_anthropic_request_honors_temperature_max_tokens() {
+        let req = ArcAiChatRequest {
+            model: "anthropic:foo".into(),
+            temperature: Some(0.7),
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+        let body = build_anthropic_request("foo", &req, false);
+        assert_eq!(body.temperature, Some(0.7));
+        assert_eq!(body.max_tokens, 2048);
+    }
+
+    #[test]
+    fn build_anthropic_request_default_max_tokens() {
+        let body = build_anthropic_request("foo", &ArcAiChatRequest::default(), false);
+        assert_eq!(body.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(body.temperature, None);
+    }
+
+    #[test]
+    fn build_anthropic_request_forwards_tools() {
+        use crate::ai_rpc::{ArcAiTool, ArcAiToolFunction};
+        let req = ArcAiChatRequest {
+            model: "anthropic:foo".into(),
+            tools: vec![ArcAiTool {
+                kind: "function".into(),
+                function: ArcAiToolFunction {
+                    name: "ls".into(),
+                    description: "list".into(),
+                    parameters: json!({"type": "object"}),
+                },
+            }],
+            ..Default::default()
+        };
+        let body = build_anthropic_request("foo", &req, false);
+        assert_eq!(body.tools.len(), 1);
+        assert_eq!(body.tools[0].name, "ls");
+        assert_eq!(body.tools[0].input_schema, json!({"type": "object"}));
+    }
+
+    #[test]
+    fn build_anthropic_messages_maps_tool_role_to_user_tool_result() {
+        use crate::ai_rpc::ArcAiMessage;
+        let msgs = vec![
+            ArcAiMessage { role: "user".into(), content: Some("call ls".into()), ..Default::default() },
+            ArcAiMessage {
+                role: "tool".into(),
+                content: Some("file1\nfile2".into()),
+                tool_call_id: Some("call_42".into()),
+                ..Default::default()
+            },
+        ];
+        let out = build_anthropic_messages(&msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "user");
+        assert_eq!(out[1].role, "user");
+        let blob = serde_json::to_value(&out[1]).unwrap();
+        assert_eq!(blob["content"][0]["type"], "tool_result");
+        assert_eq!(blob["content"][0]["tool_use_id"], "call_42");
+        assert_eq!(blob["content"][0]["content"], "file1\nfile2");
+    }
+
+    #[test]
+    fn build_anthropic_messages_preserves_assistant_tool_calls() {
+        use crate::ai_rpc::{ArcAiMessage, ArcAiToolCall, ArcAiToolCallFunction};
+        let msgs = vec![ArcAiMessage {
+            role: "assistant".into(),
+            content: Some("let me check".into()),
+            tool_calls: vec![ArcAiToolCall {
+                id: "call_42".into(),
+                kind: "function".into(),
+                function: ArcAiToolCallFunction {
+                    name: "ls".into(),
+                    arguments: "{\"path\":\".\"}".into(),
+                },
+            }],
+            ..Default::default()
+        }];
+        let out = build_anthropic_messages(&msgs);
+        assert_eq!(out.len(), 1);
+        let blob = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(blob["role"], "assistant");
+        let blocks = blob["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "let me check");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "call_42");
+        assert_eq!(blocks[1]["name"], "ls");
+        assert_eq!(blocks[1]["input"], json!({"path": "."}));
     }
 }

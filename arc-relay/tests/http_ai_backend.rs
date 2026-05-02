@@ -94,6 +94,7 @@ fn user_msg(text: &str) -> ArcAiMessage {
     ArcAiMessage {
         role: "user".to_string(),
         content: Some(text.to_string()),
+        ..Default::default()
     }
 }
 
@@ -119,9 +120,11 @@ async fn chat_returns_concatenated_text_blocks() {
     let req = ArcAiChatRequest {
         model: "anthropic:claude-haiku-4-5".to_string(),
         messages: vec![user_msg("hi")],
+        ..Default::default()
     };
     let out = backend.chat(&req).await.expect("chat ok");
-    assert_eq!(out, "hello world");
+    assert_eq!(out.content.as_deref(), Some("hello world"));
+    assert!(out.tool_calls.is_empty());
     assert_eq!(state.received.load(Ordering::SeqCst), 1);
     assert_eq!(
         state.last_x_api_key.lock().await.as_deref(),
@@ -152,6 +155,7 @@ async fn chat_returns_err_on_upstream_5xx() {
     let req = ArcAiChatRequest {
         model: "anthropic:claude-haiku-4-5".to_string(),
         messages: vec![user_msg("hi")],
+        ..Default::default()
     };
     let err = backend.chat(&req).await.expect_err("chat should fail");
     assert!(err.contains("502"), "got: {err}");
@@ -180,6 +184,7 @@ async fn stream_chat_emits_text_then_done() {
     let req = ArcAiChatRequest {
         model: "anthropic:claude-haiku-4-5".to_string(),
         messages: vec![user_msg("hi")],
+        ..Default::default()
     };
     let mut s = backend.stream_chat(&req).await.expect("stream ok");
 
@@ -229,6 +234,7 @@ async fn stream_chat_emits_tool_use_with_accumulated_arguments() {
     let req = ArcAiChatRequest {
         model: "anthropic:claude-haiku-4-5".to_string(),
         messages: vec![user_msg("call it")],
+        ..Default::default()
     };
     let mut s = backend.stream_chat(&req).await.expect("stream ok");
 
@@ -270,6 +276,7 @@ async fn stream_chat_propagates_inband_error_then_done() {
     let req = ArcAiChatRequest {
         model: "anthropic:claude-haiku-4-5".to_string(),
         messages: vec![user_msg("hi")],
+        ..Default::default()
     };
     let mut s = backend.stream_chat(&req).await.expect("stream ok");
 
@@ -283,5 +290,160 @@ async fn stream_chat_propagates_inband_error_then_done() {
     assert!(matches!(second, ArcAiStreamEvent::Done));
 
     assert!(s.next().await.is_none(), "stream should end after Done");
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[tokio::test]
+async fn chat_request_body_includes_system_tools_temperature() {
+    use arc_relay::ai_rpc::{ArcAiTool, ArcAiToolFunction};
+
+    let _lock = ENV_LOCK.lock().await;
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+    let state = Arc::new(FakeServerState::default());
+    state.pending.lock().await.push(FakeResponse::JsonOk(json!({
+        "content": [{"type": "text", "text": "ok"}]
+    })));
+
+    let addr = spawn_fake_server(state.clone()).await;
+    let backend = HttpAiBackend::with_base_url(format!("http://{addr}"));
+
+    let req = ArcAiChatRequest {
+        model: "anthropic:claude-haiku-4-5".into(),
+        messages: vec![ArcAiMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            ..Default::default()
+        }],
+        system: Some("be brief".into()),
+        temperature: Some(0.5),
+        max_tokens: Some(256),
+        tools: vec![ArcAiTool {
+            kind: "function".into(),
+            function: ArcAiToolFunction {
+                name: "ls".into(),
+                description: "list".into(),
+                parameters: json!({"type": "object"}),
+            },
+        }],
+    };
+
+    let _ = backend.chat(&req).await.expect("ok");
+
+    let body = state.last_body.lock().await.clone().expect("body recorded");
+    assert_eq!(body["model"], "claude-haiku-4-5");
+    assert_eq!(body["system"], "be brief");
+    assert_eq!(body["temperature"], 0.5);
+    assert_eq!(body["max_tokens"], 256);
+    assert_eq!(body["tools"][0]["name"], "ls");
+    assert_eq!(body["tools"][0]["input_schema"], json!({"type": "object"}));
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[tokio::test]
+async fn chat_returns_tool_calls_when_response_has_tool_use_blocks() {
+    let _lock = ENV_LOCK.lock().await;
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+    let state = Arc::new(FakeServerState::default());
+    state.pending.lock().await.push(FakeResponse::JsonOk(json!({
+        "content": [
+            {"type": "text", "text": "let me check"},
+            {"type": "tool_use", "id": "call_1", "name": "ls", "input": {"path": "."}}
+        ]
+    })));
+
+    let addr = spawn_fake_server(state.clone()).await;
+    let backend = HttpAiBackend::with_base_url(format!("http://{addr}"));
+
+    let req = ArcAiChatRequest {
+        model: "anthropic:claude-haiku-4-5".into(),
+        messages: vec![ArcAiMessage {
+            role: "user".into(),
+            content: Some("list files".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let resp = backend.chat(&req).await.expect("ok");
+
+    assert_eq!(resp.content.as_deref(), Some("let me check"));
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(resp.tool_calls[0].id, "call_1");
+    assert_eq!(resp.tool_calls[0].function.name, "ls");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&resp.tool_calls[0].function.arguments).unwrap();
+    assert_eq!(parsed, json!({"path": "."}));
+    std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+#[tokio::test]
+async fn chat_request_body_encodes_tool_roundtrip() {
+    use arc_relay::ai_rpc::{ArcAiToolCall, ArcAiToolCallFunction};
+
+    let _lock = ENV_LOCK.lock().await;
+    std::env::set_var("ANTHROPIC_API_KEY", "test-key");
+
+    let state = Arc::new(FakeServerState::default());
+    state.pending.lock().await.push(FakeResponse::JsonOk(json!({
+        "content": [{"type": "text", "text": "done"}]
+    })));
+
+    let addr = spawn_fake_server(state.clone()).await;
+    let backend = HttpAiBackend::with_base_url(format!("http://{addr}"));
+
+    let req = ArcAiChatRequest {
+        model: "anthropic:claude-haiku-4-5".into(),
+        messages: vec![
+            ArcAiMessage {
+                role: "user".into(),
+                content: Some("list files".into()),
+                ..Default::default()
+            },
+            ArcAiMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: vec![ArcAiToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: ArcAiToolCallFunction {
+                        name: "ls".into(),
+                        arguments: "{\"path\":\".\"}".into(),
+                    },
+                }],
+                ..Default::default()
+            },
+            ArcAiMessage {
+                role: "tool".into(),
+                content: Some("a.txt\nb.txt".into()),
+                tool_call_id: Some("call_1".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let _ = backend.chat(&req).await.expect("ok");
+
+    let body = state.last_body.lock().await.clone().expect("body recorded");
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 3);
+    // 1: user/text
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "list files");
+    // 2: assistant/blocks containing tool_use
+    assert_eq!(messages[1]["role"], "assistant");
+    let blocks = messages[1]["content"].as_array().expect("blocks");
+    assert_eq!(blocks[0]["type"], "tool_use");
+    assert_eq!(blocks[0]["id"], "call_1");
+    assert_eq!(blocks[0]["name"], "ls");
+    assert_eq!(blocks[0]["input"], json!({"path": "."}));
+    // 3: user/blocks containing tool_result
+    assert_eq!(messages[2]["role"], "user");
+    let result_blocks = messages[2]["content"].as_array().expect("blocks");
+    assert_eq!(result_blocks[0]["type"], "tool_result");
+    assert_eq!(result_blocks[0]["tool_use_id"], "call_1");
+    assert_eq!(result_blocks[0]["content"], "a.txt\nb.txt");
     std::env::remove_var("ANTHROPIC_API_KEY");
 }

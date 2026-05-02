@@ -172,13 +172,19 @@ flag flip + msgpack-path removal is a separate cleanup slice.
 
 `arc-relay/src/ai_backend.rs::HttpAiBackend` now drives `arc.ai.{chat,stream_chat,list_models}` against the Anthropic Messages API. Wired into `AppState.arc_ai_backend` in `arc-relay/src/main.rs`. Reads `ANTHROPIC_API_KEY` from env at each call (matches legacy `/v1/ai/*` semantics). Provider prefix `anthropic:` strips before forwarding `model` to upstream. Other prefixes return `Err`.
 
-**Out of scope for this slice (gaps with `/v1/ai/chat`):**
-- `tools` / function calling — `ArcAiChatRequest` has no `tools` field
-- explicit `temperature` / `max_tokens` — hardcoded `max_tokens=1024`
+**Out of scope (gaps with `/v1/ai/chat`):**
+- ~~`tools` / function calling~~ — DONE in `feat/arc-ai-request-expansion`
+- ~~explicit `temperature` / `max_tokens`~~ — DONE in `feat/arc-ai-request-expansion`
 - providers other than Anthropic
 
-These can be addressed by extending `ArcAiChatRequest` (rpc layer) and the
-backend's `build_anthropic_request`.
+### `arc.ai.*` request expansion — DONE (feat/arc-ai-request-expansion)
+
+`ArcAiChatRequest` now carries `system`, `tools`, `temperature`, `max_tokens`. `ArcAiMessage` carries `tool_call_id` + `tool_calls[]` for full tool roundtrip. `ArcAiBackend::chat` returns `ArcAiChatResponse { content?, tool_calls[] }` so non-streaming callers can read tool_use blocks. `HttpAiBackend::build_anthropic_request` honors all new fields and emits Anthropic's `tool_use` / `tool_result` content-block format.
+
+Wire shape on `arc.ai.chat` response: `{content?: string, tool_calls?: [{id, type, function:{name, arguments}}]}`. Empty `content` + populated `tool_calls` matches OpenAI convention.
+
+Still out of scope:
+- providers other than Anthropic
 
 ---
 
