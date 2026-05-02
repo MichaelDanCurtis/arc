@@ -258,3 +258,18 @@ excludes plugin-host gRPC from the unification scope.
 
 Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until
 the full boundary is cut over, then the flag can be removed.
+
+---
+
+## beacon-net JSON-RPC client — DONE (2026-05-02)
+
+Added `beacon-net::jsonrpc::JsonRpcWsClient` shipping on `feat/beacon-net-jsonrpc-client`.
+
+- Connects to arc-relay's `/ws` with `Sec-WebSocket-Protocol: arc.json-rpc`.
+- Async `request(method, params) -> Value` API with per-request id (`Id::Num`) + oneshot demux.
+- `notifications() -> broadcast::Receiver<Notification>` for server-pushed events.
+- Subprotocol negotiation enforced (errors out if server didn't accept `arc.json-rpc`).
+- Existing msgpack `ArcConnection` left untouched — callers migrate in a follow-up slice.
+
+3 integration tests against fake axum WS server cover request round-trip,
+notification fan-out, and RPC error surfacing.
