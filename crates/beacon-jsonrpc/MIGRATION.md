@@ -214,6 +214,27 @@ current write-control holder; they emit `arc.host.input` and
 `arc.host.resize_request` notifications respectively. The host-side dispatch
 that consumes these notifications lands in Phase D.
 
+### Arc surface — Phase B (feat/arc-jsonrpc-phase-b)
+
+Watcher-side block-stream + replay surface added (additive; msgpack pump unchanged).
+
+**Methods:** none (notification-only phase).
+
+**Notifications (6):**
+
+| Notification                | Params                                                                                                         | Direction      |
+|-----------------------------|----------------------------------------------------------------------------------------------------------------|----------------|
+| `arc.mirror.block_start`    | `{session_id, header: <BlockHeader-json>}`                                                                     | relay→watcher  |
+| `arc.mirror.block_chunk`    | `{session_id, block_id, seq: u64, data: <base64>}`                                                             | relay→watcher  |
+| `arc.mirror.block_end`      | `{session_id, footer: <BlockFooter-json>}`                                                                     | relay→watcher  |
+| `arc.mirror.replay_begin`   | `{session_id, total_blocks: u32}`                                                                              | relay→watcher  |
+| `arc.mirror.replay_block`   | `{session_id, header: <BlockHeader-json>, output: <base64>, footer: <BlockFooter-json \| null>}`               | relay→watcher  |
+| `arc.mirror.replay_end`     | `{session_id}`                                                                                                 | relay→watcher  |
+
+`<BlockHeader-json>` and `<BlockFooter-json>` are direct `serde_json::to_value(&BlockHeader)` / `serde_json::to_value(&BlockFooter)` — see `beacon-model::{BlockHeader, BlockFooter}`. Wire keys are pinned by lock tests in `arc-relay/src/rpc.rs::tests::block_header_json_shape_locked` / `block_footer_json_shape_locked`. `replay_block` flattens `Block` so `output` lands as a base64 string at top level (matches the `arc.mirror.frame` byte-payload convention).
+
+The host-side producers that fire these notifications (mapping `BlockEvent` from `beacon-blocks::BlockDetector` into the rpc emitters) land in Phase D.
+
 ---
 
 ## 3. beacon-remote  (SSH transport)

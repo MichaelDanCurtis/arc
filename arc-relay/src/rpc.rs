@@ -45,6 +45,12 @@
 //! arc.host.input                 {"session_id":"<ulid>","data":"<base64>"}                                            relay→host (Phase D consumer)
 //! arc.host.resize_request        {"session_id":"<ulid>","cols":<u32>,"rows":<u32>}                                    relay→host (Phase D consumer)
 //! arc.mirror.discontinuity       {"session_id":"<ulid>","last_seq":<u64>}                                             relay→watcher (gap signal)
+//! arc.mirror.block_start          {"session_id":"<ulid>","header":<BlockHeader-json>}                                  relay→watcher
+//! arc.mirror.block_chunk          {"session_id":"<ulid>","block_id":"<ulid>","seq":<u64>,"data":"<base64>"}             relay→watcher
+//! arc.mirror.block_end            {"session_id":"<ulid>","footer":<BlockFooter-json>}                                  relay→watcher
+//! arc.mirror.replay_begin         {"session_id":"<ulid>","total_blocks":<u32>}                                          relay→watcher
+//! arc.mirror.replay_block         {"session_id":"<ulid>","header":<BlockHeader-json>,"output":"<base64>","footer":<BlockFooter-json|null>}  relay→watcher
+//! arc.mirror.replay_end           {"session_id":"<ulid>"}                                                                relay→watcher
 //! ```
 //!
 //! `participant` fires on both attach (`joined:true`) and detach (`joined:false`).
@@ -205,6 +211,123 @@ pub fn emit_mirror_discontinuity(entry: &ArcSessionEntry, last_seq: u64) {
         json!({
             "session_id": entry.session_id,
             "last_seq": last_seq,
+        }),
+    );
+}
+
+/// Emit `arc.mirror.block_start` — relay→watcher when a new command block
+/// begins. Carries the full `BlockHeader` envelope (id, command, cwd, env,
+/// host_info, etc.) per the spec-locked wire shape from Task 1.
+///
+/// Direction: relay→watcher. Pairs with the existing msgpack
+/// `ArcToClient::BlockStart` envelope; future cut-over slices will fan
+/// `BlockEvent::Started` from `beacon-blocks::BlockDetector` into this
+/// emit fn instead of msgpack.
+pub fn emit_mirror_block_start(entry: &ArcSessionEntry, header: &beacon_model::BlockHeader) {
+    let header_value = serde_json::to_value(header).unwrap_or(Value::Null);
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.block_start",
+        json!({
+            "session_id": entry.session_id,
+            "header": header_value,
+        }),
+    );
+}
+
+/// Emit `arc.mirror.block_chunk` — relay→watcher carrying one base64-encoded
+/// chunk of block output bytes, tagged with `seq` for gap-detection. The
+/// `block_id` ties it to the parent `arc.mirror.block_start`.
+///
+/// Direction: relay→watcher. Pairs with msgpack `ArcToClient::BlockOutputChunk`.
+pub fn emit_mirror_block_chunk(
+    entry: &ArcSessionEntry,
+    block_id: &beacon_model::BlockId,
+    seq: u64,
+    data: &[u8],
+) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.block_chunk",
+        json!({
+            "session_id": entry.session_id,
+            "block_id": block_id.to_string(),
+            "seq": seq,
+            "data": BASE64.encode(data),
+        }),
+    );
+}
+
+/// Emit `arc.mirror.block_end` — relay→watcher when a command block finishes.
+/// Carries the full `BlockFooter` envelope (id, exit_code, ended_at,
+/// shadow_git_ref). `exit_code: null` indicates signal termination.
+///
+/// Direction: relay→watcher. Pairs with msgpack `ArcToClient::BlockEnd`.
+pub fn emit_mirror_block_end(entry: &ArcSessionEntry, footer: &beacon_model::BlockFooter) {
+    let footer_value = serde_json::to_value(footer).unwrap_or(Value::Null);
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.block_end",
+        json!({
+            "session_id": entry.session_id,
+            "footer": footer_value,
+        }),
+    );
+}
+
+/// Emit `arc.mirror.replay_begin` — relay→watcher signalling the start of a
+/// scrollback replay. `total_blocks` is the count of historical blocks the
+/// watcher should expect via `arc.mirror.replay_block` before
+/// `arc.mirror.replay_end`.
+///
+/// Direction: relay→watcher. Pairs with msgpack `ArcToClient::ReplayBegin`.
+pub fn emit_mirror_replay_begin(entry: &ArcSessionEntry, total_blocks: u32) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.replay_begin",
+        json!({
+            "session_id": entry.session_id,
+            "total_blocks": total_blocks,
+        }),
+    );
+}
+
+/// Emit `arc.mirror.replay_block` — relay→watcher carrying one historical
+/// block during scrollback replay. The `Block` is flattened: `header` and
+/// `footer` are JSON objects (footer is `null` for a still-running block);
+/// `output` is base64-encoded raw bytes per the `arc.mirror.frame` precedent.
+///
+/// Direction: relay→watcher. Pairs with msgpack `ArcToClient::ReplayBlock`.
+pub fn emit_mirror_replay_block(entry: &ArcSessionEntry, block: &beacon_model::Block) {
+    let header_value = serde_json::to_value(&block.header).unwrap_or(Value::Null);
+    let footer_value = block
+        .footer
+        .as_ref()
+        .map(|f| serde_json::to_value(f).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.replay_block",
+        json!({
+            "session_id": entry.session_id,
+            "header": header_value,
+            "output": BASE64.encode(&block.output),
+            "footer": footer_value,
+        }),
+    );
+}
+
+/// Emit `arc.mirror.replay_end` — relay→watcher signalling that scrollback
+/// replay has finished and subsequent `arc.mirror.frame` /
+/// `arc.mirror.block_*` notifications are live.
+///
+/// Direction: relay→watcher. Pairs with msgpack `ArcToClient::ReplayEnd`.
+pub fn emit_mirror_replay_end(entry: &ArcSessionEntry) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.replay_end",
+        json!({
+            "session_id": entry.session_id,
         }),
     );
 }
@@ -1391,5 +1514,313 @@ mod tests {
         assert_eq!(v["method"], "arc.session.revoked");
         assert_eq!(v["params"]["session_id"], "s9");
         assert_eq!(v["params"]["reason"], "kicked_by_owner");
+    }
+
+    #[test]
+    fn block_header_json_shape_locked() {
+        use beacon_model::{BlockHeader, BlockId, HostInfo, SessionId, TabId};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let h = BlockHeader {
+            id: BlockId::new(),
+            session_id: SessionId::new(),
+            tab_id: TabId::new(),
+            command: "echo hi".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            started_at: SystemTime::UNIX_EPOCH,
+            env_snapshot: HashMap::new(),
+            host_info: HostInfo::current(),
+        };
+        let v = serde_json::to_value(&h).expect("header serializes");
+        let obj = v.as_object().expect("header is JSON object");
+
+        // These keys are part of the locked wire format. Add a key to BlockHeader
+        // → this test fails → bump Phase E/F consumers explicitly.
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "command", "cwd", "env_snapshot", "host_info",
+                "id", "session_id", "started_at", "tab_id",
+            ],
+            "BlockHeader wire keys drifted; sync MIGRATION.md Phase B + arc-web/Mac decoders",
+        );
+
+        // ULIDs serialize as strings (transparent newtype).
+        assert!(obj["id"].is_string(), "BlockId must be transparent ULID string");
+        assert!(obj["session_id"].is_string());
+        assert!(obj["tab_id"].is_string());
+
+        // Round-trip preserves the value.
+        let back: BlockHeader = serde_json::from_value(v).expect("header round-trip");
+        assert_eq!(h, back);
+    }
+
+    #[test]
+    fn block_footer_json_shape_locked() {
+        use beacon_model::{BlockFooter, BlockId};
+        use std::time::SystemTime;
+
+        let f = BlockFooter {
+            id: BlockId::new(),
+            exit_code: Some(0),
+            ended_at: SystemTime::UNIX_EPOCH,
+            shadow_git_ref: None,
+        };
+        let v = serde_json::to_value(&f).expect("footer serializes");
+        let obj = v.as_object().expect("footer is JSON object");
+
+        let mut keys: Vec<&String> = obj.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["ended_at", "exit_code", "id", "shadow_git_ref"],
+            "BlockFooter wire keys drifted; sync MIGRATION.md Phase B + arc-web/Mac decoders",
+        );
+
+        let back: BlockFooter = serde_json::from_value(v).expect("footer round-trip");
+        assert_eq!(f, back);
+    }
+
+    #[test]
+    fn block_footer_signal_kill_serializes_null_exit_code() {
+        use beacon_model::{BlockFooter, BlockId};
+        use std::time::SystemTime;
+
+        let f = BlockFooter {
+            id: BlockId::new(),
+            exit_code: None,
+            ended_at: SystemTime::UNIX_EPOCH,
+            shadow_git_ref: None,
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        assert!(v["exit_code"].is_null(), "exit_code:None must serialize as null, got {v}");
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_block_start_round_trip() {
+        use beacon_model::{BlockHeader, BlockId, HostInfo, SessionId, TabId};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-blk").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let header = BlockHeader {
+            id: BlockId::new(),
+            session_id: SessionId::new(),
+            tab_id: TabId::new(),
+            command: "ls -la".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            started_at: SystemTime::UNIX_EPOCH,
+            env_snapshot: HashMap::new(),
+            host_info: HostInfo::current(),
+        };
+
+        emit_mirror_block_start(&entry, &header);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.block_start");
+        assert_eq!(v["params"]["session_id"], "s-blk");
+        let header_back: BlockHeader =
+            serde_json::from_value(v["params"]["header"].clone()).unwrap();
+        assert_eq!(header_back, header);
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_block_chunk_round_trip() {
+        use beacon_model::BlockId;
+
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-blk").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let block_id = BlockId::new();
+        let payload = b"hello\x1b[0mworld";
+        emit_mirror_block_chunk(&entry, &block_id, 7, payload);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.block_chunk");
+        assert_eq!(v["params"]["session_id"], "s-blk");
+        assert_eq!(v["params"]["block_id"], block_id.to_string());
+        assert_eq!(v["params"]["seq"], 7);
+        let b64 = v["params"]["data"].as_str().unwrap();
+        assert_eq!(BASE64.decode(b64).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_block_end_round_trip() {
+        use beacon_model::{BlockFooter, BlockId};
+        use std::time::SystemTime;
+
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-blk").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let footer = BlockFooter {
+            id: BlockId::new(),
+            exit_code: Some(0),
+            ended_at: SystemTime::UNIX_EPOCH,
+            shadow_git_ref: None,
+        };
+        emit_mirror_block_end(&entry, &footer);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.block_end");
+        assert_eq!(v["params"]["session_id"], "s-blk");
+        let footer_back: BlockFooter =
+            serde_json::from_value(v["params"]["footer"].clone()).unwrap();
+        assert_eq!(footer_back, footer);
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_block_end_signal_kill_round_trip() {
+        use beacon_model::{BlockFooter, BlockId};
+        use std::time::SystemTime;
+
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-blk").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let footer = BlockFooter {
+            id: BlockId::new(),
+            exit_code: None, // signal kill
+            ended_at: SystemTime::UNIX_EPOCH,
+            shadow_git_ref: None,
+        };
+        emit_mirror_block_end(&entry, &footer);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert!(v["params"]["footer"]["exit_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_replay_begin_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-rpl").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_mirror_replay_begin(&entry, 42);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.replay_begin");
+        assert_eq!(v["params"]["session_id"], "s-rpl");
+        assert_eq!(v["params"]["total_blocks"], 42);
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_replay_block_round_trip() {
+        use beacon_model::{Block, BlockFooter, BlockHeader, BlockId, HostInfo, SessionId, TabId};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-rpl").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let header = BlockHeader {
+            id: BlockId::new(),
+            session_id: SessionId::new(),
+            tab_id: TabId::new(),
+            command: "echo replayed".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            started_at: SystemTime::UNIX_EPOCH,
+            env_snapshot: HashMap::new(),
+            host_info: HostInfo::current(),
+        };
+        let footer = BlockFooter {
+            id: header.id,
+            exit_code: Some(0),
+            ended_at: SystemTime::UNIX_EPOCH,
+            shadow_git_ref: None,
+        };
+        let block = Block {
+            header: header.clone(),
+            output: b"replayed\n".to_vec(),
+            footer: Some(footer.clone()),
+        };
+
+        emit_mirror_replay_block(&entry, &block);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.replay_block");
+        assert_eq!(v["params"]["session_id"], "s-rpl");
+
+        let header_back: BlockHeader =
+            serde_json::from_value(v["params"]["header"].clone()).unwrap();
+        assert_eq!(header_back, header);
+
+        let output_b64 = v["params"]["output"].as_str().unwrap();
+        assert_eq!(BASE64.decode(output_b64).unwrap(), b"replayed\n");
+
+        let footer_back: BlockFooter =
+            serde_json::from_value(v["params"]["footer"].clone()).unwrap();
+        assert_eq!(footer_back, footer);
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_replay_block_running_block_serializes_null_footer() {
+        use beacon_model::{Block, BlockHeader, BlockId, HostInfo, SessionId, TabId};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-rpl").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let block = Block {
+            header: BlockHeader {
+                id: BlockId::new(),
+                session_id: SessionId::new(),
+                tab_id: TabId::new(),
+                command: "tail -f /var/log/x".to_string(),
+                cwd: PathBuf::from("/tmp"),
+                started_at: SystemTime::UNIX_EPOCH,
+                env_snapshot: HashMap::new(),
+                host_info: HostInfo::current(),
+            },
+            output: Vec::new(),
+            footer: None, // still running
+        };
+        emit_mirror_replay_block(&entry, &block);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert!(v["params"]["footer"].is_null());
+        assert_eq!(v["params"]["output"], "");
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_replay_end_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-rpl").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_mirror_replay_end(&entry);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.replay_end");
+        assert_eq!(v["params"]["session_id"], "s-rpl");
+        // No other fields — only session_id.
+        assert_eq!(
+            v["params"].as_object().unwrap().len(),
+            1,
+            "replay_end params should be just session_id, got {}",
+            v["params"]
+        );
     }
 }
