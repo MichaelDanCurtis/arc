@@ -109,7 +109,14 @@ async fn handle_subscribe_side_effects(
 
     let want_session = matches!(
         method,
-        "arc.session.attach" | "arc.session.control" | "arc.session.release"
+        "arc.session.attach"
+            | "arc.session.detach"
+            | "arc.session.subscribe"
+            | "arc.session.unsubscribe"
+            | "arc.session.control"
+            | "arc.session.release"
+            | "arc.session.input"
+            | "arc.session.resize"
     );
     if want_session && session_subs.insert(session_id.to_string()) {
         let _ = state.arc_session_store.get_or_create(session_id).await;

@@ -186,6 +186,34 @@ Wire shape on `arc.ai.chat` response: `{content?: string, tool_calls?: [{id, typ
 Still out of scope:
 - providers other than Anthropic
 
+### Arc surface — Phase A (feat/arc-jsonrpc-phase-a)
+
+Watcher-side session-control surface added (additive; msgpack pump unchanged).
+
+**Methods (5):** `arc.session.{detach,subscribe,unsubscribe,input,resize}`
+
+| Method                    | Params                                                          | Result        |
+|---------------------------|-----------------------------------------------------------------|---------------|
+| `arc.session.detach`      | `{session_id, token}`                                           | `{ok: true}`  |
+| `arc.session.subscribe`   | `{session_id, token}`                                           | `{ok: true}`  |
+| `arc.session.unsubscribe` | `{session_id, token}`                                           | `{ok: true}`  |
+| `arc.session.input`       | `{session_id, requester_id, data: <base64>}`                    | `{ok: true}`  |
+| `arc.session.resize`      | `{session_id, requester_id, cols: u32, rows: u32}`              | `{ok: true}`  |
+
+**Notifications (4):**
+
+| Notification                         | Params                                                  | Direction       |
+|--------------------------------------|---------------------------------------------------------|-----------------|
+| `arc.session.control_requested`      | `{session_id, request_id, from_user, from_device}`      | relay→holder    |
+| `arc.session.gone`                   | `{session_id, reason}`                                  | relay→watchers  |
+| `arc.session.revoked`                | `{session_id, reason}`                                  | relay→watcher   |
+| `arc.mirror.discontinuity`           | `{session_id, last_seq}`                                | relay→watchers  |
+
+`arc.session.input` and `arc.session.resize` are gated on the caller being the
+current write-control holder; they emit `arc.host.input` and
+`arc.host.resize_request` notifications respectively. The host-side dispatch
+that consumes these notifications lands in Phase D.
+
 ---
 
 ## 3. beacon-remote  (SSH transport)

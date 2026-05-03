@@ -3,9 +3,14 @@
 //! Implements the first sub-slice of the Arc WS jsonrpc cut-over per
 //! `beacon-jsonrpc/MIGRATION.md` section 2:
 //!
-//! - `arc.session.attach`  — join mirrored session
-//! - `arc.session.control` — claim write control
-//! - `arc.session.release` — release write control
+//! - `arc.session.attach`     — join mirrored session
+//! - `arc.session.detach`     — leave mirrored session
+//! - `arc.session.subscribe`  — read-only mirror handshake
+//! - `arc.session.unsubscribe` — leave mirror handshake
+//! - `arc.session.control`    — claim write control
+//! - `arc.session.release`    — release write control
+//! - `arc.session.input`      — driver-only PTY write
+//! - `arc.session.resize`     — driver-only PTY resize
 //! - `arc.session.participant` notification (relay → all)
 //!
 //! These handlers live alongside the existing msgpack `ClientToArc` /
@@ -20,19 +25,29 @@
 //! # Wire format — methods
 //!
 //! ```text
-//! arc.session.attach   {"session_id":"<ulid>","token":"<jwt>"}      → {"ok":true}
-//! arc.session.control  {"session_id":"<ulid>","requester_id":"..."} → {"ok":true}
-//! arc.session.release  {"session_id":"<ulid>"}                      → {"ok":true}
+//! arc.session.attach       {"session_id":"<ulid>","token":"<jwt>"}                                    → {"ok":true}
+//! arc.session.detach       {"session_id":"<ulid>","token":"<jwt>"}                                    → {"ok":true}
+//! arc.session.subscribe    {"session_id":"<ulid>","token":"<jwt>"}                                    → {"ok":true}
+//! arc.session.unsubscribe  {"session_id":"<ulid>","token":"<jwt>"}                                    → {"ok":true}
+//! arc.session.control      {"session_id":"<ulid>","requester_id":"..."}                               → {"ok":true}
+//! arc.session.release      {"session_id":"<ulid>"}                                                    → {"ok":true}
+//! arc.session.input        {"session_id":"<ulid>","requester_id":"...","data":"<base64>"}             → {"ok":true}
+//! arc.session.resize       {"session_id":"<ulid>","requester_id":"...","cols":<u32>,"rows":<u32>}     → {"ok":true}
 //! ```
 //!
 //! # Wire format — notifications
 //!
 //! ```text
-//! arc.session.participant {"session_id":"<ulid>","user_id":"...","joined":true}
+//! arc.session.participant         {"session_id":"<ulid>","user_id":"...","joined":bool}                               relay→all
+//! arc.session.control_requested  {"session_id":"<ulid>","request_id":"...","from_user":"...","from_device":"..."}    relay→holder (Phase C)
+//! arc.session.gone               {"session_id":"<ulid>","reason":"..."}                                               relay→all (host uplink lost)
+//! arc.session.revoked            {"session_id":"<ulid>","reason":"..."}                                               relay→watcher (kicked by owner)
+//! arc.host.input                 {"session_id":"<ulid>","data":"<base64>"}                                            relay→host (Phase D consumer)
+//! arc.host.resize_request        {"session_id":"<ulid>","cols":<u32>,"rows":<u32>}                                    relay→host (Phase D consumer)
+//! arc.mirror.discontinuity       {"session_id":"<ulid>","last_seq":<u64>}                                             relay→watcher (gap signal)
 //! ```
 //!
-//! `participant` fires when a client successfully attaches; the join/leave
-//! shape leaves room for a future `arc.session.detach` to emit `joined:false`.
+//! `participant` fires on both attach (`joined:true`) and detach (`joined:false`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -181,6 +196,96 @@ pub fn emit_mirror_control_revoke(entry: &ArcSessionEntry) {
     );
 }
 
+/// Emit `arc.mirror.discontinuity` — relay→watcher when the broadcast missed
+/// frames and the watcher must re-replay or accept the gap.
+pub fn emit_mirror_discontinuity(entry: &ArcSessionEntry, last_seq: u64) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.discontinuity",
+        json!({
+            "session_id": entry.session_id,
+            "last_seq": last_seq,
+        }),
+    );
+}
+
+/// Emit `arc.host.input` — driver→host PTY bytes (forwarded to the host
+/// process by the host-side jsonrpc consumer in Phase D).
+pub fn emit_host_input(entry: &ArcSessionEntry, data: &[u8]) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.host.input",
+        json!({
+            "session_id": entry.session_id,
+            "data": BASE64.encode(data),
+        }),
+    );
+}
+
+/// Emit `arc.host.resize_request` — driver→host PTY resize (forwarded to the
+/// host process by the host-side jsonrpc consumer in Phase D).
+pub fn emit_host_resize_request(entry: &ArcSessionEntry, cols: u32, rows: u32) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.host.resize_request",
+        json!({
+            "session_id": entry.session_id,
+            "cols": cols,
+            "rows": rows,
+        }),
+    );
+}
+
+/// Emit `arc.session.control_requested` — relay→watcher (sent to the current
+/// holder) when a watcher requests write control.
+pub fn emit_control_requested(
+    entry: &ArcSessionEntry,
+    request_id: &str,
+    from_user: &str,
+    from_device: &str,
+) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.session.control_requested",
+        json!({
+            "session_id": entry.session_id,
+            "request_id": request_id,
+            "from_user": from_user,
+            "from_device": from_device,
+        }),
+    );
+}
+
+/// Emit `arc.session.gone` — relay→all watchers when the host process drops
+/// the session (uplink lost, host shutdown, etc.).
+pub fn emit_session_gone(entry: &ArcSessionEntry, reason: &str) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.session.gone",
+        json!({
+            "session_id": entry.session_id,
+            "reason": reason,
+        }),
+    );
+}
+
+/// Emit `arc.session.revoked` — relay→watcher when the session owner kicks
+/// this watcher out.
+///
+/// Note: this is distinct from `arc.mirror.control_revoke`, which clears the
+/// write-control holder slot (released voluntarily). `arc.session.revoked`
+/// means the watcher's access has been terminated by the owner entirely.
+pub fn emit_session_revoked(entry: &ArcSessionEntry, reason: &str) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.session.revoked",
+        json!({
+            "session_id": entry.session_id,
+            "reason": reason,
+        }),
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -192,6 +297,22 @@ fn require_str<'a>(params: &'a Value, field: &str) -> Result<&'a str, RpcError> 
             "missing or empty '{field}' field"
         ))),
     }
+}
+
+fn require_u32(params: &Value, field: &str) -> Result<u32, RpcError> {
+    match params.get(field).and_then(|v| v.as_u64()) {
+        Some(n) if n > 0 && n <= u32::MAX as u64 => Ok(n as u32),
+        _ => Err(RpcError::invalid_params(format!(
+            "missing or invalid '{field}' field (need positive u32)"
+        ))),
+    }
+}
+
+/// Application error -32000 returned when a write-gated method is called by
+/// someone other than the current write-control holder. Carries
+/// `data.reason: "not_controller"` so callers can branch on the cause.
+fn not_controller_err() -> RpcError {
+    RpcError::server_error("not_controller").with_data(json!({"reason": "not_controller"}))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -259,6 +380,168 @@ impl RpcHandler for ArcSessionAttachHandler {
 
             let entry = self.store.get_or_create(&session_id).await;
             emit_participant(&entry, &user_id, true);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.session.detach
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.session.detach`.
+///
+/// Symmetric counterpart to `arc.session.attach`: validates the wire shape,
+/// looks up the session entry (errors if missing), derives a stable `user_id`
+/// from the token, and emits an `arc.session.participant {joined:false}`
+/// notification. Does not allocate a fresh entry — detaching a session that
+/// was never attached is treated as a server error.
+pub struct ArcSessionDetachHandler {
+    store: ArcSessionStore,
+    user_resolver: Arc<dyn Fn(&str) -> String + Send + Sync>,
+}
+
+impl ArcSessionDetachHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self {
+            store,
+            user_resolver: Arc::new(default_user_resolver),
+        }
+    }
+
+    pub fn with_user_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.user_resolver = Arc::new(resolver);
+        self
+    }
+}
+
+impl RpcHandler for ArcSessionDetachHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.session.detach"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let token = require_str(&params, "token")?;
+            let user_id = (self.user_resolver)(token);
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+            emit_participant(&entry, &user_id, false);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.session.subscribe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.session.subscribe`.
+///
+/// Read-only mirror-mode handshake. Allocates an [`ArcSessionEntry`] for the
+/// session if one does not already exist (mirrors attach), but does not affect
+/// the controller field (read-only mirror, no write claim). Emits
+/// `arc.session.participant {joined:true}` so existing watchers see the new
+/// presence.
+pub struct ArcSessionSubscribeHandler {
+    store: ArcSessionStore,
+    user_resolver: Arc<dyn Fn(&str) -> String + Send + Sync>,
+}
+
+impl ArcSessionSubscribeHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self {
+            store,
+            user_resolver: Arc::new(default_user_resolver),
+        }
+    }
+
+    pub fn with_user_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.user_resolver = Arc::new(resolver);
+        self
+    }
+}
+
+impl RpcHandler for ArcSessionSubscribeHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.session.subscribe"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let token = require_str(&params, "token")?;
+            let user_id = (self.user_resolver)(token);
+
+            let entry = self.store.get_or_create(&session_id).await;
+            emit_participant(&entry, &user_id, true);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.session.unsubscribe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.session.unsubscribe`.
+///
+/// Counterpart to `arc.session.subscribe` for the leave path. Unlike
+/// subscribe (which allocates via `get_or_create`), this looks up the
+/// session entry and errors if missing — a client must subscribe before it
+/// can unsubscribe. Emits `arc.session.participant {joined:false}` so
+/// existing watchers see the leave. Does not affect the controller field —
+/// read-only mirror leave.
+pub struct ArcSessionUnsubscribeHandler {
+    store: ArcSessionStore,
+    user_resolver: Arc<dyn Fn(&str) -> String + Send + Sync>,
+}
+
+impl ArcSessionUnsubscribeHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self {
+            store,
+            user_resolver: Arc::new(default_user_resolver),
+        }
+    }
+
+    pub fn with_user_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        self.user_resolver = Arc::new(resolver);
+        self
+    }
+}
+
+impl RpcHandler for ArcSessionUnsubscribeHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.session.unsubscribe"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let token = require_str(&params, "token")?;
+            let user_id = (self.user_resolver)(token);
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+            emit_participant(&entry, &user_id, false);
             Ok(json!({"ok": true}))
         })
     }
@@ -348,6 +631,104 @@ impl RpcHandler for ArcSessionReleaseHandler {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// arc.session.input
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.session.input`.
+///
+/// Driver-only: gated on `requester_id` matching the current write-control
+/// holder. Emits an `arc.host.input` notification carrying the base64-decoded
+/// payload to the broadcast channel; the host-side consumer (lands in Phase
+/// D) is what actually forwards the bytes to the PTY. Until that consumer
+/// exists this handler functions as a wire stub plus an audit fanout.
+pub struct ArcSessionInputHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcSessionInputHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcSessionInputHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.session.input"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let requester_id = require_str(&params, "requester_id")?.to_string();
+            let data_b64 = require_str(&params, "data")?;
+            let data = BASE64
+                .decode(data_b64)
+                .map_err(|e| RpcError::invalid_params(format!("data not valid base64: {e}")))?;
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+            let holder = entry.controller.lock().await.clone();
+            if holder.as_deref() != Some(requester_id.as_str()) {
+                return Err(not_controller_err());
+            }
+            emit_host_input(&entry, &data);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.session.resize
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.session.resize`.
+///
+/// Driver-only: gated on `requester_id` matching the current write-control
+/// holder. Emits an `arc.host.resize_request` notification carrying the new
+/// `cols`/`rows` dimensions to the broadcast channel; the host-side consumer
+/// (lands in Phase D) is what actually resizes the PTY. Until that consumer
+/// exists this handler functions as a wire stub plus an audit fanout.
+pub struct ArcSessionResizeHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcSessionResizeHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcSessionResizeHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.session.resize"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let requester_id = require_str(&params, "requester_id")?.to_string();
+            let cols = require_u32(&params, "cols")?;
+            let rows = require_u32(&params, "rows")?;
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+            let holder = entry.controller.lock().await.clone();
+            if holder.as_deref() != Some(requester_id.as_str()) {
+                return Err(not_controller_err());
+            }
+            emit_host_resize_request(&entry, cols, rows);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ArcMirrorEmitter — bridges MirrorRegistry::broadcast to arc.mirror.* notifs
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -400,23 +781,33 @@ impl crate::mirror::fanout::BroadcastEmitter for ArcMirrorEmitter {
 // Registration helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a fresh dispatcher with all three arc.session.* handlers registered.
+/// Build a fresh dispatcher with all eight arc.session.* handlers registered.
 /// Mainly used in tests; production wires through [`register_if_enabled`].
 pub fn build_arc_session_dispatcher(store: ArcSessionStore) -> RpcDispatcher {
     let mut d = RpcDispatcher::new();
     d.register(ArcSessionAttachHandler::new(store.clone()));
+    d.register(ArcSessionDetachHandler::new(store.clone()));
+    d.register(ArcSessionSubscribeHandler::new(store.clone()));
+    d.register(ArcSessionUnsubscribeHandler::new(store.clone()));
     d.register(ArcSessionControlHandler::new(store.clone()));
-    d.register(ArcSessionReleaseHandler::new(store));
+    d.register(ArcSessionReleaseHandler::new(store.clone()));
+    d.register(ArcSessionInputHandler::new(store.clone()));
+    d.register(ArcSessionResizeHandler::new(store));
     d
 }
 
-/// Register all three arc.session.* handlers with `dispatcher` if
+/// Register all eight arc.session.* handlers with `dispatcher` if
 /// `JsonRpcSpine` is on. Returns `true` when handlers were registered.
 pub fn register_if_enabled(dispatcher: &mut RpcDispatcher, store: ArcSessionStore) -> bool {
     if beacon_features::is_enabled(beacon_features::FeatureFlag::JsonRpcSpine) {
         dispatcher.try_register(ArcSessionAttachHandler::new(store.clone()));
+        dispatcher.try_register(ArcSessionDetachHandler::new(store.clone()));
+        dispatcher.try_register(ArcSessionSubscribeHandler::new(store.clone()));
+        dispatcher.try_register(ArcSessionUnsubscribeHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionControlHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionReleaseHandler::new(store));
+        dispatcher.try_register(ArcSessionReleaseHandler::new(store.clone()));
+        dispatcher.try_register(ArcSessionInputHandler::new(store.clone()));
+        dispatcher.try_register(ArcSessionResizeHandler::new(store));
         true
     } else {
         false
@@ -439,8 +830,22 @@ mod tests {
             ArcSessionAttachHandler::new(store.clone())
                 .with_user_resolver(|_token| "alice".into()),
         );
+        d.register(
+            ArcSessionDetachHandler::new(store.clone())
+                .with_user_resolver(|_token| "alice".into()),
+        );
+        d.register(
+            ArcSessionSubscribeHandler::new(store.clone())
+                .with_user_resolver(|_token| "alice".into()),
+        );
+        d.register(
+            ArcSessionUnsubscribeHandler::new(store.clone())
+                .with_user_resolver(|_token| "alice".into()),
+        );
         d.register(ArcSessionControlHandler::new(store.clone()));
         d.register(ArcSessionReleaseHandler::new(store.clone()));
+        d.register(ArcSessionInputHandler::new(store.clone()));
+        d.register(ArcSessionResizeHandler::new(store.clone()));
         (store, d)
     }
 
@@ -592,16 +997,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_arc_session_dispatcher_registers_three_methods() {
+    async fn build_arc_session_dispatcher_registers_eight_methods() {
         let store = ArcSessionStore::new(8);
         let d = build_arc_session_dispatcher(store);
-        let methods = d.registered_methods();
+        let mut methods = d.registered_methods();
+        methods.sort();
         assert_eq!(
             methods,
             vec![
                 "arc.session.attach",
                 "arc.session.control",
+                "arc.session.detach",
+                "arc.session.input",
                 "arc.session.release",
+                "arc.session.resize",
+                "arc.session.subscribe",
+                "arc.session.unsubscribe",
             ]
         );
     }
@@ -657,6 +1068,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn detach_emits_participant_joined_false() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s1").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.detach",
+            json!({"session_id": "s1", "token": "tok"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.session.participant");
+        assert_eq!(v["params"]["joined"], false);
+    }
+
+    #[tokio::test]
+    async fn detach_unknown_session_server_error() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.session.detach",
+            json!({"session_id": "ghost", "token": "tok"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
     async fn release_no_revoke_when_no_holder() {
         let (store, d) = make_dispatcher();
         let entry = store.get_or_create("s1").await;
@@ -671,6 +1115,64 @@ mod tests {
 
         // No revoke notif since there was no holder to clear.
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_creates_entry_and_emits_participant() {
+        let (store, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.session.subscribe",
+            json!({"session_id": "s2", "token": "tok"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+        assert!(store.get("s2").await.is_some());
+
+        let entry = store.get("s2").await.unwrap();
+        let mut rx = entry.notif_tx.subscribe();
+        // Re-fire to capture (the emitted notif already happened pre-subscribe).
+        let req = Request::new(
+            "arc.session.subscribe",
+            json!({"session_id": "s2", "token": "tok2"}),
+            2i64,
+        );
+        let _ = d.dispatch(req).await;
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.session.participant");
+        assert_eq!(v["params"]["joined"], true);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_unknown_session_errors() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.session.unsubscribe",
+            json!({"session_id": "ghost", "token": "t"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_emits_participant_joined_false() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s3").await;
+        let mut rx = entry.notif_tx.subscribe();
+        let req = Request::new(
+            "arc.session.unsubscribe",
+            json!({"session_id": "s3", "token": "t"}),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.session.participant");
+        assert_eq!(v["params"]["joined"], false);
     }
 
     #[tokio::test]
@@ -689,5 +1191,205 @@ mod tests {
         let b64 = v["params"]["data"].as_str().unwrap();
         let decoded = BASE64.decode(b64).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn input_only_when_controller() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s4").await;
+        *entry.controller.lock().await = Some("u-bob".into());
+
+        let req = Request::new(
+            "arc.session.input",
+            json!({
+                "session_id": "s4",
+                "requester_id": "u-alice",
+                "data": BASE64.encode(b"ls\n"),
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        let err = resp.err().unwrap();
+        assert_eq!(err.code, -32000, "expected server_error, got {err:?}");
+        assert_eq!(err.data.as_ref().unwrap()["reason"], "not_controller");
+    }
+
+    #[tokio::test]
+    async fn input_rejected_when_no_controller() {
+        // Hardens the gating: holder=None must reject, not silently allow.
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s4-none").await;
+
+        let req = Request::new(
+            "arc.session.input",
+            json!({
+                "session_id": "s4-none",
+                "requester_id": "u-alice",
+                "data": BASE64.encode(b"x"),
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        let err = resp.err().unwrap();
+        assert_eq!(err.code, -32000);
+        assert_eq!(err.data.as_ref().unwrap()["reason"], "not_controller");
+    }
+
+    #[tokio::test]
+    async fn input_emits_host_input_when_controller() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s4b").await;
+        *entry.controller.lock().await = Some("u-alice".into());
+        let mut rx = entry.notif_tx.subscribe();
+
+        let payload = b"echo hi\n";
+        let req = Request::new(
+            "arc.session.input",
+            json!({
+                "session_id": "s4b",
+                "requester_id": "u-alice",
+                "data": BASE64.encode(payload),
+            }),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.host.input");
+        assert_eq!(v["params"]["session_id"], "s4b");
+        let b64 = v["params"]["data"].as_str().unwrap();
+        assert_eq!(BASE64.decode(b64).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn input_unknown_session_errors() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.session.input",
+            json!({
+                "session_id": "ghost",
+                "requester_id": "u-alice",
+                "data": "AAAA",
+            }),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn resize_emits_host_resize_when_controller() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s5").await;
+        *entry.controller.lock().await = Some("u-alice".into());
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.resize",
+            json!({
+                "session_id": "s5",
+                "requester_id": "u-alice",
+                "cols": 120, "rows": 40,
+            }),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.host.resize_request");
+        assert_eq!(v["params"]["cols"], 120);
+        assert_eq!(v["params"]["rows"], 40);
+    }
+
+    #[tokio::test]
+    async fn resize_rejects_non_controller() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s5b").await;
+        *entry.controller.lock().await = Some("u-bob".into());
+        let req = Request::new(
+            "arc.session.resize",
+            json!({"session_id": "s5b", "requester_id": "u-alice", "cols": 80, "rows": 24}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        let err = resp.err().unwrap();
+        assert_eq!(err.code, -32000);
+        assert_eq!(err.data.as_ref().unwrap()["reason"], "not_controller");
+    }
+
+    #[tokio::test]
+    async fn resize_invalid_dimensions_invalid_params() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s5c").await;
+        *entry.controller.lock().await = Some("u-alice".into());
+        let req = Request::new(
+            "arc.session.resize",
+            json!({"session_id": "s5c", "requester_id": "u-alice", "cols": 0, "rows": 24}),
+            1i64,
+        );
+        assert_eq!(d.dispatch(req).await.err().unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn emit_control_requested_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s6").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_control_requested(&entry, "req-1", "u-alice", "MacBook");
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.session.control_requested");
+        assert_eq!(v["params"]["session_id"], "s6");
+        assert_eq!(v["params"]["request_id"], "req-1");
+        assert_eq!(v["params"]["from_user"], "u-alice");
+        assert_eq!(v["params"]["from_device"], "MacBook");
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_discontinuity_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s7").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_mirror_discontinuity(&entry, 42);
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.discontinuity");
+        assert_eq!(v["params"]["session_id"], "s7");
+        assert_eq!(v["params"]["last_seq"], 42);
+    }
+
+    #[tokio::test]
+    async fn emit_session_gone_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s8").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_session_gone(&entry, "host_disconnected");
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.session.gone");
+        assert_eq!(v["params"]["session_id"], "s8");
+        assert_eq!(v["params"]["reason"], "host_disconnected");
+    }
+
+    #[tokio::test]
+    async fn emit_session_revoked_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s9").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_session_revoked(&entry, "kicked_by_owner");
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.session.revoked");
+        assert_eq!(v["params"]["session_id"], "s9");
+        assert_eq!(v["params"]["reason"], "kicked_by_owner");
     }
 }
