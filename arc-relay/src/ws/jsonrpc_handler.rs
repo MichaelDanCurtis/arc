@@ -115,6 +115,8 @@ async fn handle_subscribe_side_effects(
             | "arc.session.unsubscribe"
             | "arc.session.control"
             | "arc.session.release"
+            | "arc.session.approve_control"
+            | "arc.session.deny_control"
             | "arc.session.input"
             | "arc.session.resize"
     );

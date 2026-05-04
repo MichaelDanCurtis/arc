@@ -235,6 +235,29 @@ Watcher-side block-stream + replay surface added (additive; msgpack pump unchang
 
 The host-side producers that fire these notifications (mapping `BlockEvent` from `beacon-blocks::BlockDetector` into the rpc emitters) land in Phase D.
 
+### Arc surface — Phase C (feat/arc-jsonrpc-phase-c)
+
+Watcher-side approve/deny + host-input echo (additive; msgpack pump unchanged).
+
+**Methods (2):**
+
+| Method                          | Params                                                       | Result        | Direction          |
+|---------------------------------|--------------------------------------------------------------|---------------|--------------------|
+| `arc.session.approve_control`   | `{session_id, request_id, requester_id}`                     | `{ok: true}`  | watcher (owner)→relay |
+| `arc.session.deny_control`      | `{session_id, request_id, requester_id}`                     | `{ok: true}`  | watcher (owner)→relay |
+
+**Notifications (1):**
+
+| Notification              | Params                                                       | Direction       |
+|---------------------------|--------------------------------------------------------------|-----------------|
+| `arc.mirror.host_input`   | `{session_id, data: <base64>, from_user: <string>}`          | relay→watcher   |
+
+`approve_control` promotes `requester_id` to the new write-control holder and fires `arc.mirror.control_grant`. `deny_control` is silent (no notification — the requesting watcher times out client-side, matching msgpack semantic). The `request_id` parameter is accepted for wire compatibility with msgpack `ClientToArc::ApproveControl` / `DenyControl` and logged but not validated against any server-side pending-request queue — the full lease-manager flow (queue, owner authorization, race resolution) lives behind msgpack until Phase D wires the host surface.
+
+`arc.mirror.host_input` is new logical behavior on the JSON-RPC side: it broadcasts a base64-encoded echo of the current driver's input bytes to all subscribed watchers, attributed via `from_user`. msgpack land does not broadcast `HostInput` to watchers (only forwards to the host PTY); Phase C adds this echo so non-driver watchers see real-time typing attribution. Fired alongside `arc.host.input` from inside `ArcSessionInputHandler`.
+
+The host-side dispatch that consumes the `arc.host.input` and `arc.host.resize_request` notifications (Phase A emitters) lands in Phase D.
+
 ---
 
 ## 3. beacon-remote  (SSH transport)

@@ -29,9 +29,11 @@
 //! arc.session.detach       {"session_id":"<ulid>","token":"<jwt>"}                                    → {"ok":true}
 //! arc.session.subscribe    {"session_id":"<ulid>","token":"<jwt>"}                                    → {"ok":true}
 //! arc.session.unsubscribe  {"session_id":"<ulid>","token":"<jwt>"}                                    → {"ok":true}
-//! arc.session.control      {"session_id":"<ulid>","requester_id":"..."}                               → {"ok":true}
-//! arc.session.release      {"session_id":"<ulid>"}                                                    → {"ok":true}
-//! arc.session.input        {"session_id":"<ulid>","requester_id":"...","data":"<base64>"}             → {"ok":true}
+//! arc.session.control          {"session_id":"<ulid>","requester_id":"..."}                               → {"ok":true}
+//! arc.session.release          {"session_id":"<ulid>"}                                                    → {"ok":true}
+//! arc.session.approve_control  {"session_id":"<ulid>","request_id":"...","requester_id":"..."}            → {"ok":true}
+//! arc.session.deny_control     {"session_id":"<ulid>","request_id":"...","requester_id":"..."}            → {"ok":true}
+//! arc.session.input            {"session_id":"<ulid>","requester_id":"...","data":"<base64>"}             → {"ok":true}
 //! arc.session.resize       {"session_id":"<ulid>","requester_id":"...","cols":<u32>,"rows":<u32>}     → {"ok":true}
 //! ```
 //!
@@ -43,6 +45,7 @@
 //! arc.session.gone               {"session_id":"<ulid>","reason":"..."}                                               relay→all (host uplink lost)
 //! arc.session.revoked            {"session_id":"<ulid>","reason":"..."}                                               relay→watcher (kicked by owner)
 //! arc.host.input                 {"session_id":"<ulid>","data":"<base64>"}                                            relay→host (Phase D consumer)
+//! arc.mirror.host_input          {"session_id":"<ulid>","data":"<base64>","from_user":"<id>"}                         relay→watcher
 //! arc.host.resize_request        {"session_id":"<ulid>","cols":<u32>,"rows":<u32>}                                    relay→host (Phase D consumer)
 //! arc.mirror.discontinuity       {"session_id":"<ulid>","last_seq":<u64>}                                             relay→watcher (gap signal)
 //! arc.mirror.block_start          {"session_id":"<ulid>","header":<BlockHeader-json>}                                  relay→watcher
@@ -341,6 +344,25 @@ pub fn emit_host_input(entry: &ArcSessionEntry, data: &[u8]) {
         json!({
             "session_id": entry.session_id,
             "data": BASE64.encode(data),
+        }),
+    );
+}
+
+/// Emit `arc.mirror.host_input` — relay→all-watchers carrying a base64-encoded
+/// echo of the current driver's input bytes, attributed via `from_user`. Fires
+/// alongside `arc.host.input` (which forwards the same bytes to the host PTY)
+/// so non-driver watchers see real-time typing attribution.
+///
+/// Direction: relay→watcher. New behavior on the JSON-RPC side — msgpack land
+/// does not broadcast `HostInput` to watchers (it routes only to host).
+pub fn emit_mirror_host_input(entry: &ArcSessionEntry, data: &[u8], from_user: &str) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.host_input",
+        json!({
+            "session_id": entry.session_id,
+            "data": BASE64.encode(data),
+            "from_user": from_user,
         }),
     );
 }
@@ -754,6 +776,113 @@ impl RpcHandler for ArcSessionReleaseHandler {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// arc.session.approve_control
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.session.approve_control`.
+///
+/// Promotes `requester_id` to the new write-control holder and emits
+/// `arc.mirror.control_grant`. The `request_id` parameter is accepted for
+/// wire compatibility with msgpack `ClientToArc::ApproveControl` and logged,
+/// but not validated against any server-side pending-request queue — the
+/// full lease-manager flow (queue, owner authorization, race resolution)
+/// lives behind msgpack until Phase D wires the host surface.
+///
+/// Fails with `server_error` when the session entry is missing.
+pub struct ArcSessionApproveControlHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcSessionApproveControlHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcSessionApproveControlHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.session.approve_control"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let request_id = require_str(&params, "request_id")?.to_string();
+            let requester_id = require_str(&params, "requester_id")?.to_string();
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+
+            *entry.controller.lock().await = Some(requester_id.clone());
+            emit_mirror_control_grant(&entry, &requester_id);
+            tracing::debug!(
+                session_id = %session_id,
+                request_id = %request_id,
+                requester_id = %requester_id,
+                "approve_control: promoted requester to controller (in-rpc-layer)"
+            );
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.session.deny_control
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.session.deny_control`.
+///
+/// Silent denial — no notification fired. Matches msgpack
+/// `ClientToArc::DenyControl` semantic: the requesting watcher times out
+/// client-side rather than receiving an explicit deny event. The
+/// `request_id` parameter is accepted for wire compatibility and logged,
+/// but not validated against any server-side queue.
+///
+/// Fails with `server_error` when the session entry is missing — matches
+/// the rest of the in-rpc-layer convention (a request against an unknown
+/// session is a routing bug, not a client error).
+pub struct ArcSessionDenyControlHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcSessionDenyControlHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcSessionDenyControlHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.session.deny_control"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let request_id = require_str(&params, "request_id")?.to_string();
+            let requester_id = require_str(&params, "requester_id")?.to_string();
+
+            let Some(_entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+
+            tracing::debug!(
+                session_id = %session_id,
+                request_id = %request_id,
+                requester_id = %requester_id,
+                "deny_control: silent denial (no notification, no controller change)"
+            );
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // arc.session.input
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -798,6 +927,7 @@ impl RpcHandler for ArcSessionInputHandler {
                 return Err(not_controller_err());
             }
             emit_host_input(&entry, &data);
+            emit_mirror_host_input(&entry, &data, requester_id.as_str());
             Ok(json!({"ok": true}))
         })
     }
@@ -904,7 +1034,7 @@ impl crate::mirror::fanout::BroadcastEmitter for ArcMirrorEmitter {
 // Registration helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a fresh dispatcher with all eight arc.session.* handlers registered.
+/// Build a fresh dispatcher with all ten arc.session.* handlers registered.
 /// Mainly used in tests; production wires through [`register_if_enabled`].
 pub fn build_arc_session_dispatcher(store: ArcSessionStore) -> RpcDispatcher {
     let mut d = RpcDispatcher::new();
@@ -914,12 +1044,14 @@ pub fn build_arc_session_dispatcher(store: ArcSessionStore) -> RpcDispatcher {
     d.register(ArcSessionUnsubscribeHandler::new(store.clone()));
     d.register(ArcSessionControlHandler::new(store.clone()));
     d.register(ArcSessionReleaseHandler::new(store.clone()));
+    d.register(ArcSessionApproveControlHandler::new(store.clone()));
+    d.register(ArcSessionDenyControlHandler::new(store.clone()));
     d.register(ArcSessionInputHandler::new(store.clone()));
     d.register(ArcSessionResizeHandler::new(store));
     d
 }
 
-/// Register all eight arc.session.* handlers with `dispatcher` if
+/// Register all ten arc.session.* handlers with `dispatcher` if
 /// `JsonRpcSpine` is on. Returns `true` when handlers were registered.
 pub fn register_if_enabled(dispatcher: &mut RpcDispatcher, store: ArcSessionStore) -> bool {
     if beacon_features::is_enabled(beacon_features::FeatureFlag::JsonRpcSpine) {
@@ -929,6 +1061,8 @@ pub fn register_if_enabled(dispatcher: &mut RpcDispatcher, store: ArcSessionStor
         dispatcher.try_register(ArcSessionUnsubscribeHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionControlHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionReleaseHandler::new(store.clone()));
+        dispatcher.try_register(ArcSessionApproveControlHandler::new(store.clone()));
+        dispatcher.try_register(ArcSessionDenyControlHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionInputHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionResizeHandler::new(store));
         true
@@ -967,6 +1101,8 @@ mod tests {
         );
         d.register(ArcSessionControlHandler::new(store.clone()));
         d.register(ArcSessionReleaseHandler::new(store.clone()));
+        d.register(ArcSessionApproveControlHandler::new(store.clone()));
+        d.register(ArcSessionDenyControlHandler::new(store.clone()));
         d.register(ArcSessionInputHandler::new(store.clone()));
         d.register(ArcSessionResizeHandler::new(store.clone()));
         (store, d)
@@ -1120,7 +1256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_arc_session_dispatcher_registers_eight_methods() {
+    async fn build_arc_session_dispatcher_registers_ten_methods() {
         let store = ArcSessionStore::new(8);
         let d = build_arc_session_dispatcher(store);
         let mut methods = d.registered_methods();
@@ -1128,8 +1264,10 @@ mod tests {
         assert_eq!(
             methods,
             vec![
+                "arc.session.approve_control",
                 "arc.session.attach",
                 "arc.session.control",
+                "arc.session.deny_control",
                 "arc.session.detach",
                 "arc.session.input",
                 "arc.session.release",
@@ -1383,6 +1521,49 @@ mod tests {
         assert_eq!(v["params"]["session_id"], "s4b");
         let b64 = v["params"]["data"].as_str().unwrap();
         assert_eq!(BASE64.decode(b64).unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn input_also_emits_mirror_host_input_when_controller() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s1").await;
+        *entry.controller.lock().await = Some("alice".into());
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.input",
+            json!({
+                "session_id": "s1",
+                "requester_id": "alice",
+                "data": BASE64.encode(b"ls"),
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+
+        // Drain notifications and assert BOTH arc.host.input AND arc.mirror.host_input fire.
+        let mut saw_host = false;
+        let mut saw_mirror = false;
+        for _ in 0..2 {
+            let raw = rx.recv().await.expect("notif");
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            match v["method"].as_str().unwrap() {
+                "arc.host.input" => {
+                    saw_host = true;
+                    let b64 = v["params"]["data"].as_str().unwrap();
+                    assert_eq!(BASE64.decode(b64).unwrap(), b"ls");
+                }
+                "arc.mirror.host_input" => {
+                    saw_mirror = true;
+                    let b64 = v["params"]["data"].as_str().unwrap();
+                    assert_eq!(BASE64.decode(b64).unwrap(), b"ls");
+                    assert_eq!(v["params"]["from_user"], "alice");
+                }
+                other => panic!("unexpected notification: {other}"),
+            }
+        }
+        assert!(saw_host && saw_mirror, "expected both notifications");
     }
 
     #[tokio::test]
@@ -1822,5 +2003,162 @@ mod tests {
             "replay_end params should be just session_id, got {}",
             v["params"]
         );
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_host_input_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-echo").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_mirror_host_input(&entry, b"hi\x1b[0m", "alice");
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.host_input");
+        assert_eq!(v["params"]["session_id"], "s-echo");
+        assert_eq!(v["params"]["from_user"], "alice");
+        let b64 = v["params"]["data"].as_str().unwrap();
+        assert_eq!(BASE64.decode(b64).unwrap(), b"hi\x1b[0m");
+    }
+
+    #[test]
+    fn mirror_host_input_wire_shape_locked() {
+        use serde_json::json;
+
+        let n = beacon_jsonrpc::Notification::new(
+            "arc.mirror.host_input",
+            json!({
+                "session_id": "s1",
+                "data": "aGVsbG8=", // "hello"
+                "from_user": "alice",
+            }),
+        );
+        let s = serde_json::to_string(&n).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+
+        // Lock the wire keys: top-level method + params shape.
+        assert_eq!(v["method"], "arc.mirror.host_input");
+        let params = v["params"].as_object().expect("params is object");
+        let mut keys: Vec<&String> = params.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["data", "from_user", "session_id"],
+            "arc.mirror.host_input wire keys drifted; sync MIGRATION.md Phase C + arc-web/Mac decoders",
+        );
+        assert!(params["data"].is_string(), "data must be base64 string");
+        assert!(params["from_user"].is_string());
+        assert!(params["session_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn approve_control_promotes_requester_and_emits_grant() {
+        let (store, d) = make_dispatcher();
+        // Pre-create entry; set existing controller (the owner who's approving).
+        let entry = store.get_or_create("s1").await;
+        *entry.controller.lock().await = Some("owner".into());
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.approve_control",
+            json!({
+                "session_id": "s1",
+                "request_id": "req-42",
+                "requester_id": "bob",
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+
+        // Controller field promoted.
+        assert_eq!(*entry.controller.lock().await, Some("bob".to_string()));
+
+        // arc.mirror.control_grant fired with the new holder.
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.control_grant");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["holder_id"], "bob");
+    }
+
+    #[tokio::test]
+    async fn approve_control_unknown_session_server_error() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.session.approve_control",
+            json!({
+                "session_id": "ghost",
+                "request_id": "req-1",
+                "requester_id": "bob",
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn approve_control_missing_request_id_invalid_params() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.session.approve_control",
+            json!({"session_id": "s1", "requester_id": "bob"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(
+            resp.err().unwrap().code,
+            beacon_jsonrpc::RpcErrorCode::InvalidParams as i32,
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_control_silent_no_notification() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s1").await;
+        *entry.controller.lock().await = Some("owner".into());
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.session.deny_control",
+            json!({
+                "session_id": "s1",
+                "request_id": "req-42",
+                "requester_id": "bob",
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+
+        // Controller unchanged.
+        assert_eq!(*entry.controller.lock().await, Some("owner".to_string()));
+
+        // No notification emitted.
+        use tokio::sync::broadcast::error::TryRecvError;
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => { /* expected */ }
+            other => panic!("expected no notification, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_control_unknown_session_server_error() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.session.deny_control",
+            json!({
+                "session_id": "ghost",
+                "request_id": "req-1",
+                "requester_id": "bob",
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.err().unwrap().message.contains("not found"));
     }
 }
