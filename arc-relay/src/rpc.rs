@@ -78,7 +78,8 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use beacon_jsonrpc::{BoxFuture, Notification, RpcDispatcher, RpcError, RpcHandler};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use uuid::Uuid;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Session store
@@ -99,6 +100,11 @@ pub struct ArcSessionEntry {
     /// Broadcast channel: each `String` is a JSON-encoded
     /// [`beacon_jsonrpc::Notification`].
     pub notif_tx: broadcast::Sender<String>,
+    /// JoinHandles for the (translator_task, pump_task) background tasks
+    /// spawned by `arc.host.session_register`. Set to `Some(...)` when the
+    /// host registers; T2 (`arc.host.session_unregister`) aborts these on
+    /// cleanup. Stored here so T2 can find them via `store.get(session_id)`.
+    pub host_tasks: Mutex<Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)>>,
 }
 
 /// Thread-safe map of `session_id` → [`ArcSessionEntry`].
@@ -128,6 +134,7 @@ impl ArcSessionStore {
             session_id: session_id.to_string(),
             controller: Mutex::new(None),
             notif_tx,
+            host_tasks: Mutex::new(None),
         });
         guard.insert(session_id.to_string(), entry.clone());
         entry
@@ -1083,17 +1090,37 @@ impl RpcHandler for ArcHostHelloHandler {
 
 /// Handler for `arc.host.session_register`.
 ///
-/// Allocates an `ArcSessionEntry` for the registered session if one does not
-/// already exist. Emits no notification (matches msgpack — host registration
-/// is invisible to existing watchers). Phase F will wire this to
-/// `RelayRouter::register_session` + DB `create_session`.
+/// Phase F full wire-up: allocates an `ArcSessionEntry`, registers the session
+/// with `RelayRouter`, initialises the `MirrorRegistry` entry, spawns a
+/// host-input pump task (watcher→host JSON-RPC notifications), spawns a
+/// translator task (RelayRouter msgpack bytes → JSON-RPC notifications), and
+/// persists the session to the DB (best-effort). The two task JoinHandles are
+/// stored on `entry.host_tasks` so `arc.host.session_unregister` (T2) can abort
+/// them on cleanup.
+///
+/// Pattern mirrors `arc-relay/src/ws/host.rs:155-243` (the msgpack path).
+/// `ws/host.rs` is NOT touched by this handler.
 pub struct ArcHostSessionRegisterHandler {
     store: ArcSessionStore,
+    relay: Arc<crate::relay::router::RelayRouter>,
+    mirror_registry: crate::mirror::MirrorRegistry,
+    pool: sqlx::PgPool,
+    /// Uuid of the authenticated user on this WebSocket connection. Set to
+    /// `Uuid::nil()` in unit-test contexts where no real auth is present; the
+    /// production path threads the real user_id from the WS upgrade handler via
+    /// `register_if_enabled`.
+    user_id: Uuid,
 }
 
 impl ArcHostSessionRegisterHandler {
-    pub fn new(store: ArcSessionStore) -> Self {
-        Self { store }
+    pub fn new(
+        store: ArcSessionStore,
+        relay: Arc<crate::relay::router::RelayRouter>,
+        mirror_registry: crate::mirror::MirrorRegistry,
+        pool: sqlx::PgPool,
+        user_id: Uuid,
+    ) -> Self {
+        Self { store, relay, mirror_registry, pool, user_id }
     }
 }
 
@@ -1103,15 +1130,190 @@ impl RpcHandler for ArcHostSessionRegisterHandler {
     }
 
     fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        let relay = self.relay.clone();
+        let mirror_registry = self.mirror_registry.clone();
+        let pool = self.pool.clone();
+        let store = self.store.clone();
+        let user_id = self.user_id;
+
         Box::pin(async move {
             let session_id = require_str(&params, "session_id")?.to_string();
             let name = require_str(&params, "name")?.to_string();
 
-            let _entry = self.store.get_or_create(&session_id).await;
+            // ── Step 1: Allocate ArcSessionEntry ─────────────────────────────
+            let entry = store.get_or_create(&session_id).await;
+
+            // ── Step 2: Register with RelayRouter ────────────────────────────
+            // Create the mpsc channel whose Sender we give to RelayRouter as
+            // the host_tx. RelayRouter encodes ArcToClient frames as msgpack
+            // Vec<u8> and sends them here; the translator task (Step 4) decodes
+            // and re-emits them as JSON-RPC notifications on the session entry.
+            let (host_tx_bytes, mut host_rx_bytes) = mpsc::channel::<Vec<u8>>(256);
+            let _broadcast_rx = relay.register_session(
+                session_id.clone(),
+                host_tx_bytes,
+                user_id,
+                name.clone(),
+            );
             tracing::info!(
                 session_id = %session_id,
                 name = %name,
-                "arc.host.session_register: entry allocated (in-rpc-layer)"
+                user_id = %user_id,
+                "arc.host.session_register: registered with RelayRouter",
+            );
+
+            // ── Step 3: MirrorRegistry init + host_input pump ─────────────────
+            // get_or_init is idempotent; if a watcher subscribed first the
+            // mirror already exists and we just retrieve it.
+            let mirror_arc = mirror_registry
+                .get_or_init(&session_id, user_id, vec![])
+                .await;
+
+            let (host_input_tx, mut host_input_rx) =
+                mpsc::channel::<beacon_proto::envelope::ArcToClient>(256);
+            {
+                let mut m = mirror_arc.lock().await;
+                m.host_input_tx = Some(host_input_tx);
+            }
+
+            // Pump task: ArcToClient::HostInput frames arriving from watchers
+            // → arc.host.input JSON-RPC notification on this host connection.
+            let entry_pump = entry.clone();
+            let sid_pump = session_id.clone();
+            let pump_handle = tokio::spawn(async move {
+                while let Some(frame) = host_input_rx.recv().await {
+                    match frame {
+                        beacon_proto::envelope::ArcToClient::HostInput { bytes, .. } => {
+                            emit_host_input(&entry_pump, &bytes);
+                        }
+                        _ => {
+                            tracing::debug!(
+                                session_id = %sid_pump,
+                                "host_input pump: unexpected frame variant; skipping",
+                            );
+                        }
+                    }
+                }
+                tracing::debug!(
+                    session_id = %sid_pump,
+                    "host_input pump: channel closed; stopping",
+                );
+            });
+
+            // ── Step 4: Translator task ───────────────────────────────────────
+            // Reads raw msgpack Vec<u8> from the RelayRouter host channel,
+            // decodes as ArcToClient, and re-emits as the appropriate JSON-RPC
+            // notification on the session entry.
+            let entry_xlat = entry.clone();
+            let sid_xlat = session_id.clone();
+            let xlat_handle = tokio::spawn(async move {
+                while let Some(bytes) = host_rx_bytes.recv().await {
+                    match beacon_proto::codec::decode::<beacon_proto::envelope::ArcToClient>(&bytes) {
+                        Ok(frame) => {
+                            use beacon_proto::envelope::ArcToClient as F;
+                            match &frame {
+                                F::HostInput { bytes: data, .. } => {
+                                    emit_host_input(&entry_xlat, data);
+                                }
+                                F::LeaseChanged { driver: Some(d), .. } => {
+                                    emit_mirror_control_grant(&entry_xlat, &d.user_id);
+                                }
+                                F::LeaseChanged { driver: None, .. } => {
+                                    emit_mirror_control_revoke(&entry_xlat);
+                                }
+                                F::ControlRequested {
+                                    request_id,
+                                    from_user,
+                                    from_device,
+                                    ..
+                                } => {
+                                    emit_control_requested(
+                                        &entry_xlat,
+                                        request_id,
+                                        from_user,
+                                        from_device,
+                                    );
+                                }
+                                F::PresenceChanged { watchers, .. } => {
+                                    // Translate to arc.session.participant for each watcher.
+                                    // `joined: true` for all entries (presence snapshot).
+                                    for w in watchers {
+                                        emit_participant(&entry_xlat, &w.user_id, true);
+                                    }
+                                }
+                                F::SessionRevoked { reason, .. } => {
+                                    emit_session_revoked(&entry_xlat, reason);
+                                }
+                                F::ShadowDiffRequest { request_id, .. } => {
+                                    emit_host_shadow_diff_request(&entry_xlat, request_id);
+                                }
+                                F::BlockStart { header, .. } => {
+                                    emit_mirror_block_start(&entry_xlat, header);
+                                }
+                                F::BlockOutputChunk { block_id, seq, bytes: data, .. } => {
+                                    emit_mirror_block_chunk(&entry_xlat, block_id, *seq, data);
+                                }
+                                F::BlockEnd { footer, .. } => {
+                                    emit_mirror_block_end(&entry_xlat, footer);
+                                }
+                                F::SessionOutput { bytes: data, .. } => {
+                                    emit_mirror_frame(&entry_xlat, data);
+                                }
+                                F::Ping | F::Pong => {
+                                    // drop silently
+                                }
+                                other => {
+                                    tracing::debug!(
+                                        session_id = %sid_xlat,
+                                        variant = ?std::mem::discriminant(other),
+                                        "translator: unhandled ArcToClient variant; skipping",
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %sid_xlat,
+                                "translator: decode error: {e}; skipping frame",
+                            );
+                        }
+                    }
+                }
+                tracing::debug!(
+                    session_id = %sid_xlat,
+                    "translator: relay channel closed; stopping",
+                );
+            });
+
+            // Store handles on the entry so T2 (session_unregister) can abort them.
+            *entry.host_tasks.lock().await = Some((xlat_handle, pump_handle));
+
+            // ── Step 5: DB persist (best-effort) ─────────────────────────────
+            let pool2 = pool.clone();
+            let sid2 = session_id.clone();
+            let name2 = name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = crate::models::session::create_session(
+                    &pool2,
+                    &sid2,
+                    user_id, // host_id = connecting user
+                    user_id, // owner_id = connecting user
+                    Some(&name2),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        session_id = %sid2,
+                        "arc.host.session_register: create_session DB error: {e}",
+                    );
+                }
+            });
+
+            tracing::info!(
+                session_id = %session_id,
+                name = %name,
+                user_id = %user_id,
+                "arc.host.session_register: fully wired (relay + mirror + pump + translator + db)",
             );
             Ok(json!({"ok": true}))
         })
@@ -1124,18 +1326,40 @@ impl RpcHandler for ArcHostSessionRegisterHandler {
 
 /// Handler for `arc.host.session_unregister`.
 ///
-/// Idempotent: if the session entry exists, fires `arc.session.gone` with
-/// `reason: "host_unregistered"`. If missing, returns `{ok: true}` without
-/// notification — matches msgpack's no-error-on-missing semantic. Phase F will
-/// wire `RelayRouter::unregister_session` + DB state update + `mirror_registry`
-/// host_input_tx clear.
+/// Full Phase F wire-up: on a known session entry, this handler:
+/// 1. Calls `relay.unregister_session` — drops the broadcast channel, stops
+///    mirror fan-out.
+/// 2. Spawns a best-effort `update_session_state(&pool, sid, "ended")` DB
+///    update (warns on error; does NOT fail the RPC reply).
+/// 3. Aborts the translator + host_input pump `JoinHandle`s stored on
+///    `entry.host_tasks` by T1 (`arc.host.session_register`).
+/// 4. Clears `mirror.host_input_tx` — sets it to `None`; the `MirrorRegistry`
+///    entry itself is left in place for connection-lifetime invariant stability.
+///
+/// All four steps are idempotent: if `host_tasks` is `None` (never registered
+/// or already unregistered) step 3 is a no-op; `relay.unregister_session` is
+/// idempotent boolean; `update_session_state` is a no-op if already ended.
+///
+/// If the entry is missing entirely, returns `{ok: true}` without notification
+/// — matches msgpack's no-error-on-missing semantic.
+///
+/// Pattern mirrors `arc-relay/src/ws/host.rs:245-266` (the msgpack path).
+/// `ws/host.rs` is NOT touched by this handler.
 pub struct ArcHostSessionUnregisterHandler {
     store: ArcSessionStore,
+    relay: Arc<crate::relay::router::RelayRouter>,
+    mirror_registry: crate::mirror::MirrorRegistry,
+    pool: sqlx::PgPool,
 }
 
 impl ArcHostSessionUnregisterHandler {
-    pub fn new(store: ArcSessionStore) -> Self {
-        Self { store }
+    pub fn new(
+        store: ArcSessionStore,
+        relay: Arc<crate::relay::router::RelayRouter>,
+        mirror_registry: crate::mirror::MirrorRegistry,
+        pool: sqlx::PgPool,
+    ) -> Self {
+        Self { store, relay, mirror_registry, pool }
     }
 }
 
@@ -1145,14 +1369,71 @@ impl RpcHandler for ArcHostSessionUnregisterHandler {
     }
 
     fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        let relay = self.relay.clone();
+        let mirror_registry = self.mirror_registry.clone();
+        let pool = self.pool.clone();
+        let store = self.store.clone();
+
         Box::pin(async move {
             let session_id = require_str(&params, "session_id")?.to_string();
 
-            if let Some(entry) = self.store.get(&session_id).await {
+            if let Some(entry) = store.get(&session_id).await {
+                // ── Step 1: Unregister from RelayRouter ──────────────────────
+                // Drops the broadcast channel; any attached watcher receivers
+                // will see their streams close.  Idempotent: returns false if
+                // already removed, which we ignore.
+                let _was_registered = relay.unregister_session(&session_id);
+                tracing::info!(
+                    session_id = %session_id,
+                    was_registered = _was_registered,
+                    "arc.host.session_unregister: unregistered from RelayRouter",
+                );
+
+                // ── Step 2: DB state → "ended" (best-effort) ─────────────────
+                let pool2 = pool.clone();
+                let sid2 = session_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::models::session::update_session_state(&pool2, &sid2, "ended").await
+                    {
+                        tracing::warn!(
+                            session_id = %sid2,
+                            "arc.host.session_unregister: update_session_state DB error: {e}",
+                        );
+                    }
+                });
+
+                // ── Step 3: Abort translator + pump JoinHandles ───────────────
+                // Take the Option out so double-unregister doesn't abort twice.
+                if let Some((xlat_handle, pump_handle)) =
+                    entry.host_tasks.lock().await.take()
+                {
+                    xlat_handle.abort();
+                    pump_handle.abort();
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "arc.host.session_unregister: aborted translator + pump handles",
+                    );
+                }
+
+                // ── Step 4: Clear mirror host_input_tx ───────────────────────
+                // Leaves the MirrorRegistry entry in place; just drops the
+                // sender so subsequent SessionInput frames are silently dropped
+                // (mirror/handlers.rs already handles None gracefully).
+                if let Some(mirror_arc) = mirror_registry.get(&session_id).await {
+                    let mut m = mirror_arc.lock().await;
+                    m.host_input_tx = None;
+                    tracing::debug!(
+                        session_id = %session_id,
+                        "arc.host.session_unregister: cleared mirror host_input_tx",
+                    );
+                }
+
+                // ── Step 5: Emit arc.session.gone ────────────────────────────
                 emit_session_gone(&entry, "host_unregistered");
                 tracing::info!(
                     session_id = %session_id,
-                    "arc.host.session_unregister: emitted arc.session.gone"
+                    "arc.host.session_unregister: emitted arc.session.gone",
                 );
             } else {
                 tracing::debug!(
@@ -1316,17 +1597,21 @@ impl RpcHandler for ArcHostBlockEndHandler {
 
 /// Handler for `arc.host.session_resize`.
 ///
-/// Host-driven dimensions update. In-rpc-layer this is a wire stub that logs
-/// at debug and returns `{ok: true}`; Phase F will wire `RelayRouter::update_size`
-/// so subsequent watcher attaches see the new dims. No notification fires
-/// (msgpack also does not broadcast resize events to watchers).
+/// Phase F wire-up: calls `RelayRouter::update_size` so that subsequent
+/// `arc.session.attach` replies carry the updated `initial_size`. No
+/// notification fires (msgpack also does not broadcast resize events to
+/// watchers).
 pub struct ArcHostSessionResizeHandler {
     store: ArcSessionStore,
+    relay: Arc<crate::relay::router::RelayRouter>,
 }
 
 impl ArcHostSessionResizeHandler {
-    pub fn new(store: ArcSessionStore) -> Self {
-        Self { store }
+    pub fn new(
+        store: ArcSessionStore,
+        relay: Arc<crate::relay::router::RelayRouter>,
+    ) -> Self {
+        Self { store, relay }
     }
 }
 
@@ -1336,20 +1621,23 @@ impl RpcHandler for ArcHostSessionResizeHandler {
     }
 
     fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        let relay = self.relay.clone();
+        let store = self.store.clone();
         Box::pin(async move {
             let session_id = require_str(&params, "session_id")?.to_string();
-            let cols = require_u32(&params, "cols")?;
-            let rows = require_u32(&params, "rows")?;
+            let cols = require_u32(&params, "cols")? as u16;
+            let rows = require_u32(&params, "rows")? as u16;
 
-            let Some(_entry) = self.store.get(&session_id).await else {
+            let Some(_entry) = store.get(&session_id).await else {
                 return Err(RpcError::server_error(format!(
-                    "arc session not found: {session_id}"
+                    "not found: {session_id}"
                 )));
             };
-            tracing::debug!(
+            relay.update_size(&session_id, cols, rows);
+            tracing::info!(
                 session_id = %session_id,
                 cols, rows,
-                "arc.host.session_resize: in-rpc-layer no-op (wired to RelayRouter in Phase F)"
+                "arc.host.session_resize: updated RelayRouter size",
             );
             Ok(json!({"ok": true}))
         })
@@ -1362,17 +1650,27 @@ impl RpcHandler for ArcHostSessionResizeHandler {
 
 /// Handler for `arc.host.push_output`.
 ///
-/// Decodes base64 `data` and re-broadcasts as `arc.mirror.frame` to subscribed
-/// watchers. The host-supplied `seq` is echoed back in the result so the host
-/// can correlate; in-rpc-layer there is no scrollback ring (Phase F wires
-/// `MirrorRegistry::ScrollbackRing`).
+/// Phase F wire-up: decodes base64 `data`, appends to `ScrollbackRing` for a
+/// canonical monotone `seq`, then calls `MirrorRegistry::broadcast` which fans
+/// out via both the msgpack `Fanout` path AND the `ArcMirrorEmitter` JSON-RPC
+/// path (registered in Phase D). The host-supplied `seq` parameter is
+/// intentionally discarded — `ScrollbackRing::append` assigns the canonical
+/// sequence number.
+///
+/// If the session has no `MirrorRegistry` entry (host pushed before
+/// `arc.host.session_register`), the frame is silently dropped and `{ok: true}`
+/// is returned — matches msgpack semantics.
 pub struct ArcHostPushOutputHandler {
     store: ArcSessionStore,
+    mirror_registry: crate::mirror::MirrorRegistry,
 }
 
 impl ArcHostPushOutputHandler {
-    pub fn new(store: ArcSessionStore) -> Self {
-        Self { store }
+    pub fn new(
+        store: ArcSessionStore,
+        mirror_registry: crate::mirror::MirrorRegistry,
+    ) -> Self {
+        Self { store, mirror_registry }
     }
 }
 
@@ -1382,12 +1680,11 @@ impl RpcHandler for ArcHostPushOutputHandler {
     }
 
     fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        let store = self.store.clone();
+        let mirror_registry = self.mirror_registry.clone();
         Box::pin(async move {
             let session_id = require_str(&params, "session_id")?.to_string();
-            let seq = params
-                .get("seq")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| RpcError::invalid_params("missing or invalid 'seq' field"))?;
+            // `seq` from host is discarded; ScrollbackRing assigns canonical seq.
             // Use as_str (not require_str) — empty string is valid base64 (zero bytes).
             let data_b64 = params
                 .get("data")
@@ -1397,13 +1694,54 @@ impl RpcHandler for ArcHostPushOutputHandler {
                 .decode(data_b64)
                 .map_err(|e| RpcError::invalid_params(format!("data not valid base64: {e}")))?;
 
-            let Some(entry) = self.store.get(&session_id).await else {
+            let Some(_entry) = store.get(&session_id).await else {
                 return Err(RpcError::server_error(format!(
                     "arc session not found: {session_id}"
                 )));
             };
-            emit_mirror_frame(&entry, &data);
-            Ok(json!({"ok": true, "seq": seq}))
+
+            let Some(mirror_arc) = mirror_registry.get(&session_id).await else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "arc.host.push_output: session not registered for mirroring; ignoring",
+                );
+                return Ok(json!({"ok": true, "seq": 0u64}));
+            };
+
+            let canonical_seq = {
+                let mut m = mirror_arc.lock().await;
+                m.scrollback.append(data.clone())
+            };
+
+            // Construct the typed SessionOutput for MirrorRegistry::broadcast.
+            // session_id is a ULID in production; fall back to emit_mirror_frame
+            // for non-ULID values (unit tests use plain string IDs).
+            if let Ok(sid_typed) = session_id.parse::<beacon_model::SessionId>() {
+                mirror_registry
+                    .broadcast(
+                        &session_id,
+                        beacon_proto::envelope::ArcToClient::SessionOutput {
+                            session_id: sid_typed,
+                            bytes: data,
+                            seq: canonical_seq,
+                            replay: false,
+                        },
+                    )
+                    .await;
+            } else {
+                // Non-ULID session_id (test-only path): broadcast directly via
+                // emit_mirror_frame so notif_tx subscribers still receive the frame.
+                if let Some(entry) = store.get(&session_id).await {
+                    emit_mirror_frame(&entry, &data);
+                }
+            }
+
+            tracing::info!(
+                session_id = %session_id,
+                seq = canonical_seq,
+                "arc.host.push_output: broadcast via MirrorRegistry",
+            );
+            Ok(json!({"ok": true, "seq": canonical_seq}))
         })
     }
 }
@@ -1415,27 +1753,21 @@ impl RpcHandler for ArcHostPushOutputHandler {
 /// Handler for `arc.host.shadow_diff_response`.
 ///
 /// Receives the host's diff payload for a previously-issued
-/// `arc.host.shadow_diff_request`. In-rpc-layer there is no waiter map
-/// (production has `RelayRouter::pending_shadow_diffs`); the handler logs at
-/// debug and returns `{ok: true}` so the wire shape is locked. Phase F wires
-/// the waiter side. The matching `emit_host_shadow_diff_request` helper is
-/// already in place (Task 2) so Phase F can plumb the request side without
-/// re-touching wire shapes.
+/// `arc.host.shadow_diff_request` and resolves the corresponding
+/// `RelayRouter::pending_shadow_diffs` waiter. If no waiter is present a warn
+/// is logged but the RPC still returns `{ok: true}` — the host should not be
+/// penalised for a late/orphaned response.
 ///
 /// Note: also accepts an `Option<String>` `diff` field to allow `null` for
 /// "host has no diff for this request" responses; required-string check would
 /// reject that. Wire spec uses plain string per `ClientToArc::ShadowDiffResponse`.
-pub struct ArcHostShadowDiffResponseHandler;
-
-impl ArcHostShadowDiffResponseHandler {
-    pub fn new() -> Self {
-        Self
-    }
+pub struct ArcHostShadowDiffResponseHandler {
+    relay: Arc<crate::relay::router::RelayRouter>,
 }
 
-impl Default for ArcHostShadowDiffResponseHandler {
-    fn default() -> Self {
-        Self::new()
+impl ArcHostShadowDiffResponseHandler {
+    pub fn new(relay: Arc<crate::relay::router::RelayRouter>) -> Self {
+        Self { relay }
     }
 }
 
@@ -1445,20 +1777,31 @@ impl RpcHandler for ArcHostShadowDiffResponseHandler {
     }
 
     fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        let relay = self.relay.clone();
         Box::pin(async move {
             let session_id = require_str(&params, "session_id")?.to_string();
             let request_id = require_str(&params, "request_id")?.to_string();
             // `diff` is required per the msgpack envelope, but allow empty string.
-            let _diff = params
+            let diff = params
                 .get("diff")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| RpcError::invalid_params("missing 'diff' field"))?;
+                .ok_or_else(|| RpcError::invalid_params("missing 'diff' field"))?
+                .to_string();
 
-            tracing::debug!(
-                session_id = %session_id,
-                request_id = %request_id,
-                "arc.host.shadow_diff_response: in-rpc-layer no-op (wired to RelayRouter::pending_shadow_diffs in Phase F)"
-            );
+            let resolved = relay.resolve_shadow_diff(&request_id, diff);
+            if !resolved {
+                tracing::warn!(
+                    session_id = %session_id,
+                    request_id = %request_id,
+                    "arc.host.shadow_diff_response: no waiter for request_id (late or orphaned response)",
+                );
+            } else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    request_id = %request_id,
+                    "arc.host.shadow_diff_response: resolved waiter",
+                );
+            }
             Ok(json!({"ok": true}))
         })
     }
@@ -1519,7 +1862,17 @@ impl crate::mirror::fanout::BroadcastEmitter for ArcMirrorEmitter {
 
 /// Build a fresh dispatcher with all 19 arc.session.* + arc.host.* handlers registered.
 /// Mainly used in tests; production wires through [`register_if_enabled`].
-pub fn build_arc_session_dispatcher(store: ArcSessionStore) -> RpcDispatcher {
+///
+/// `relay`, `mirror_registry`, `pool`, and `user_id` are threaded into
+/// `ArcHostSessionRegisterHandler` for full Phase F wire-up. Pass a nil Uuid
+/// in unit tests that don't exercise session_register's relay/DB paths.
+pub fn build_arc_session_dispatcher(
+    store: ArcSessionStore,
+    relay: Arc<crate::relay::router::RelayRouter>,
+    mirror_registry: crate::mirror::MirrorRegistry,
+    pool: sqlx::PgPool,
+    user_id: Uuid,
+) -> RpcDispatcher {
     let mut d = RpcDispatcher::new();
     // Watcher surface (Phase A + B + C)
     d.register(ArcSessionAttachHandler::new(store.clone()));
@@ -1532,22 +1885,43 @@ pub fn build_arc_session_dispatcher(store: ArcSessionStore) -> RpcDispatcher {
     d.register(ArcSessionDenyControlHandler::new(store.clone()));
     d.register(ArcSessionInputHandler::new(store.clone()));
     d.register(ArcSessionResizeHandler::new(store.clone()));
-    // Host surface (Phase D)
+    // Host surface (Phase D + F)
     d.register(ArcHostHelloHandler::new());
-    d.register(ArcHostSessionRegisterHandler::new(store.clone()));
-    d.register(ArcHostSessionUnregisterHandler::new(store.clone()));
+    d.register(ArcHostSessionRegisterHandler::new(
+        store.clone(),
+        relay.clone(),
+        mirror_registry.clone(),
+        pool.clone(),
+        user_id,
+    ));
+    d.register(ArcHostSessionUnregisterHandler::new(
+        store.clone(),
+        relay.clone(),
+        mirror_registry.clone(),
+        pool,
+    ));
     d.register(ArcHostBlockStartHandler::new(store.clone()));
     d.register(ArcHostBlockChunkHandler::new(store.clone()));
     d.register(ArcHostBlockEndHandler::new(store.clone()));
-    d.register(ArcHostSessionResizeHandler::new(store.clone()));
-    d.register(ArcHostPushOutputHandler::new(store));
-    d.register(ArcHostShadowDiffResponseHandler::new());
+    d.register(ArcHostSessionResizeHandler::new(store.clone(), relay.clone()));
+    d.register(ArcHostPushOutputHandler::new(store, mirror_registry));
+    d.register(ArcHostShadowDiffResponseHandler::new(relay));
     d
 }
 
 /// Register all 19 arc.session.* + arc.host.* handlers with `dispatcher` if
 /// `JsonRpcSpine` is on. Returns `true` when handlers were registered.
-pub fn register_if_enabled(dispatcher: &mut RpcDispatcher, store: ArcSessionStore) -> bool {
+///
+/// `relay`, `mirror_registry`, `pool`, and `user_id` are required for the
+/// full Phase F wire-up of `arc.host.session_register`.
+pub fn register_if_enabled(
+    dispatcher: &mut RpcDispatcher,
+    store: ArcSessionStore,
+    relay: Arc<crate::relay::router::RelayRouter>,
+    mirror_registry: crate::mirror::MirrorRegistry,
+    pool: sqlx::PgPool,
+    user_id: Uuid,
+) -> bool {
     if beacon_features::is_enabled(beacon_features::FeatureFlag::JsonRpcSpine) {
         // Watcher surface (Phase A + B + C)
         dispatcher.try_register(ArcSessionAttachHandler::new(store.clone()));
@@ -1560,16 +1934,27 @@ pub fn register_if_enabled(dispatcher: &mut RpcDispatcher, store: ArcSessionStor
         dispatcher.try_register(ArcSessionDenyControlHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionInputHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionResizeHandler::new(store.clone()));
-        // Host surface (Phase D)
+        // Host surface (Phase D + F)
         dispatcher.try_register(ArcHostHelloHandler::new());
-        dispatcher.try_register(ArcHostSessionRegisterHandler::new(store.clone()));
-        dispatcher.try_register(ArcHostSessionUnregisterHandler::new(store.clone()));
+        dispatcher.try_register(ArcHostSessionRegisterHandler::new(
+            store.clone(),
+            relay.clone(),
+            mirror_registry.clone(),
+            pool.clone(),
+            user_id,
+        ));
+        dispatcher.try_register(ArcHostSessionUnregisterHandler::new(
+            store.clone(),
+            relay.clone(),
+            mirror_registry.clone(),
+            pool,
+        ));
         dispatcher.try_register(ArcHostBlockStartHandler::new(store.clone()));
         dispatcher.try_register(ArcHostBlockChunkHandler::new(store.clone()));
         dispatcher.try_register(ArcHostBlockEndHandler::new(store.clone()));
-        dispatcher.try_register(ArcHostSessionResizeHandler::new(store.clone()));
-        dispatcher.try_register(ArcHostPushOutputHandler::new(store));
-        dispatcher.try_register(ArcHostShadowDiffResponseHandler::new());
+        dispatcher.try_register(ArcHostSessionResizeHandler::new(store.clone(), relay.clone()));
+        dispatcher.try_register(ArcHostPushOutputHandler::new(store, mirror_registry));
+        dispatcher.try_register(ArcHostShadowDiffResponseHandler::new(relay));
         true
     } else {
         false
@@ -1585,8 +1970,16 @@ mod tests {
     use super::*;
     use beacon_jsonrpc::Request;
 
+    /// Build a dispatcher wired to a lazy (never-connecting) pool and a
+    /// fresh RelayRouter + MirrorRegistry. Suitable for all unit tests that
+    /// don't exercise DB or inter-task paths.
     fn make_dispatcher() -> (ArcSessionStore, RpcDispatcher) {
         let store = ArcSessionStore::new(64);
+        let relay = Arc::new(crate::relay::router::RelayRouter::new());
+        let mirror_registry = crate::mirror::MirrorRegistry::default();
+        let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
+            .expect("lazy pool");
+        let user_id = Uuid::nil();
         let mut d = RpcDispatcher::new();
         d.register(
             ArcSessionAttachHandler::new(store.clone())
@@ -1611,15 +2004,85 @@ mod tests {
         d.register(ArcSessionInputHandler::new(store.clone()));
         d.register(ArcSessionResizeHandler::new(store.clone()));
         d.register(ArcHostHelloHandler::new());
-        d.register(ArcHostSessionRegisterHandler::new(store.clone()));
-        d.register(ArcHostSessionUnregisterHandler::new(store.clone()));
+        d.register(ArcHostSessionRegisterHandler::new(
+            store.clone(),
+            relay.clone(),
+            mirror_registry.clone(),
+            pool.clone(),
+            user_id,
+        ));
+        d.register(ArcHostSessionUnregisterHandler::new(
+            store.clone(),
+            relay.clone(),
+            mirror_registry.clone(),
+            pool,
+        ));
         d.register(ArcHostBlockStartHandler::new(store.clone()));
         d.register(ArcHostBlockChunkHandler::new(store.clone()));
         d.register(ArcHostBlockEndHandler::new(store.clone()));
-        d.register(ArcHostSessionResizeHandler::new(store.clone()));
-        d.register(ArcHostPushOutputHandler::new(store.clone()));
-        d.register(ArcHostShadowDiffResponseHandler::new());
+        d.register(ArcHostSessionResizeHandler::new(store.clone(), relay.clone()));
+        d.register(ArcHostPushOutputHandler::new(store.clone(), mirror_registry));
+        d.register(ArcHostShadowDiffResponseHandler::new(relay));
         (store, d)
+    }
+
+    /// Like `make_dispatcher` but also returns the `MirrorRegistry` and
+    /// pre-registers `ArcMirrorEmitter` so that `mirror_registry.broadcast`
+    /// flows through to `entry.notif_tx` via the emitter hook.
+    fn make_dispatcher_with_mirror()
+        -> (ArcSessionStore, crate::mirror::MirrorRegistry, RpcDispatcher)
+    {
+        let store = ArcSessionStore::new(64);
+        let relay = Arc::new(crate::relay::router::RelayRouter::new());
+        let mirror_registry = crate::mirror::MirrorRegistry::default();
+        mirror_registry.add_emitter(Arc::new(ArcMirrorEmitter::new(store.clone())));
+        let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
+            .expect("lazy pool");
+        let user_id = Uuid::nil();
+        let mut d = RpcDispatcher::new();
+        d.register(
+            ArcSessionAttachHandler::new(store.clone())
+                .with_user_resolver(|_token| "alice".into()),
+        );
+        d.register(
+            ArcSessionDetachHandler::new(store.clone())
+                .with_user_resolver(|_token| "alice".into()),
+        );
+        d.register(
+            ArcSessionSubscribeHandler::new(store.clone())
+                .with_user_resolver(|_token| "alice".into()),
+        );
+        d.register(
+            ArcSessionUnsubscribeHandler::new(store.clone())
+                .with_user_resolver(|_token| "alice".into()),
+        );
+        d.register(ArcSessionControlHandler::new(store.clone()));
+        d.register(ArcSessionReleaseHandler::new(store.clone()));
+        d.register(ArcSessionApproveControlHandler::new(store.clone()));
+        d.register(ArcSessionDenyControlHandler::new(store.clone()));
+        d.register(ArcSessionInputHandler::new(store.clone()));
+        d.register(ArcSessionResizeHandler::new(store.clone()));
+        d.register(ArcHostHelloHandler::new());
+        d.register(ArcHostSessionRegisterHandler::new(
+            store.clone(),
+            relay.clone(),
+            mirror_registry.clone(),
+            pool.clone(),
+            user_id,
+        ));
+        d.register(ArcHostSessionUnregisterHandler::new(
+            store.clone(),
+            relay.clone(),
+            mirror_registry.clone(),
+            pool,
+        ));
+        d.register(ArcHostBlockStartHandler::new(store.clone()));
+        d.register(ArcHostBlockChunkHandler::new(store.clone()));
+        d.register(ArcHostBlockEndHandler::new(store.clone()));
+        d.register(ArcHostSessionResizeHandler::new(store.clone(), relay.clone()));
+        d.register(ArcHostPushOutputHandler::new(store.clone(), mirror_registry.clone()));
+        d.register(ArcHostShadowDiffResponseHandler::new(relay));
+        (store, mirror_registry, d)
     }
 
     #[tokio::test]
@@ -1772,7 +2235,11 @@ mod tests {
     #[tokio::test]
     async fn build_arc_session_dispatcher_registers_nineteen_methods() {
         let store = ArcSessionStore::new(8);
-        let d = build_arc_session_dispatcher(store);
+        let relay = Arc::new(crate::relay::router::RelayRouter::new());
+        let mirror_registry = crate::mirror::MirrorRegistry::default();
+        let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
+            .expect("lazy pool");
+        let d = build_arc_session_dispatcher(store, relay, mirror_registry, pool, Uuid::nil());
         let mut methods = d.registered_methods();
         methods.sort();
         assert_eq!(
@@ -3119,17 +3586,24 @@ mod tests {
         use base64::engine::general_purpose::STANDARD as BASE64;
         use base64::Engine as _;
 
-        let (store, d) = make_dispatcher();
-        let entry = store.get_or_create("s-push").await;
+        // Use a real ULID as session_id — SessionId is a ULID newtype.
+        let sid = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+        let (store, mirror_registry, d) = make_dispatcher_with_mirror();
+        let entry = store.get_or_create(sid).await;
+        // Pre-init the MirrorRegistry entry so push_output finds it.
+        mirror_registry
+            .get_or_init(sid, uuid::Uuid::nil(), vec![])
+            .await;
         let mut rx = entry.notif_tx.subscribe();
 
         let payload = b"PTY output \x1b[31mred\x1b[0m".to_vec();
         let req = Request::new(
             "arc.host.push_output",
             json!({
-                "session_id": "s-push",
+                "session_id": sid,
                 "data": BASE64.encode(&payload),
-                "seq": 7u64,
+                "seq": 99u64,   // bogus host seq — must be discarded
             }),
             1i64,
         );
@@ -3137,7 +3611,12 @@ mod tests {
         assert!(resp.is_success(), "{:?}", resp.err());
         let result = resp.result().unwrap();
         assert_eq!(result["ok"], true);
-        assert_eq!(result["seq"], 7);
+        // Canonical seq comes from ScrollbackRing (starts at 0), NOT the host-supplied 99.
+        let canonical_seq = result["seq"].as_u64().unwrap();
+        assert_ne!(canonical_seq, 99, "host seq must be discarded");
+
+        // Give the ArcMirrorEmitter tokio::spawn a chance to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let raw = rx.recv().await.expect("notif");
         let v: Value = serde_json::from_str(&raw).unwrap();
@@ -3206,5 +3685,66 @@ mod tests {
         );
         let resp = d.dispatch(req).await;
         assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── Phase F: arc.host.session_register relay + mirror wire-up ────────────
+
+    /// Verify that calling `arc.host.session_register` wires the session into
+    /// both the `ArcSessionStore` (entry exists) and `MirrorRegistry` (mirror
+    /// entry created).  Uses the same lazy-pool dispatcher as other lib tests
+    /// so no real DB is required.
+    #[tokio::test]
+    async fn host_session_register_wires_relay_router() {
+        let store = ArcSessionStore::new(64);
+        let relay = Arc::new(crate::relay::router::RelayRouter::new());
+        let mirror_registry = crate::mirror::MirrorRegistry::default();
+        let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
+            .expect("lazy pool");
+        let user_id = Uuid::nil();
+
+        let mut d = RpcDispatcher::new();
+        d.register(ArcHostSessionRegisterHandler::new(
+            store.clone(),
+            relay.clone(),
+            mirror_registry.clone(),
+            pool,
+            user_id,
+        ));
+
+        let sid = "phase-f-lib-test-1";
+        let req = Request::new(
+            "arc.host.session_register",
+            json!({"session_id": sid, "name": "shell"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "register failed: {:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+
+        // ArcSessionEntry must be in the store.
+        assert!(store.get(sid).await.is_some(), "store entry missing after register");
+
+        // Give the async mirror init a moment (get_or_init is awaited inline so
+        // it should already be done, but yield once to be safe).
+        tokio::task::yield_now().await;
+
+        // MirrorRegistry must have an entry.
+        assert!(
+            mirror_registry.get(sid).await.is_some(),
+            "MirrorRegistry entry missing after register",
+        );
+
+        // RelayRouter must have a session registered.
+        assert!(
+            relay.get_session_info(sid).is_some(),
+            "RelayRouter session missing after register",
+        );
+
+        // JoinHandles must be stored on the entry.
+        let entry = store.get(sid).await.unwrap();
+        assert!(
+            entry.host_tasks.lock().await.is_some(),
+            "host_tasks JoinHandles not stored on ArcSessionEntry",
+        );
     }
 }

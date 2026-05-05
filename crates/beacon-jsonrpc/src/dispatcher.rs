@@ -31,7 +31,7 @@ pub trait RpcHandler: Send + Sync {
     fn method_name(&self) -> &'static str;
 
     /// Handle the request. `params` is `Value::Null` when the request had no params field.
-    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>>;
+    fn handle(&self, params: Value) -> BoxFuture<'_, Result<Value, RpcError>>;
 }
 
 /// Central dispatcher: holds a registry of [`RpcHandler`]s and routes requests.

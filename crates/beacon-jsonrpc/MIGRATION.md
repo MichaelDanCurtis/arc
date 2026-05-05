@@ -350,6 +350,73 @@ WASM-side changes.
 Phase F migrates the Mac client (`beacon-net::ArcConnection`). Phase G
 deletes the msgpack envelope on both sides.
 
+### Arc surface — Phase F (beacon-net + production wire-up)
+
+Two halves shipped together:
+
+**A. arc-relay production wire-up.** The nine `arc.host.*` handlers from
+Phase D were dispatcher-only stubs; Phase F connects them to the same
+production state the msgpack `ws/host.rs` path uses. JSON-RPC hosts now
+fully participate in mirroring, presence, and shadow-diff request/response.
+
+| Handler | Wire-up |
+|---------|---------|
+| `arc.host.session_register` | `RelayRouter::register_session` + `MirrorRegistry::get_or_init` + host_input pump + DB `create_session` |
+| `arc.host.session_unregister` | `RelayRouter::unregister_session` + DB `update_session_state(_, "ended")` + abort translator + pump |
+| `arc.host.session_resize` | `RelayRouter::update_size` |
+| `arc.host.push_output` | `MirrorRegistry::scrollback.append` (canonical seq) → `mirror_registry.broadcast` |
+| `arc.host.shadow_diff_response` | `RelayRouter::resolve_shadow_diff` |
+
+`shadow_routes::request_diff` now emits BOTH msgpack `ShadowDiffRequest`
+(legacy) AND `arc.host.shadow_diff_request` JSON-RPC notif (Phase F new),
+so either flavour of host can satisfy a diff request.
+
+Host-bound msgpack frames (sent via `RelayRouter::register_session`'s
+`host_tx: mpsc::Sender<Vec<u8>>`) are translated to `arc.host.*` /
+`arc.session.*` JSON-RPC notifications by a per-session translator task
+spawned at `session_register` and aborted at `session_unregister`. Handles
+are stored on `ArcSessionEntry::host_tasks`.
+
+**B. Mac client wire migration.** New
+`beacon_net::ArcConnectionJsonRpc` wraps the existing `JsonRpcWsClient`
+and exposes the same `send(ClientToArc) / recv() -> ArcToClient` surface
+as msgpack `ArcConnection` so `beacon-hostd::daemon` can switch via
+the `BEACON_FF_JSON_RPC_SPINE` feature flag without rewriting its
+match arms. Outbound `ClientToArc` is method-mapped (e.g.
+`SessionRegister` → `arc.host.session_register`); inbound `arc.*`
+notifs are reverse-mapped (e.g. `arc.host.input` → `HostInput`,
+`arc.mirror.control_grant`/`revoke` → `LeaseChanged`).
+
+The daemon's `ArcWire` enum (private to `daemon.rs`) wraps both
+connection types so `relay_loop`, `mirror_upstream_loop`, and
+`inbound_loop` accept either implementation.
+
+**Self-subscribe filter** is client-side: `ArcConnectionJsonRpc`'s
+translator drops `arc.mirror.frame`, `arc.mirror.block_*`,
+`arc.mirror.replay_*`, `arc.mirror.discontinuity`, and
+`arc.mirror.host_input` since hostd has no mirror-render need.
+`arc.mirror.control_grant`/`revoke` are PRESERVED (mapped to
+`LeaseChanged`) because the daemon's lease cache needs them.
+
+#### Known gap — JSON-RPC reconnect parity
+
+`JsonRpcWsClient` has no auto-reconnect; the WS actor breaks on close.
+msgpack `ArcConnection` reconnects with backoff via its own actor loop.
+Production hostd JSON-RPC connections will NOT survive WS drops until a
+follow-up lands either (a) a reconnect wrapper around
+`ArcConnectionJsonRpc` modeled on the msgpack actor, or (b) wires the
+WS actor's exit path to drop `notif_tx` so `state_watch` publishes
+`Disconnected` and `beacon-hostd::daemon::relay_loop` can react.
+Test `state_stays_connected_after_drop_documenting_no_autoreconnect`
+locks in the current behavior as a tripwire.
+
+#### What ships next
+
+Phase G deletes msgpack on both sides — `beacon-net::ArcConnection`,
+`arc-relay/src/ws/host.rs`, the `beacon-proto` envelope module, and the
+msgpack branch of `arc-relay/src/api/shadow_routes.rs`. Reconnect parity
+follow-up may land before or alongside Phase G.
+
 ---
 
 ## 3. beacon-remote  (SSH transport)

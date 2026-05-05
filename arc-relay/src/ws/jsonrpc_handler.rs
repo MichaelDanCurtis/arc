@@ -26,7 +26,14 @@ pub async fn handle_jsonrpc_connection(
     state: AppState,
 ) {
     let mut dispatcher = RpcDispatcher::new();
-    crate::rpc::register_if_enabled(&mut dispatcher, state.arc_session_store.clone());
+    crate::rpc::register_if_enabled(
+        &mut dispatcher,
+        state.arc_session_store.clone(),
+        state.relay.clone(),
+        state.mirror_registry.clone(),
+        state.pool.clone(),
+        user_id,
+    );
     if let Some(backend) = state.arc_ai_backend.clone() {
         crate::ai_rpc::register_if_enabled(
             &mut dispatcher,

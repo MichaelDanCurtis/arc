@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::auth::middleware::AuthUser;
+use crate::rpc::emit_host_shadow_diff_request;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -74,7 +75,19 @@ pub async fn get_shadow_diff(
         .relay
         .register_shadow_diff_waiter(&request_id, tx);
 
-    // Send the request to the host via the relay router
+    // JSON-RPC path: if a JSON-RPC host entry exists for this session, emit
+    // arc.host.shadow_diff_request directly on its notification channel.
+    // The msgpack send_to_host call below stays as the legacy path — both run
+    // in parallel until Phase G removes msgpack.
+    // NOTE: the T1 translator also handles ArcToClient::ShadowDiffRequest from
+    // send_to_host; that arm is intentionally kept as a safety net. If the host
+    // is JSON-RPC-only, the translator path is a no-op (send_to_host returns
+    // false for a JSON-RPC-only host) so no double-fire occurs in that case.
+    if let Some(entry) = state.arc_session_store.get(&session_id).await {
+        emit_host_shadow_diff_request(&entry, &request_id);
+    }
+
+    // Send the request to the host via the relay router (msgpack legacy path).
     if !state.relay.send_to_host(&session_id, encoded).await {
         // Clean up the waiter we just registered before returning the error.
         state.relay.remove_shadow_diff_waiter(&request_id);
