@@ -260,6 +260,70 @@ The host-side dispatch that consumes the `arc.host.input` and `arc.host.resize_r
 
 ---
 
+### Arc surface — Phase D (host surface)
+
+Adds the `arc.host.*` host-facing method surface (9 methods) and one new
+relay→host notification (`arc.host.shadow_diff_request`). Two of the spec's
+three host-facing notifs (`arc.host.input`, `arc.host.resize_request`)
+already shipped as Phase A side effects of `arc.session.{input, resize}`.
+Additive — msgpack `handle_host` pump in `arc-relay/src/ws/host.rs` is
+untouched.
+
+#### Methods
+
+| Method                              | Params                                                                                | Result                                            |
+|-------------------------------------|---------------------------------------------------------------------------------------|---------------------------------------------------|
+| `arc.host.hello`                    | `{host_id, auth_token, protocol_version}`                                             | `{ok: true, protocol_version}`                    |
+| `arc.host.session_register`         | `{session_id, name}`                                                                  | `{ok: true}`                                      |
+| `arc.host.session_unregister`       | `{session_id}`                                                                        | `{ok: true}`                                      |
+| `arc.host.block_start`              | `{session_id, header: <BlockHeader-json>}`                                            | `{ok: true}`                                      |
+| `arc.host.block_chunk`              | `{session_id, block_id, seq, data: <base64>}`                                         | `{ok: true}`                                      |
+| `arc.host.block_end`                | `{session_id, footer: <BlockFooter-json>}`                                            | `{ok: true}`                                      |
+| `arc.host.session_resize`           | `{session_id, cols, rows}`                                                            | `{ok: true}`                                      |
+| `arc.host.push_output`              | `{session_id, data: <base64>, seq}`                                                   | `{ok: true, seq}`                                 |
+| `arc.host.shadow_diff_response`     | `{session_id, request_id, diff}`                                                      | `{ok: true}`                                      |
+
+#### New notification
+
+| Notification                        | Params                                       | Direction       |
+|-------------------------------------|----------------------------------------------|-----------------|
+| `arc.host.shadow_diff_request`      | `{session_id, request_id}`                   | relay→host      |
+
+#### Semantics
+
+- **`arc.host.hello`** — connection-level handshake. Validates `protocol_version`
+  matches `beacon_proto::PROTOCOL_VERSION`; rejects with `server_error` on
+  mismatch. Auth token is logged but not verified (WS upgrade handler is auth
+  boundary).
+- **`arc.host.session_register`** — `get_or_create` the entry; emits no notif
+  (matches msgpack — host registration is invisible to existing watchers).
+- **`arc.host.session_unregister`** — fires `arc.session.gone` with
+  `reason: "host_unregistered"`; idempotent (returns `{ok: true}` on missing
+  entry).
+- **`arc.host.block_start` / `block_chunk` / `block_end`** — re-broadcast
+  to subscribed watchers via Phase B's `arc.mirror.block_*` emitters.
+- **`arc.host.session_resize`** — host-driven resize. In-rpc-layer no-op
+  (logs at debug, returns `{ok: true}`); Phase F wires `RelayRouter::update_size`.
+- **`arc.host.push_output`** — re-broadcasts as `arc.mirror.frame`. Echoes
+  `seq` in result for host-side correlation.
+- **`arc.host.shadow_diff_response`** — in-rpc-layer no-op; Phase F wires
+  the waiter map (`RelayRouter::pending_shadow_diffs`).
+
+#### In-rpc-layer convention
+
+All 9 handlers act only on `ArcSessionStore.entry`. No `RelayRouter` /
+`MirrorRegistry` / DB interaction in this phase. Phase F (Mac client wire
+migration) will refactor the handlers to wire to production routing /
+persistence; the wire shapes locked here are stable across that refactor.
+
+#### What ships next
+
+Phase E migrates the arc-web TS client to `JsonRpcWsClient`. Phase F migrates
+the Mac client (`beacon-net::ArcConnection`). Phase G deletes the msgpack
+envelope.
+
+---
+
 ## 3. beacon-remote  (SSH transport)
 
 Source files: `beacon-core/crates/beacon-remote/src/lib.rs`,

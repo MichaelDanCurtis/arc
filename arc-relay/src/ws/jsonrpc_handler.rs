@@ -119,6 +119,14 @@ async fn handle_subscribe_side_effects(
             | "arc.session.deny_control"
             | "arc.session.input"
             | "arc.session.resize"
+            | "arc.host.session_register"
+            | "arc.host.session_unregister"
+            | "arc.host.block_start"
+            | "arc.host.block_chunk"
+            | "arc.host.block_end"
+            | "arc.host.session_resize"
+            | "arc.host.push_output"
+            | "arc.host.shadow_diff_response"
     );
     if want_session && session_subs.insert(session_id.to_string()) {
         let _ = state.arc_session_store.get_or_create(session_id).await;

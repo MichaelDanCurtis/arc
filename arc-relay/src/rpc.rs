@@ -12,6 +12,10 @@
 //! - `arc.session.input`      — driver-only PTY write
 //! - `arc.session.resize`     — driver-only PTY resize
 //! - `arc.session.participant` notification (relay → all)
+//! - 9 host methods (Phase D): `arc.host.hello`, `arc.host.session_register`,
+//!   `arc.host.session_unregister`, `arc.host.block_start`, `arc.host.block_chunk`,
+//!   `arc.host.block_end`, `arc.host.session_resize`, `arc.host.push_output`,
+//!   `arc.host.shadow_diff_response`
 //!
 //! These handlers live alongside the existing msgpack `ClientToArc` /
 //! `ArcToClient` envelope (see `arc-relay/src/ws/handler.rs`); they do not
@@ -35,6 +39,15 @@
 //! arc.session.deny_control     {"session_id":"<ulid>","request_id":"...","requester_id":"..."}            → {"ok":true}
 //! arc.session.input            {"session_id":"<ulid>","requester_id":"...","data":"<base64>"}             → {"ok":true}
 //! arc.session.resize       {"session_id":"<ulid>","requester_id":"...","cols":<u32>,"rows":<u32>}     → {"ok":true}
+//! arc.host.hello                  {"host_id":"...","auth_token":"...","protocol_version":<u16>}                          → {"ok":true,"protocol_version":<u16>}
+//! arc.host.session_register       {"session_id":"<ulid>","name":"..."}                                                    → {"ok":true}
+//! arc.host.session_unregister     {"session_id":"<ulid>"}                                                                 → {"ok":true}
+//! arc.host.block_start            {"session_id":"<ulid>","header":<BlockHeader-json>}                                     → {"ok":true}
+//! arc.host.block_chunk            {"session_id":"<ulid>","block_id":"<ulid>","seq":<u64>,"data":"<base64>"}               → {"ok":true}
+//! arc.host.block_end              {"session_id":"<ulid>","footer":<BlockFooter-json>}                                     → {"ok":true}
+//! arc.host.session_resize         {"session_id":"<ulid>","cols":<u32>,"rows":<u32>}                                       → {"ok":true}
+//! arc.host.push_output            {"session_id":"<ulid>","data":"<base64>","seq":<u64>}                                   → {"ok":true,"seq":<u64>}
+//! arc.host.shadow_diff_response   {"session_id":"<ulid>","request_id":"...","diff":"..."}                                 → {"ok":true}
 //! ```
 //!
 //! # Wire format — notifications
@@ -47,6 +60,7 @@
 //! arc.host.input                 {"session_id":"<ulid>","data":"<base64>"}                                            relay→host (Phase D consumer)
 //! arc.mirror.host_input          {"session_id":"<ulid>","data":"<base64>","from_user":"<id>"}                         relay→watcher
 //! arc.host.resize_request        {"session_id":"<ulid>","cols":<u32>,"rows":<u32>}                                    relay→host (Phase D consumer)
+//! arc.host.shadow_diff_request   {"session_id":"<ulid>","request_id":"..."}                                             relay→host (Phase D consumer)
 //! arc.mirror.discontinuity       {"session_id":"<ulid>","last_seq":<u64>}                                             relay→watcher (gap signal)
 //! arc.mirror.block_start          {"session_id":"<ulid>","header":<BlockHeader-json>}                                  relay→watcher
 //! arc.mirror.block_chunk          {"session_id":"<ulid>","block_id":"<ulid>","seq":<u64>,"data":"<base64>"}             relay→watcher
@@ -377,6 +391,22 @@ pub fn emit_host_resize_request(entry: &ArcSessionEntry, cols: u32, rows: u32) {
             "session_id": entry.session_id,
             "cols": cols,
             "rows": rows,
+        }),
+    );
+}
+
+/// Emit `arc.host.shadow_diff_request` — relay→host asking for a shadow-diff
+/// snapshot. Pairs with the host's `arc.host.shadow_diff_response` reply.
+/// Phase D adds the helper; the production trigger (currently
+/// `RelayRouter::request_shadow_diff` + msgpack `ArcToClient::ShadowDiffRequest`)
+/// is plumbed in Phase F.
+pub fn emit_host_shadow_diff_request(entry: &ArcSessionEntry, request_id: &str) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.host.shadow_diff_request",
+        json!({
+            "session_id": entry.session_id,
+            "request_id": request_id,
         }),
     );
 }
@@ -982,6 +1012,459 @@ impl RpcHandler for ArcSessionResizeHandler {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// arc.host.hello
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.hello`.
+///
+/// Connection-level handshake: validates the host's `protocol_version` matches
+/// `beacon_proto::PROTOCOL_VERSION` and echoes it back. Does not touch the
+/// session store (no session_id at this layer). The `auth_token` is logged but
+/// not verified — the WS upgrade handler is the auth boundary, mirroring
+/// msgpack `ClientToArc::HostHello` handling.
+pub struct ArcHostHelloHandler;
+
+impl ArcHostHelloHandler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ArcHostHelloHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RpcHandler for ArcHostHelloHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.hello"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let host_id = require_str(&params, "host_id")?.to_string();
+            let _auth_token = require_str(&params, "auth_token")?;
+            let protocol_version = match params
+                .get("protocol_version")
+                .and_then(|v| v.as_u64())
+            {
+                Some(n) if n <= u16::MAX as u64 => n as u16,
+                _ => {
+                    return Err(RpcError::invalid_params(
+                        "missing or invalid 'protocol_version' field",
+                    ));
+                }
+            };
+
+            if protocol_version != beacon_proto::PROTOCOL_VERSION {
+                return Err(RpcError::server_error(format!(
+                    "unsupported protocol version: {protocol_version} (relay speaks {})",
+                    beacon_proto::PROTOCOL_VERSION
+                )));
+            }
+
+            tracing::info!(
+                host_id = %host_id,
+                protocol_version,
+                "arc.host.hello accepted"
+            );
+            Ok(json!({
+                "ok": true,
+                "protocol_version": beacon_proto::PROTOCOL_VERSION,
+            }))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.session_register
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.session_register`.
+///
+/// Allocates an `ArcSessionEntry` for the registered session if one does not
+/// already exist. Emits no notification (matches msgpack — host registration
+/// is invisible to existing watchers). Phase F will wire this to
+/// `RelayRouter::register_session` + DB `create_session`.
+pub struct ArcHostSessionRegisterHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcHostSessionRegisterHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcHostSessionRegisterHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.session_register"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let name = require_str(&params, "name")?.to_string();
+
+            let _entry = self.store.get_or_create(&session_id).await;
+            tracing::info!(
+                session_id = %session_id,
+                name = %name,
+                "arc.host.session_register: entry allocated (in-rpc-layer)"
+            );
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.session_unregister
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.session_unregister`.
+///
+/// Idempotent: if the session entry exists, fires `arc.session.gone` with
+/// `reason: "host_unregistered"`. If missing, returns `{ok: true}` without
+/// notification — matches msgpack's no-error-on-missing semantic. Phase F will
+/// wire `RelayRouter::unregister_session` + DB state update + `mirror_registry`
+/// host_input_tx clear.
+pub struct ArcHostSessionUnregisterHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcHostSessionUnregisterHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcHostSessionUnregisterHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.session_unregister"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+
+            if let Some(entry) = self.store.get(&session_id).await {
+                emit_session_gone(&entry, "host_unregistered");
+                tracing::info!(
+                    session_id = %session_id,
+                    "arc.host.session_unregister: emitted arc.session.gone"
+                );
+            } else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    "arc.host.session_unregister: entry missing (idempotent no-op)"
+                );
+            }
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.block_start
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.block_start`.
+///
+/// Decodes the `BlockHeader` from `params.header` and re-broadcasts it via
+/// `emit_mirror_block_start` so subscribed watchers receive the
+/// `arc.mirror.block_start` notification (Phase B wire shape, locked by
+/// `block_header_json_shape_locked`).
+pub struct ArcHostBlockStartHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcHostBlockStartHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcHostBlockStartHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.block_start"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+
+            let header_value = params
+                .get("header")
+                .cloned()
+                .ok_or_else(|| RpcError::invalid_params("missing 'header' field"))?;
+            let header: beacon_model::BlockHeader = serde_json::from_value(header_value)
+                .map_err(|e| RpcError::invalid_params(format!("invalid 'header': {e}")))?;
+
+            emit_mirror_block_start(&entry, &header);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.block_chunk
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.block_chunk`.
+///
+/// Decodes base64 `data` and the ULID `block_id`, then re-broadcasts via
+/// `emit_mirror_block_chunk`. `seq` is forwarded verbatim for watcher-side
+/// gap detection.
+pub struct ArcHostBlockChunkHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcHostBlockChunkHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcHostBlockChunkHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.block_chunk"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let block_id_str = require_str(&params, "block_id")?;
+            let block_id: beacon_model::BlockId = block_id_str
+                .parse()
+                .map_err(|e| RpcError::invalid_params(format!("invalid 'block_id': {e}")))?;
+            let seq = params
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| RpcError::invalid_params("missing or invalid 'seq' field"))?;
+            let data_b64 = require_str(&params, "data")?;
+            let data = BASE64
+                .decode(data_b64)
+                .map_err(|e| RpcError::invalid_params(format!("data not valid base64: {e}")))?;
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+            emit_mirror_block_chunk(&entry, &block_id, seq, &data);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.block_end
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.block_end`.
+///
+/// Decodes the `BlockFooter` from `params.footer` and re-broadcasts via
+/// `emit_mirror_block_end` (Phase B wire shape).
+pub struct ArcHostBlockEndHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcHostBlockEndHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcHostBlockEndHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.block_end"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+
+            let footer_value = params
+                .get("footer")
+                .cloned()
+                .ok_or_else(|| RpcError::invalid_params("missing 'footer' field"))?;
+            let footer: beacon_model::BlockFooter = serde_json::from_value(footer_value)
+                .map_err(|e| RpcError::invalid_params(format!("invalid 'footer': {e}")))?;
+
+            emit_mirror_block_end(&entry, &footer);
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.session_resize
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.session_resize`.
+///
+/// Host-driven dimensions update. In-rpc-layer this is a wire stub that logs
+/// at debug and returns `{ok: true}`; Phase F will wire `RelayRouter::update_size`
+/// so subsequent watcher attaches see the new dims. No notification fires
+/// (msgpack also does not broadcast resize events to watchers).
+pub struct ArcHostSessionResizeHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcHostSessionResizeHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcHostSessionResizeHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.session_resize"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let cols = require_u32(&params, "cols")?;
+            let rows = require_u32(&params, "rows")?;
+
+            let Some(_entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+            tracing::debug!(
+                session_id = %session_id,
+                cols, rows,
+                "arc.host.session_resize: in-rpc-layer no-op (wired to RelayRouter in Phase F)"
+            );
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.push_output
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.push_output`.
+///
+/// Decodes base64 `data` and re-broadcasts as `arc.mirror.frame` to subscribed
+/// watchers. The host-supplied `seq` is echoed back in the result so the host
+/// can correlate; in-rpc-layer there is no scrollback ring (Phase F wires
+/// `MirrorRegistry::ScrollbackRing`).
+pub struct ArcHostPushOutputHandler {
+    store: ArcSessionStore,
+}
+
+impl ArcHostPushOutputHandler {
+    pub fn new(store: ArcSessionStore) -> Self {
+        Self { store }
+    }
+}
+
+impl RpcHandler for ArcHostPushOutputHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.push_output"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let seq = params
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| RpcError::invalid_params("missing or invalid 'seq' field"))?;
+            // Use as_str (not require_str) — empty string is valid base64 (zero bytes).
+            let data_b64 = params
+                .get("data")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| RpcError::invalid_params("missing 'data' field"))?;
+            let data = BASE64
+                .decode(data_b64)
+                .map_err(|e| RpcError::invalid_params(format!("data not valid base64: {e}")))?;
+
+            let Some(entry) = self.store.get(&session_id).await else {
+                return Err(RpcError::server_error(format!(
+                    "arc session not found: {session_id}"
+                )));
+            };
+            emit_mirror_frame(&entry, &data);
+            Ok(json!({"ok": true, "seq": seq}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// arc.host.shadow_diff_response
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handler for `arc.host.shadow_diff_response`.
+///
+/// Receives the host's diff payload for a previously-issued
+/// `arc.host.shadow_diff_request`. In-rpc-layer there is no waiter map
+/// (production has `RelayRouter::pending_shadow_diffs`); the handler logs at
+/// debug and returns `{ok: true}` so the wire shape is locked. Phase F wires
+/// the waiter side. The matching `emit_host_shadow_diff_request` helper is
+/// already in place (Task 2) so Phase F can plumb the request side without
+/// re-touching wire shapes.
+///
+/// Note: also accepts an `Option<String>` `diff` field to allow `null` for
+/// "host has no diff for this request" responses; required-string check would
+/// reject that. Wire spec uses plain string per `ClientToArc::ShadowDiffResponse`.
+pub struct ArcHostShadowDiffResponseHandler;
+
+impl ArcHostShadowDiffResponseHandler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ArcHostShadowDiffResponseHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RpcHandler for ArcHostShadowDiffResponseHandler {
+    fn method_name(&self) -> &'static str {
+        "arc.host.shadow_diff_response"
+    }
+
+    fn handle<'a>(&'a self, params: Value) -> BoxFuture<'a, Result<Value, RpcError>> {
+        Box::pin(async move {
+            let session_id = require_str(&params, "session_id")?.to_string();
+            let request_id = require_str(&params, "request_id")?.to_string();
+            // `diff` is required per the msgpack envelope, but allow empty string.
+            let _diff = params
+                .get("diff")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| RpcError::invalid_params("missing 'diff' field"))?;
+
+            tracing::debug!(
+                session_id = %session_id,
+                request_id = %request_id,
+                "arc.host.shadow_diff_response: in-rpc-layer no-op (wired to RelayRouter::pending_shadow_diffs in Phase F)"
+            );
+            Ok(json!({"ok": true}))
+        })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ArcMirrorEmitter — bridges MirrorRegistry::broadcast to arc.mirror.* notifs
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1034,10 +1517,11 @@ impl crate::mirror::fanout::BroadcastEmitter for ArcMirrorEmitter {
 // Registration helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build a fresh dispatcher with all ten arc.session.* handlers registered.
+/// Build a fresh dispatcher with all 19 arc.session.* + arc.host.* handlers registered.
 /// Mainly used in tests; production wires through [`register_if_enabled`].
 pub fn build_arc_session_dispatcher(store: ArcSessionStore) -> RpcDispatcher {
     let mut d = RpcDispatcher::new();
+    // Watcher surface (Phase A + B + C)
     d.register(ArcSessionAttachHandler::new(store.clone()));
     d.register(ArcSessionDetachHandler::new(store.clone()));
     d.register(ArcSessionSubscribeHandler::new(store.clone()));
@@ -1047,14 +1531,25 @@ pub fn build_arc_session_dispatcher(store: ArcSessionStore) -> RpcDispatcher {
     d.register(ArcSessionApproveControlHandler::new(store.clone()));
     d.register(ArcSessionDenyControlHandler::new(store.clone()));
     d.register(ArcSessionInputHandler::new(store.clone()));
-    d.register(ArcSessionResizeHandler::new(store));
+    d.register(ArcSessionResizeHandler::new(store.clone()));
+    // Host surface (Phase D)
+    d.register(ArcHostHelloHandler::new());
+    d.register(ArcHostSessionRegisterHandler::new(store.clone()));
+    d.register(ArcHostSessionUnregisterHandler::new(store.clone()));
+    d.register(ArcHostBlockStartHandler::new(store.clone()));
+    d.register(ArcHostBlockChunkHandler::new(store.clone()));
+    d.register(ArcHostBlockEndHandler::new(store.clone()));
+    d.register(ArcHostSessionResizeHandler::new(store.clone()));
+    d.register(ArcHostPushOutputHandler::new(store));
+    d.register(ArcHostShadowDiffResponseHandler::new());
     d
 }
 
-/// Register all ten arc.session.* handlers with `dispatcher` if
+/// Register all 19 arc.session.* + arc.host.* handlers with `dispatcher` if
 /// `JsonRpcSpine` is on. Returns `true` when handlers were registered.
 pub fn register_if_enabled(dispatcher: &mut RpcDispatcher, store: ArcSessionStore) -> bool {
     if beacon_features::is_enabled(beacon_features::FeatureFlag::JsonRpcSpine) {
+        // Watcher surface (Phase A + B + C)
         dispatcher.try_register(ArcSessionAttachHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionDetachHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionSubscribeHandler::new(store.clone()));
@@ -1064,7 +1559,17 @@ pub fn register_if_enabled(dispatcher: &mut RpcDispatcher, store: ArcSessionStor
         dispatcher.try_register(ArcSessionApproveControlHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionDenyControlHandler::new(store.clone()));
         dispatcher.try_register(ArcSessionInputHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionResizeHandler::new(store));
+        dispatcher.try_register(ArcSessionResizeHandler::new(store.clone()));
+        // Host surface (Phase D)
+        dispatcher.try_register(ArcHostHelloHandler::new());
+        dispatcher.try_register(ArcHostSessionRegisterHandler::new(store.clone()));
+        dispatcher.try_register(ArcHostSessionUnregisterHandler::new(store.clone()));
+        dispatcher.try_register(ArcHostBlockStartHandler::new(store.clone()));
+        dispatcher.try_register(ArcHostBlockChunkHandler::new(store.clone()));
+        dispatcher.try_register(ArcHostBlockEndHandler::new(store.clone()));
+        dispatcher.try_register(ArcHostSessionResizeHandler::new(store.clone()));
+        dispatcher.try_register(ArcHostPushOutputHandler::new(store));
+        dispatcher.try_register(ArcHostShadowDiffResponseHandler::new());
         true
     } else {
         false
@@ -1105,6 +1610,15 @@ mod tests {
         d.register(ArcSessionDenyControlHandler::new(store.clone()));
         d.register(ArcSessionInputHandler::new(store.clone()));
         d.register(ArcSessionResizeHandler::new(store.clone()));
+        d.register(ArcHostHelloHandler::new());
+        d.register(ArcHostSessionRegisterHandler::new(store.clone()));
+        d.register(ArcHostSessionUnregisterHandler::new(store.clone()));
+        d.register(ArcHostBlockStartHandler::new(store.clone()));
+        d.register(ArcHostBlockChunkHandler::new(store.clone()));
+        d.register(ArcHostBlockEndHandler::new(store.clone()));
+        d.register(ArcHostSessionResizeHandler::new(store.clone()));
+        d.register(ArcHostPushOutputHandler::new(store.clone()));
+        d.register(ArcHostShadowDiffResponseHandler::new());
         (store, d)
     }
 
@@ -1256,7 +1770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_arc_session_dispatcher_registers_ten_methods() {
+    async fn build_arc_session_dispatcher_registers_nineteen_methods() {
         let store = ArcSessionStore::new(8);
         let d = build_arc_session_dispatcher(store);
         let mut methods = d.registered_methods();
@@ -1264,6 +1778,15 @@ mod tests {
         assert_eq!(
             methods,
             vec![
+                "arc.host.block_chunk",
+                "arc.host.block_end",
+                "arc.host.block_start",
+                "arc.host.hello",
+                "arc.host.push_output",
+                "arc.host.session_register",
+                "arc.host.session_resize",
+                "arc.host.session_unregister",
+                "arc.host.shadow_diff_response",
                 "arc.session.approve_control",
                 "arc.session.attach",
                 "arc.session.control",
@@ -2160,5 +2683,528 @@ mod tests {
         );
         let resp = d.dispatch(req).await;
         assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn emit_host_shadow_diff_request_round_trip() {
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-shadow").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_host_shadow_diff_request(&entry, "req-abc");
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.host.shadow_diff_request");
+        assert_eq!(v["params"]["session_id"], "s-shadow");
+        assert_eq!(v["params"]["request_id"], "req-abc");
+    }
+
+    #[test]
+    fn host_shadow_diff_request_wire_shape_locked() {
+        use serde_json::json;
+
+        let n = beacon_jsonrpc::Notification::new(
+            "arc.host.shadow_diff_request",
+            json!({
+                "session_id": "s1",
+                "request_id": "req-001",
+            }),
+        );
+        let s = serde_json::to_string(&n).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(v["method"], "arc.host.shadow_diff_request");
+        let params = v["params"].as_object().expect("params is object");
+        let mut keys: Vec<&String> = params.keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["request_id", "session_id"],
+            "arc.host.shadow_diff_request wire keys drifted; sync MIGRATION.md Phase D + arc-web/Mac decoders",
+        );
+        assert!(params["request_id"].is_string());
+        assert!(params["session_id"].is_string());
+    }
+
+    // ── arc.host.hello ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_hello_returns_protocol_version() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.hello",
+            json!({
+                "host_id": "host-1",
+                "auth_token": "tok",
+                "protocol_version": beacon_proto::PROTOCOL_VERSION,
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        let result = resp.result().unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["protocol_version"], beacon_proto::PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn host_hello_rejects_mismatched_protocol_version() {
+        let (_s, d) = make_dispatcher();
+        let bad_version = beacon_proto::PROTOCOL_VERSION.wrapping_add(99);
+        let req = Request::new(
+            "arc.host.hello",
+            json!({
+                "host_id": "host-1",
+                "auth_token": "tok",
+                "protocol_version": bad_version,
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        let err = resp.err().unwrap();
+        assert!(
+            err.message.contains("protocol") || err.message.contains("unsupported"),
+            "expected protocol-version mismatch error, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_hello_missing_host_id_invalid_params() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.hello",
+            json!({"auth_token": "tok", "protocol_version": beacon_proto::PROTOCOL_VERSION}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn host_hello_missing_protocol_version_invalid_params() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.hello",
+            json!({"host_id": "host-1", "auth_token": "tok"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── arc.host.session_register ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_session_register_creates_entry() {
+        let (store, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.session_register",
+            json!({"session_id": "s-host-1", "name": "shell"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+        assert!(store.get("s-host-1").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn host_session_register_emits_no_notif() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-host-2").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.host.session_register",
+            json!({"session_id": "s-host-2", "name": "shell"}),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+
+        // Host-side register is silent on the watcher broadcast channel.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn host_session_register_missing_name_invalid_params() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.session_register",
+            json!({"session_id": "s1"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── arc.host.session_unregister ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_session_unregister_emits_session_gone() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-bye").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let req = Request::new(
+            "arc.host.session_unregister",
+            json!({"session_id": "s-bye"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.session.gone");
+        assert_eq!(v["params"]["session_id"], "s-bye");
+        assert_eq!(v["params"]["reason"], "host_unregistered");
+    }
+
+    #[tokio::test]
+    async fn host_session_unregister_missing_entry_idempotent_ok() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.session_unregister",
+            json!({"session_id": "ghost"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn host_session_unregister_missing_session_id_invalid_params() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.session_unregister",
+            json!({}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── arc.host.block_start ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_block_start_emits_mirror_block_start() {
+        use beacon_model::{BlockHeader, BlockId, HostInfo, SessionId, TabId};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::time::SystemTime;
+
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-block").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let header = BlockHeader {
+            id: BlockId::new(),
+            session_id: SessionId::new(),
+            tab_id: TabId::new(),
+            command: "echo hi".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            started_at: SystemTime::UNIX_EPOCH,
+            env_snapshot: HashMap::new(),
+            host_info: HostInfo::current(),
+        };
+        let header_json = serde_json::to_value(&header).unwrap();
+
+        let req = Request::new(
+            "arc.host.block_start",
+            json!({"session_id": "s-block", "header": header_json}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.block_start");
+        assert_eq!(v["params"]["session_id"], "s-block");
+        assert_eq!(v["params"]["header"]["command"], "echo hi");
+    }
+
+    #[tokio::test]
+    async fn host_block_start_unknown_session_server_error() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.block_start",
+            json!({"session_id": "ghost", "header": {}}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn host_block_start_invalid_header_invalid_params() {
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-block").await;
+        let req = Request::new(
+            "arc.host.block_start",
+            json!({"session_id": "s-block", "header": "not-an-object"}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── arc.host.block_chunk ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_block_chunk_emits_mirror_block_chunk() {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+        use beacon_model::BlockId;
+
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-chunk").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let block_id = BlockId::new();
+        let payload = b"output bytes".to_vec();
+
+        let req = Request::new(
+            "arc.host.block_chunk",
+            json!({
+                "session_id": "s-chunk",
+                "block_id": block_id.to_string(),
+                "seq": 42u64,
+                "data": BASE64.encode(&payload),
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.block_chunk");
+        assert_eq!(v["params"]["session_id"], "s-chunk");
+        assert_eq!(v["params"]["block_id"], block_id.to_string());
+        assert_eq!(v["params"]["seq"], 42);
+        let echoed_b64 = v["params"]["data"].as_str().unwrap();
+        let echoed = BASE64.decode(echoed_b64).unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    #[tokio::test]
+    async fn host_block_chunk_invalid_block_id_invalid_params() {
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-chunk").await;
+        let req = Request::new(
+            "arc.host.block_chunk",
+            json!({"session_id": "s-chunk", "block_id": "not-a-ulid", "seq": 0u64, "data": ""}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    #[tokio::test]
+    async fn host_block_chunk_invalid_data_invalid_params() {
+        use beacon_model::BlockId;
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-chunk").await;
+        let req = Request::new(
+            "arc.host.block_chunk",
+            json!({
+                "session_id": "s-chunk",
+                "block_id": BlockId::new().to_string(),
+                "seq": 0u64,
+                "data": "not_base64!!!",
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── arc.host.block_end ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_block_end_emits_mirror_block_end() {
+        use beacon_model::{BlockFooter, BlockId};
+        use std::time::SystemTime;
+
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-bend").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let footer = BlockFooter {
+            id: BlockId::new(),
+            exit_code: Some(0),
+            ended_at: SystemTime::UNIX_EPOCH,
+            shadow_git_ref: None,
+        };
+        let footer_json = serde_json::to_value(&footer).unwrap();
+
+        let req = Request::new(
+            "arc.host.block_end",
+            json!({"session_id": "s-bend", "footer": footer_json}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.block_end");
+        assert_eq!(v["params"]["session_id"], "s-bend");
+        assert_eq!(v["params"]["footer"]["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn host_block_end_invalid_footer_invalid_params() {
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-bend").await;
+        let req = Request::new(
+            "arc.host.block_end",
+            json!({"session_id": "s-bend", "footer": 123}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── arc.host.session_resize ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_session_resize_returns_ok() {
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-resize").await;
+        let req = Request::new(
+            "arc.host.session_resize",
+            json!({"session_id": "s-resize", "cols": 120u32, "rows": 40u32}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn host_session_resize_unknown_session_server_error() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.session_resize",
+            json!({"session_id": "ghost", "cols": 80u32, "rows": 24u32}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn host_session_resize_emits_no_notif() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-resize").await;
+        let mut rx = entry.notif_tx.subscribe();
+        let req = Request::new(
+            "arc.host.session_resize",
+            json!({"session_id": "s-resize", "cols": 80u32, "rows": 24u32}),
+            1i64,
+        );
+        assert!(d.dispatch(req).await.is_success());
+        // Host-driven resize is not broadcast to watchers in msgpack either.
+        assert!(rx.try_recv().is_err());
+    }
+
+    // ── arc.host.push_output ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_push_output_emits_mirror_frame() {
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine as _;
+
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-push").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        let payload = b"PTY output \x1b[31mred\x1b[0m".to_vec();
+        let req = Request::new(
+            "arc.host.push_output",
+            json!({
+                "session_id": "s-push",
+                "data": BASE64.encode(&payload),
+                "seq": 7u64,
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        let result = resp.result().unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["seq"], 7);
+
+        let raw = rx.recv().await.expect("notif");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.frame");
+        let echoed = BASE64.decode(v["params"]["data"].as_str().unwrap()).unwrap();
+        assert_eq!(echoed, payload);
+    }
+
+    #[tokio::test]
+    async fn host_push_output_unknown_session_server_error() {
+        let (_s, d) = make_dispatcher();
+        let req = Request::new(
+            "arc.host.push_output",
+            json!({"session_id": "ghost", "data": "", "seq": 0u64}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn host_push_output_invalid_base64_invalid_params() {
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-push").await;
+        let req = Request::new(
+            "arc.host.push_output",
+            json!({"session_id": "s-push", "data": "@@@", "seq": 0u64}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
+    }
+
+    // ── arc.host.shadow_diff_response ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn host_shadow_diff_response_silent_ok() {
+        let (store, d) = make_dispatcher();
+        let entry = store.get_or_create("s-diff").await;
+        let mut rx = entry.notif_tx.subscribe();
+        let req = Request::new(
+            "arc.host.shadow_diff_response",
+            json!({
+                "session_id": "s-diff",
+                "request_id": "req-001",
+                "diff": "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y",
+            }),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert!(resp.is_success(), "{:?}", resp.err());
+        assert_eq!(resp.result().unwrap()["ok"], true);
+        // No notif on the watcher channel — diff is host→relay, response is consumed
+        // by the (Phase F) waiter map, not echoed.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn host_shadow_diff_response_missing_request_id_invalid_params() {
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-diff").await;
+        let req = Request::new(
+            "arc.host.shadow_diff_response",
+            json!({"session_id": "s-diff", "diff": ""}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        assert_eq!(resp.err().unwrap().code, -32602);
     }
 }
