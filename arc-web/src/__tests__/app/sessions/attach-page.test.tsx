@@ -1,12 +1,12 @@
 /**
- * Tests for the /sessions/[id] attach page — mirror-mode control events.
+ * Tests for the /sessions/[id] attach page — JSON-RPC wire protocol.
  *
- * Strategy: mock useWebSocket so tests can drive inbound messages and assert
- * outbound frames, without a real WebSocket or relay server.
+ * Strategy: mock useArcJsonRpc so tests can drive inbound notifications and
+ * assert outbound JSON-RPC requests, without a real WebSocket or relay server.
  */
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
-import type { ArcToClient, ClientToArc } from "@/types/protocol";
+import type { Notification } from "@/lib/jsonrpc-ws";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -36,43 +36,53 @@ vi.mock("@/components/blocks/block-list", () => ({
 vi.mock("@/components/session/shadow-diff-panel", () => ({
   ShadowDiffPanel: () => <div data-testid="shadow-diff-panel" />,
 }));
-vi.mock("@/components/session/control-bar", () => ({
-  ControlBar: () => <div data-testid="control-bar-stub" />,
-}));
 
-// Capture onMessage and send from useWebSocket
-let capturedOnMessage: ((msg: ArcToClient) => void) | null = null;
-let capturedSend: Mock = vi.fn();
+// Mock atob/btoa for jsdom — provide a real implementation so b64ToBytes works.
+if (typeof global.atob === "undefined") {
+  global.atob = (s: string) => Buffer.from(s, "base64").toString("binary");
+}
+if (typeof global.btoa === "undefined") {
+  global.btoa = (s: string) => Buffer.from(s, "binary").toString("base64");
+}
 
-vi.mock("@/hooks/use-websocket", () => ({
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  useWebSocket: (_sessionId: string | null, onMessage: (msg: ArcToClient) => void) => {
-    capturedOnMessage = onMessage;
-    return { state: "connected", send: capturedSend };
+// Capture onNotification and request from useArcJsonRpc.
+let capturedOnNotification: ((notif: Notification) => void) | null = null;
+let capturedRequest: Mock = vi.fn(() => Promise.resolve(null));
+
+vi.mock("@/hooks/use-arc-jsonrpc", () => ({
+  useArcJsonRpc: (options: {
+    onNotification?: (notif: Notification) => void;
+    onConnect?: (client: unknown) => void | Promise<void>;
+    enabled?: boolean;
+    url?: string;
+    token?: string | null;
+  }) => {
+    capturedOnNotification = options.onNotification ?? null;
+    return { state: "connected", request: capturedRequest };
   },
 }));
 
-// Minimal useBlocks stub — the block replay path is not under test here
-vi.mock("@/hooks/use-blocks", () => ({
-  useBlocks: () => ({
-    blocks: [],
-    replaying: false,
-    replayTotal: 0,
-    replayLoaded: 0,
-    handleMessage: vi.fn(),
-  }),
+// Mock getAccessToken so the page can construct the hook without localStorage.
+vi.mock("@/lib/auth", () => ({
+  getAccessToken: () => "test-token",
 }));
 
-// Import AFTER mocks
+// Mock getWsUrl so the page gets a deterministic URL.
+vi.mock("@/lib/config", () => ({
+  getWsUrl: () => "ws://localhost:9999/ws",
+}));
+
+// Import AFTER mocks are established
 import AttachPage from "@/app/(protected)/sessions/[id]/page";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function dispatch(msg: ArcToClient) {
+/** Push a JSON-RPC notification into the page's onNotification handler. */
+function dispatchNotif(notif: Notification) {
   act(() => {
-    capturedOnMessage!(msg);
+    capturedOnNotification!(notif);
   });
 }
 
@@ -83,140 +93,136 @@ const OTHER_ID = "sess-other";
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("SessionAttachPage — mirror control events", () => {
+describe("SessionAttachPage — JSON-RPC mirror control events", () => {
   beforeEach(() => {
-    capturedOnMessage = null;
-    capturedSend = vi.fn();
+    capturedOnNotification = null;
+    capturedRequest = vi.fn(() => Promise.resolve(null));
     mockPush.mockReset();
     mockXtermWrite.mockReset();
   });
 
-  // ── ControlRequested ───────────────────────────────────────────────────────
+  // ── arc.session.control_requested ────────────────────────────────────────
 
-  it("renders a control-request banner when ControlRequested arrives", () => {
+  it("renders a control-request banner when arc.session.control_requested arrives", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: SESSION_ID,
         request_id: "req-1",
-        from_user: "alice",
-        from_device: "Alice's Mac",
+        requester_id: "alice",
+        requester_name: "Alice's Mac",
       },
     });
     expect(screen.getByText(/Alice's Mac/i)).toBeInTheDocument();
-    // from_user appears in a <span> by itself — check with exact text
     expect(screen.getByText("alice")).toBeInTheDocument();
   });
 
   it("renders multiple pending requests simultaneously", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: SESSION_ID,
         request_id: "req-1",
-        from_user: "alice",
-        from_device: "Alice's Mac",
+        requester_id: "alice",
+        requester_name: "Alice's Mac",
       },
     });
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: SESSION_ID,
         request_id: "req-2",
-        from_user: "bob",
-        from_device: "Bob's PC",
+        requester_id: "bob",
+        requester_name: "Bob's PC",
       },
     });
     expect(screen.getByText(/Alice's Mac/i)).toBeInTheDocument();
     expect(screen.getByText(/Bob's PC/i)).toBeInTheDocument();
   });
 
-  it("Grant sends ApproveControl and removes request from banner", () => {
+  it("Grant sends arc.session.approve_control and removes request from banner", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: SESSION_ID,
         request_id: "req-1",
-        from_user: "alice",
-        from_device: "Alice's Mac",
+        requester_id: "alice",
+        requester_name: "Alice's Mac",
       },
     });
     const grantBtn = screen.getByRole("button", { name: /grant/i });
     fireEvent.click(grantBtn);
 
-    // Sent correct frame
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const approve = calls.find(
-      (c) => c.kind === "ApproveControl",
-    ) as Extract<ClientToArc, { kind: "ApproveControl" }> | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const approve = calls.find(([method]) => method === "arc.session.approve_control");
     expect(approve).toBeDefined();
-    expect(approve!.data.session_id).toBe(SESSION_ID);
-    expect(approve!.data.request_id).toBe("req-1");
+    expect(approve![1].session_id).toBe(SESSION_ID);
+    expect(approve![1].request_id).toBe("req-1");
+    expect(approve![1].requester_id).toBe("alice");
 
     // Request removed from UI
     expect(screen.queryByText(/Alice's Mac/i)).toBeNull();
   });
 
-  it("Deny sends DenyControl and removes request from banner", () => {
+  it("Deny sends arc.session.deny_control and removes request from banner", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: SESSION_ID,
         request_id: "req-1",
-        from_user: "alice",
-        from_device: "Alice's Mac",
+        requester_id: "alice",
+        requester_name: "Alice's Mac",
       },
     });
     const denyBtn = screen.getByRole("button", { name: /deny/i });
     fireEvent.click(denyBtn);
 
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const deny = calls.find(
-      (c) => c.kind === "DenyControl",
-    ) as Extract<ClientToArc, { kind: "DenyControl" }> | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const deny = calls.find(([method]) => method === "arc.session.deny_control");
     expect(deny).toBeDefined();
-    expect(deny!.data.session_id).toBe(SESSION_ID);
-    expect(deny!.data.request_id).toBe("req-1");
+    expect(deny![1].session_id).toBe(SESSION_ID);
+    expect(deny![1].request_id).toBe("req-1");
+    expect(deny![1].requester_id).toBe("alice");
 
     expect(screen.queryByText(/Alice's Mac/i)).toBeNull();
   });
 
-  it("ignores ControlRequested for a different session_id", () => {
+  it("ignores arc.session.control_requested for a different session_id", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: OTHER_ID,
         request_id: "req-x",
-        from_user: "ghost",
-        from_device: "Ghost's Machine",
+        requester_id: "ghost",
+        requester_name: "Ghost's Machine",
       },
     });
     expect(screen.queryByText(/Ghost's Machine/i)).toBeNull();
   });
 
-  it("dedupes ControlRequested by request_id", () => {
+  it("dedupes arc.session.control_requested by request_id", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: SESSION_ID,
         request_id: "req-dup",
-        from_user: "alice",
-        from_device: "Alice's Mac",
+        requester_id: "alice",
+        requester_name: "Alice's Mac",
       },
     });
-    dispatch({
-      kind: "ControlRequested",
-      data: {
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: {
         session_id: SESSION_ID,
         request_id: "req-dup",
-        from_user: "alice-2",
-        from_device: "Alice's Other Mac",
+        requester_id: "alice-2",
+        requester_name: "Alice's Other Mac",
       },
     });
     const banners = screen.getAllByTestId("control-request-banner");
@@ -225,24 +231,22 @@ describe("SessionAttachPage — mirror control events", () => {
 
   it("correctly handles Grant for one of multiple pending requests", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "ControlRequested",
-      data: { session_id: SESSION_ID, request_id: "req-1", from_user: "alice", from_device: "Alice's Mac" },
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: { session_id: SESSION_ID, request_id: "req-1", requester_id: "alice", requester_name: "Alice's Mac" },
     });
-    dispatch({
-      kind: "ControlRequested",
-      data: { session_id: SESSION_ID, request_id: "req-2", from_user: "bob", from_device: "Bob's PC" },
+    dispatchNotif({
+      method: "arc.session.control_requested",
+      params: { session_id: SESSION_ID, request_id: "req-2", requester_id: "bob", requester_name: "Bob's PC" },
     });
 
     // Grant only Alice's request (first Grant button in DOM)
     const grantBtns = screen.getAllByRole("button", { name: /grant/i });
     fireEvent.click(grantBtns[0]); // Alice's
 
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const approve = calls.find(
-      (c) => c.kind === "ApproveControl",
-    ) as Extract<ClientToArc, { kind: "ApproveControl" }> | undefined;
-    expect(approve!.data.request_id).toBe("req-1");
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const approve = calls.find(([method]) => method === "arc.session.approve_control");
+    expect(approve![1].request_id).toBe("req-1");
 
     // Bob's request still visible
     expect(screen.getByText(/Bob's PC/i)).toBeInTheDocument();
@@ -250,106 +254,105 @@ describe("SessionAttachPage — mirror control events", () => {
     expect(screen.queryByText(/Alice's Mac/i)).toBeNull();
   });
 
-  // ── LeaseChanged ───────────────────────────────────────────────────────────
+  // ── arc.mirror.control_grant ──────────────────────────────────────────────
 
-  it("shows driver indicator when LeaseChanged arrives with a non-null driver", () => {
+  it("shows driver indicator when arc.mirror.control_grant arrives", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "alice", device_label: "Alice's Mac", since: 1000 },
+        controller_id: "alice",
+        controller_name: "Alice's Mac",
       },
     });
     expect(screen.getByTestId("driver-indicator")).toBeInTheDocument();
     expect(screen.getByText(/Alice's Mac/i)).toBeInTheDocument();
   });
 
-  it("hides driver indicator when LeaseChanged arrives with null driver", () => {
+  it("hides driver indicator when arc.mirror.control_revoke arrives with null driver", () => {
     render(<AttachPage />);
     // First set a driver
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "alice", device_label: "Alice's Mac", since: 1000 },
+        controller_id: "alice",
+        controller_name: "Alice's Mac",
       },
     });
     expect(screen.getByTestId("driver-indicator")).toBeInTheDocument();
 
-    // Clear the driver
-    dispatch({
-      kind: "LeaseChanged",
-      data: { session_id: SESSION_ID, driver: null },
+    // Revoke the driver
+    dispatchNotif({
+      method: "arc.mirror.control_revoke",
+      params: { session_id: SESSION_ID },
     });
     expect(screen.queryByTestId("driver-indicator")).toBeNull();
   });
 
   it("shows Revoke Control button when driver is non-null", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "alice", device_label: "Alice's Mac", since: 1000 },
+        controller_id: "alice",
+        controller_name: "Alice's Mac",
       },
     });
     expect(screen.getByRole("button", { name: /revoke control/i })).toBeInTheDocument();
   });
 
-  it("hides Revoke Control button when driver is null", () => {
+  it("hides Revoke Control button when no driver", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: { session_id: SESSION_ID, driver: null },
-    });
     expect(screen.queryByRole("button", { name: /revoke control/i })).toBeNull();
   });
 
-  it("clicking Revoke Control sends RevokeControl", () => {
+  it("clicking Revoke Control sends arc.session.release", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "alice", device_label: "Alice's Mac", since: 1000 },
+        controller_id: "alice",
+        controller_name: "Alice's Mac",
       },
     });
     const revokeBtn = screen.getByRole("button", { name: /revoke control/i });
     fireEvent.click(revokeBtn);
 
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const revoke = calls.find(
-      (c) => c.kind === "RevokeControl",
-    ) as Extract<ClientToArc, { kind: "RevokeControl" }> | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const revoke = calls.find(([method]) => method === "arc.session.release");
     expect(revoke).toBeDefined();
-    expect(revoke!.data.session_id).toBe(SESSION_ID);
+    expect(revoke![1].session_id).toBe(SESSION_ID);
   });
 
-  it("ignores LeaseChanged for a different session_id", () => {
+  it("ignores arc.mirror.control_grant for a different session_id", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: OTHER_ID,
-        driver: { user_id: "ghost", device_label: "Ghost's PC", since: 1000 },
+        controller_id: "ghost",
+        controller_name: "Ghost's PC",
       },
     });
     expect(screen.queryByTestId("driver-indicator")).toBeNull();
     expect(screen.queryByRole("button", { name: /revoke control/i })).toBeNull();
   });
 
-  // ── PresenceChanged ────────────────────────────────────────────────────────
+  // ── arc.session.participant ───────────────────────────────────────────────
 
-  it("shows watcher count when PresenceChanged arrives", () => {
+  it("shows watcher count when arc.session.participant arrives", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "PresenceChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.session.participant",
+      params: {
         session_id: SESSION_ID,
-        watchers: [
-          { user_id: "u1", device_label: "Alice's Mac", can_drive: true },
-          { user_id: "u2", device_label: "Bob's PC", can_drive: false },
+        participants: [
+          { user_id: "u1", user_name: "Alice's Mac", role: "observer" },
+          { user_id: "u2", user_name: "Bob's PC", role: "observer" },
         ],
       },
     });
@@ -359,47 +362,112 @@ describe("SessionAttachPage — mirror control events", () => {
 
   it("hides watcher count when watchers list is empty", () => {
     render(<AttachPage />);
-    // Initially no watchers — no badge
     expect(screen.queryByTestId("watcher-count")).toBeNull();
   });
 
-  it("updates watcher count when PresenceChanged fires again", () => {
+  it("updates watcher count when arc.session.participant fires again", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "PresenceChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.session.participant",
+      params: {
         session_id: SESSION_ID,
-        watchers: [
-          { user_id: "u1", device_label: "Alice's Mac", can_drive: true },
+        participants: [
+          { user_id: "u1", user_name: "Alice's Mac", role: "observer" },
         ],
       },
     });
     expect(screen.getByText(/1 watching/i)).toBeInTheDocument();
 
-    dispatch({
-      kind: "PresenceChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.session.participant",
+      params: {
         session_id: SESSION_ID,
-        watchers: [
-          { user_id: "u1", device_label: "Alice's Mac", can_drive: true },
-          { user_id: "u2", device_label: "Bob's PC", can_drive: false },
+        participants: [
+          { user_id: "u1", user_name: "Alice's Mac", role: "observer" },
+          { user_id: "u2", user_name: "Bob's PC", role: "observer" },
         ],
       },
     });
     expect(screen.getByText(/2 watching/i)).toBeInTheDocument();
   });
 
-  it("ignores PresenceChanged for a different session_id", () => {
+  it("ignores arc.session.participant for a different session_id", () => {
     render(<AttachPage />);
-    dispatch({
-      kind: "PresenceChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.session.participant",
+      params: {
         session_id: OTHER_ID,
-        watchers: [
-          { user_id: "u99", device_label: "Ghost", can_drive: false },
+        participants: [
+          { user_id: "u99", user_name: "Ghost", role: "observer" },
         ],
       },
     });
     expect(screen.queryByTestId("watcher-count")).toBeNull();
+  });
+
+  // ── arc.session.gone ──────────────────────────────────────────────────────
+
+  it("redirects to /sessions when arc.session.gone arrives", () => {
+    render(<AttachPage />);
+    dispatchNotif({
+      method: "arc.session.gone",
+      params: { session_id: SESSION_ID },
+    });
+    expect(mockPush).toHaveBeenCalledWith("/sessions");
+  });
+
+  it("ignores arc.session.gone for a different session_id", () => {
+    render(<AttachPage />);
+    dispatchNotif({
+      method: "arc.session.gone",
+      params: { session_id: OTHER_ID },
+    });
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
+  // ── arc.mirror.block_chunk → xterm write ──────────────────────────────────
+
+  it("writes arc.mirror.block_chunk decoded bytes to xterm", () => {
+    render(<AttachPage />);
+    const bytes = new Uint8Array([0x68, 0x69]); // "hi"
+    const b64 = btoa(String.fromCharCode(...bytes));
+    dispatchNotif({
+      method: "arc.mirror.block_chunk",
+      params: {
+        session_id: SESSION_ID,
+        block_id: "blk-1",
+        seq: 0,
+        data: b64,
+      },
+    });
+    expect(mockXtermWrite).toHaveBeenCalled();
+    const arg = mockXtermWrite.mock.calls[0][0];
+    expect(arg).toBeInstanceOf(Uint8Array);
+    expect(arg).toEqual(new Uint8Array([0x68, 0x69]));
+  });
+
+  it("ignores arc.mirror.block_chunk for a different session_id", () => {
+    render(<AttachPage />);
+    dispatchNotif({
+      method: "arc.mirror.block_chunk",
+      params: {
+        session_id: OTHER_ID,
+        block_id: "blk-x",
+        seq: 0,
+        data: btoa("a"),
+      },
+    });
+    expect(mockXtermWrite).not.toHaveBeenCalled();
+  });
+
+  // ── Unmount: arc.session.detach ───────────────────────────────────────────
+
+  it("sends arc.session.detach on unmount", () => {
+    const { unmount } = render(<AttachPage />);
+    unmount();
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const detach = calls.find(([method]) => method === "arc.session.detach");
+    expect(detach).toBeDefined();
+    expect(detach![1].session_id).toBe(SESSION_ID);
   });
 });

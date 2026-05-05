@@ -322,6 +322,34 @@ Phase E migrates the arc-web TS client to `JsonRpcWsClient`. Phase F migrates
 the Mac client (`beacon-net::ArcConnection`). Phase G deletes the msgpack
 envelope.
 
+### Arc surface — Phase E (arc-web wire migration)
+
+Switches arc-web's `/sessions/[id]` (attach) and `/sessions/[id]/watch`
+(mirror) pages from the msgpack `useWebSocket` hook to the new
+`useArcJsonRpc` hook backed by `JsonRpcWsClient`. **TS-only.** Server side
+unchanged. Msgpack stack (`ws.ts`, `use-websocket.ts`, `protocol.ts`) stays
+in tree — orphaned but available for the Mac client cut-over (Phase F)
+which does not touch arc-web. Phase G deletes msgpack on both sides.
+
+#### What moved
+
+| Page | Method calls | Notifications consumed |
+|------|--------------|------------------------|
+| `/sessions/[id]` | `arc.session.{attach,detach,input,resize,control,release,approve_control,deny_control}` | `arc.mirror.{block_*,replay_*,control_{grant,revoke}}`, `arc.session.{participant,control_requested,gone}` |
+| `/sessions/[id]/watch` | `arc.session.{subscribe,unsubscribe,control,release,approve_control,deny_control}` | `arc.mirror.{frame,discontinuity,host_input,control_{grant,revoke}}`, `arc.session.{participant,revoked,control_requested}` |
+
+#### Block decoding on /watch
+
+Mirror stream still feeds the `arc-web-blocks` WASM detector. Bytes now
+arrive base64-encoded in `arc.mirror.frame.data`; the page does
+`atob` → `Uint8Array` → existing `useMirrorBlocks.feedBytes(...)`. No
+WASM-side changes.
+
+#### What ships next
+
+Phase F migrates the Mac client (`beacon-net::ArcConnection`). Phase G
+deletes the msgpack envelope on both sides.
+
 ---
 
 ## 3. beacon-remote  (SSH transport)

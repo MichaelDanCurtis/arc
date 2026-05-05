@@ -1,12 +1,12 @@
 /**
  * Tests for the /sessions/[id]/watch view-only mirror page.
  *
- * Strategy: mock useWebSocket so tests can drive messages and inspect
- * what `send` was called with, without a real WebSocket.
+ * Strategy: mock useArcJsonRpc so tests can drive notifications and inspect
+ * what `request` was called with, without a real WebSocket.
  */
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
-import type { ArcToClient, ClientToArc } from "@/types/protocol";
+import type { Notification } from "@/lib/jsonrpc-ws";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -41,17 +41,41 @@ vi.mock("@/components/terminal/xterm-wrapper", () => ({
   }),
 }));
 
-// Capture onMessage from useWebSocket so tests can drive inbound messages.
-// Also capture send so tests can assert outbound frames.
-let capturedOnMessage: ((msg: ArcToClient) => void) | null = null;
-let capturedSend: Mock = vi.fn();
+// Mock atob/btoa for jsdom — provide a real implementation so b64ToBytes works.
+// jsdom includes these, but vitest running in Node may not. Provide a safe shim.
+if (typeof global.atob === "undefined") {
+  global.atob = (s: string) => Buffer.from(s, "base64").toString("binary");
+}
+if (typeof global.btoa === "undefined") {
+  global.btoa = (s: string) => Buffer.from(s, "binary").toString("base64");
+}
 
-vi.mock("@/hooks/use-websocket", () => ({
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  useWebSocket: (_sessionId: string | null, onMessage: (msg: ArcToClient) => void, _mode: string) => {
-    capturedOnMessage = onMessage;
-    return { state: "connected", send: capturedSend };
+// Capture onNotification from useArcJsonRpc so tests can drive inbound notifs.
+// Also capture request so tests can assert outbound JSON-RPC calls.
+let capturedOnNotification: ((notif: Notification) => void) | null = null;
+let capturedRequest: Mock = vi.fn();
+
+vi.mock("@/hooks/use-arc-jsonrpc", () => ({
+  useArcJsonRpc: (options: {
+    onNotification?: (notif: Notification) => void;
+    onConnect?: (client: unknown) => void | Promise<void>;
+    enabled?: boolean;
+    url?: string;
+    token?: string | null;
+  }) => {
+    capturedOnNotification = options.onNotification ?? null;
+    return { state: "connected", request: capturedRequest };
   },
+}));
+
+// Mock getAccessToken so the page can construct the hook without localStorage.
+vi.mock("@/lib/auth", () => ({
+  getAccessToken: () => "test-token",
+}));
+
+// Mock getWsUrl so the page gets a deterministic URL.
+vi.mock("@/lib/config", () => ({
+  getWsUrl: () => "ws://localhost:9999/ws",
 }));
 
 // Import AFTER mocks are established
@@ -61,9 +85,10 @@ import WatchPage from "@/app/(protected)/sessions/[id]/watch/page";
 // Helpers
 // ---------------------------------------------------------------------------
 
-function dispatch(msg: ArcToClient) {
+/** Push a JSON-RPC notification into the page's onNotification handler. */
+function dispatchNotif(notif: Notification) {
   act(() => {
-    capturedOnMessage!(msg);
+    capturedOnNotification!(notif);
   });
 }
 
@@ -76,8 +101,8 @@ const OTHER_ID = "sess-other";
 
 describe("WatchPage", () => {
   beforeEach(() => {
-    capturedOnMessage = null;
-    capturedSend = vi.fn();
+    capturedOnNotification = null;
+    capturedRequest = vi.fn();
     mockPush.mockReset();
     mockXtermWrite.mockReset();
     mockXtermProps = {};
@@ -92,45 +117,58 @@ describe("WatchPage", () => {
     expect(mockPush).toHaveBeenCalledWith("/sessions");
   });
 
-  // ── LeaseChanged ─────────────────────────────────────────────────────────
+  // ── arc.mirror.control_grant ─────────────────────────────────────────────
 
-  it("shows driver label when LeaseChanged arrives with a driver", () => {
+  it("shows driver label when arc.mirror.control_grant arrives", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     expect(screen.getByText(/MacBook Pro/i)).toBeInTheDocument();
   });
 
-  it("shows 'No driver' when LeaseChanged arrives with null driver", () => {
+  it("shows 'No driver' when arc.mirror.control_revoke arrives", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: { session_id: SESSION_ID, driver: null },
+    // First establish a driver
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
+        session_id: SESSION_ID,
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
+      },
+    });
+    // Then revoke
+    dispatchNotif({
+      method: "arc.mirror.control_revoke",
+      params: { session_id: SESSION_ID },
     });
     expect(screen.getByText(/no driver/i)).toBeInTheDocument();
   });
 
-  it("ignores LeaseChanged for a different session_id", () => {
+  it("ignores arc.mirror.control_grant for a different session_id", () => {
     render(<WatchPage />);
-    // First set a driver
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    // First set a driver for our session
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
-    // Then receive a LeaseChanged for a different session — driver stays
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    // Then receive a grant for a different session — driver name stays
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: OTHER_ID,
-        driver: { user_id: "u2", device_label: "ThinkPad", since: 2000 },
+        controller_id: "u2",
+        controller_name: "ThinkPad",
       },
     });
     // Still shows original driver, not ThinkPad
@@ -138,17 +176,17 @@ describe("WatchPage", () => {
     expect(screen.getByText(/MacBook Pro/i)).toBeInTheDocument();
   });
 
-  // ── PresenceChanged ───────────────────────────────────────────────────────
+  // ── arc.session.participant ───────────────────────────────────────────────
 
-  it("renders each watcher when PresenceChanged arrives", () => {
+  it("renders each watcher when arc.session.participant arrives", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "PresenceChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.session.participant",
+      params: {
         session_id: SESSION_ID,
-        watchers: [
-          { user_id: "u1", device_label: "Alice's Mac", can_drive: true },
-          { user_id: "u2", device_label: "Bob's PC", can_drive: false },
+        participants: [
+          { user_id: "u1", user_name: "Alice's Mac", role: "observer" },
+          { user_id: "u2", user_name: "Bob's PC", role: "observer" },
         ],
       },
     });
@@ -156,137 +194,135 @@ describe("WatchPage", () => {
     expect(screen.getByText(/Bob's PC/i)).toBeInTheDocument();
   });
 
-  it("ignores PresenceChanged for a different session_id", () => {
+  it("ignores arc.session.participant for a different session_id", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "PresenceChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.session.participant",
+      params: {
         session_id: OTHER_ID,
-        watchers: [
-          { user_id: "u99", device_label: "Ghost", can_drive: false },
+        participants: [
+          { user_id: "u99", user_name: "Ghost", role: "observer" },
         ],
       },
     });
     expect(screen.queryByText(/Ghost/i)).toBeNull();
   });
 
-  // ── SessionRevoked ────────────────────────────────────────────────────────
+  // ── arc.session.revoked ────────────────────────────────────────────────────
 
   it("shows revocation banner with the reason", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "SessionRevoked",
-      data: { session_id: SESSION_ID, reason: "host stopped sharing" },
+    dispatchNotif({
+      method: "arc.session.revoked",
+      params: { session_id: SESSION_ID, reason: "host stopped sharing" },
     });
     expect(screen.getByText(/host stopped sharing/i)).toBeInTheDocument();
   });
 
   it("revoked banner contains a link back to /sessions", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "SessionRevoked",
-      data: { session_id: SESSION_ID, reason: "access revoked" },
+    dispatchNotif({
+      method: "arc.session.revoked",
+      params: { session_id: SESSION_ID, reason: "access revoked" },
     });
     const backLink = screen.getByRole("button", { name: /back to sessions/i });
     fireEvent.click(backLink);
     expect(mockPush).toHaveBeenCalledWith("/sessions");
   });
 
-  it("ignores SessionRevoked for a different session_id", () => {
+  it("ignores arc.session.revoked for a different session_id", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "SessionRevoked",
-      data: { session_id: OTHER_ID, reason: "oops" },
+    dispatchNotif({
+      method: "arc.session.revoked",
+      params: { session_id: OTHER_ID, reason: "oops" },
     });
     expect(screen.queryByText(/oops/i)).toBeNull();
   });
 
-  // ── SessionDiscontinuity ──────────────────────────────────────────────────
+  // ── arc.mirror.discontinuity ──────────────────────────────────────────────
 
-  it("sends SubscribeSession with last seen seq on SessionDiscontinuity", () => {
+  it("sends arc.session.subscribe with last seen seq on arc.mirror.discontinuity", () => {
     render(<WatchPage />);
-    // Deliver some SessionOutput to establish last_seen_seq
-    dispatch({
-      kind: "SessionOutput",
-      data: { session_id: SESSION_ID, bytes: new Uint8Array([0x61]), seq: 10, replay: false },
+    // Deliver some arc.mirror.frame to establish last_seen_seq
+    dispatchNotif({
+      method: "arc.mirror.frame",
+      params: { session_id: SESSION_ID, data: btoa("a"), seq: 10, replay: false },
     });
-    dispatch({
-      kind: "SessionOutput",
-      data: { session_id: SESSION_ID, bytes: new Uint8Array([0x62]), seq: 15, replay: false },
+    dispatchNotif({
+      method: "arc.mirror.frame",
+      params: { session_id: SESSION_ID, data: btoa("b"), seq: 15, replay: false },
     });
     // Now discontinuity arrives
-    dispatch({
-      kind: "SessionDiscontinuity",
-      data: { session_id: SESSION_ID, last_seq: 42 },
+    dispatchNotif({
+      method: "arc.mirror.discontinuity",
+      params: { session_id: SESSION_ID },
     });
-    // send should have been called with SubscribeSession{ since_seq: 15 } (last seen)
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const resubscribe = calls.find(
-      (c) => c.kind === "SubscribeSession",
-    ) as Extract<ClientToArc, { kind: "SubscribeSession" }> | undefined;
+    // request should have been called with arc.session.subscribe{ since_seq: 15 } (last seen)
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const resubscribe = calls.find(([method]) => method === "arc.session.subscribe");
     expect(resubscribe).toBeDefined();
-    expect(resubscribe!.data.session_id).toBe(SESSION_ID);
-    expect(resubscribe!.data.since_seq).toBe(15);
+    expect(resubscribe![1].session_id).toBe(SESSION_ID);
+    expect(resubscribe![1].since_seq).toBe(15);
   });
 
-  it("ignores SessionDiscontinuity for a different session_id", () => {
+  it("ignores arc.mirror.discontinuity for a different session_id", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "SessionDiscontinuity",
-      data: { session_id: OTHER_ID, last_seq: 99 },
+    dispatchNotif({
+      method: "arc.mirror.discontinuity",
+      params: { session_id: OTHER_ID },
     });
-    // Should not send anything
-    expect(capturedSend).not.toHaveBeenCalled();
+    // Should not request arc.session.subscribe
+    const calls = capturedRequest.mock.calls as [string, unknown][];
+    const resubscribeCalls = calls.filter(([method]) => method === "arc.session.subscribe");
+    expect(resubscribeCalls).toHaveLength(0);
   });
 
-  it("resubscribes with since_seq null when discontinuity arrives before any output", () => {
+  it("resubscribes with since_seq null when discontinuity arrives before any frame", () => {
     render(<WatchPage />);
-    // No SessionOutput delivered — lastSeenSeqRef is still null
-    dispatch({
-      kind: "SessionDiscontinuity",
-      data: { session_id: SESSION_ID, last_seq: 5 },
+    // No arc.mirror.frame delivered — lastSeenSeqRef is still null
+    dispatchNotif({
+      method: "arc.mirror.discontinuity",
+      params: { session_id: SESSION_ID },
     });
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const resubscribe = calls.find(
-      (c) => c.kind === "SubscribeSession",
-    ) as Extract<ClientToArc, { kind: "SubscribeSession" }> | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const resubscribe = calls.find(([method]) => method === "arc.session.subscribe");
     expect(resubscribe).toBeDefined();
-    expect(resubscribe!.data.session_id).toBe(SESSION_ID);
-    expect(resubscribe!.data.since_seq).toBeNull();
+    expect(resubscribe![1].session_id).toBe(SESSION_ID);
+    expect(resubscribe![1].since_seq).toBeNull();
   });
 
-  it("tracks max seq across out-of-order SessionOutput frames", () => {
+  it("tracks max seq across out-of-order arc.mirror.frame frames", () => {
     render(<WatchPage />);
     // Deliver seq 15 first, then seq 10 (out of order)
-    dispatch({
-      kind: "SessionOutput",
-      data: { session_id: SESSION_ID, bytes: new Uint8Array([0x61]), seq: 15, replay: false },
+    dispatchNotif({
+      method: "arc.mirror.frame",
+      params: { session_id: SESSION_ID, data: btoa("a"), seq: 15, replay: false },
     });
-    dispatch({
-      kind: "SessionOutput",
-      data: { session_id: SESSION_ID, bytes: new Uint8Array([0x62]), seq: 10, replay: false },
+    dispatchNotif({
+      method: "arc.mirror.frame",
+      params: { session_id: SESSION_ID, data: btoa("b"), seq: 10, replay: false },
     });
     // Discontinuity should resubscribe from 15 (the max), not 10 (the most recent)
-    dispatch({
-      kind: "SessionDiscontinuity",
-      data: { session_id: SESSION_ID, last_seq: 20 },
+    dispatchNotif({
+      method: "arc.mirror.discontinuity",
+      params: { session_id: SESSION_ID },
     });
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const resubscribe = calls.find(
-      (c) => c.kind === "SubscribeSession",
-    ) as Extract<ClientToArc, { kind: "SubscribeSession" }> | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const resubscribe = calls.find(([method]) => method === "arc.session.subscribe");
     expect(resubscribe).toBeDefined();
-    expect(resubscribe!.data.since_seq).toBe(15);
+    expect(resubscribe![1].since_seq).toBe(15);
   });
 
-  // ── SessionOutput ─────────────────────────────────────────────────────────
+  // ── arc.mirror.frame ─────────────────────────────────────────────────────
 
-  it("writes SessionOutput bytes to xterm", () => {
+  it("writes arc.mirror.frame decoded bytes to xterm", () => {
     render(<WatchPage />);
+    // "hi" in base64 is "aGk="
     const bytes = new Uint8Array([0x68, 0x69]);
-    dispatch({
-      kind: "SessionOutput",
-      data: { session_id: SESSION_ID, bytes, seq: 1, replay: false },
+    const b64 = btoa(String.fromCharCode(...bytes));
+    dispatchNotif({
+      method: "arc.mirror.frame",
+      params: { session_id: SESSION_ID, data: b64, seq: 1, replay: false },
     });
     expect(mockXtermWrite).toHaveBeenCalled();
     const args = mockXtermWrite.mock.calls[0];
@@ -294,85 +330,85 @@ describe("WatchPage", () => {
     expect(args[0]).toEqual(new Uint8Array([0x68, 0x69]));
   });
 
-  it("writes replay:true SessionOutput bytes to xterm (history)", () => {
+  it("writes replay:true arc.mirror.frame bytes to xterm (history)", () => {
     render(<WatchPage />);
     const bytes = new Uint8Array([0x61]);
-    dispatch({
-      kind: "SessionOutput",
-      data: { session_id: SESSION_ID, bytes, seq: 5, replay: true },
+    const b64 = btoa(String.fromCharCode(...bytes));
+    dispatchNotif({
+      method: "arc.mirror.frame",
+      params: { session_id: SESSION_ID, data: b64, seq: 5, replay: true },
     });
     expect(mockXtermWrite).toHaveBeenCalled();
   });
 
-  it("ignores SessionOutput for a different session_id", () => {
+  it("ignores arc.mirror.frame for a different session_id", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "SessionOutput",
-      data: { session_id: OTHER_ID, bytes: new Uint8Array([0x61]), seq: 1, replay: false },
+    dispatchNotif({
+      method: "arc.mirror.frame",
+      params: { session_id: OTHER_ID, data: btoa("a"), seq: 1, replay: false },
     });
     expect(mockXtermWrite).not.toHaveBeenCalled();
   });
 
-  // ── Unmount / UnsubscribeSession ──────────────────────────────────────────
+  // ── Unmount / arc.session.unsubscribe ─────────────────────────────────────
 
-  it("sends UnsubscribeSession on unmount", () => {
+  it("sends arc.session.unsubscribe on unmount", () => {
     const { unmount } = render(<WatchPage />);
     unmount();
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const unsub = calls.find((c) => c.kind === "UnsubscribeSession") as
-      | Extract<ClientToArc, { kind: "UnsubscribeSession" }>
-      | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const unsub = calls.find(([method]) => method === "arc.session.unsubscribe");
     expect(unsub).toBeDefined();
-    expect(unsub!.data.session_id).toBe(SESSION_ID);
+    expect(unsub![1].session_id).toBe(SESSION_ID);
   });
 
   // ── Request Control ───────────────────────────────────────────────────────
 
   it("hides Request Control button when driver is null", () => {
     render(<WatchPage />);
-    // No LeaseChanged delivered — driver is null by default
+    // No arc.mirror.control_grant delivered — driver is null by default
     expect(screen.queryByRole("button", { name: /request control/i })).toBeNull();
   });
 
   it("shows Request Control button when driver is non-null", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     expect(screen.getByRole("button", { name: /request control/i })).toBeInTheDocument();
   });
 
-  it("clicking Request Control sends RequestControl envelope", () => {
+  it("clicking Request Control sends arc.session.control request", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     const btn = screen.getByRole("button", { name: /request control/i });
     fireEvent.click(btn);
 
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const req = calls.find(
-      (c) => c.kind === "RequestControl",
-    ) as Extract<ClientToArc, { kind: "RequestControl" }> | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const req = calls.find(([method]) => method === "arc.session.control");
     expect(req).toBeDefined();
-    expect(req!.data.session_id).toBe(SESSION_ID);
+    expect(req![1].session_id).toBe(SESSION_ID);
   });
 
   it("enters pending state after clicking Request Control", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     const btn = screen.getByRole("button", { name: /request control/i });
@@ -383,43 +419,44 @@ describe("WatchPage", () => {
     expect(pendingBtn).toBeDisabled();
   });
 
-  it("clears pending state when LeaseChanged arrives after request", () => {
+  it("clears pending state when arc.mirror.control_grant arrives after request", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     // Click to enter pending
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
     expect(screen.getByRole("button", { name: /requesting/i })).toBeDisabled();
 
-    // Lease changes (driver updated) WITHOUT a non-null driver while pending
-    // — this should clear pending and NOT grant isDriver (driver changed to someone else)
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    // Grant arrives while pending → isDriver=true
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u2", device_label: "Other Device", since: 2000 },
+        controller_id: "u2",
+        controller_name: "Other Device",
       },
     });
 
     // Per spec: pendingRequestMine===true AND driver!==null → isDriver=true.
-    // The "You are driving" indicator should appear instead.
     expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
     // Release Control button should appear
     expect(screen.getByRole("button", { name: /release control/i })).toBeInTheDocument();
   });
 
-  it("back-to-back clicks are idempotent — only one RequestControl sent", () => {
+  it("back-to-back clicks are idempotent — only one arc.session.control sent", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     const btn = screen.getByRole("button", { name: /request control/i });
@@ -428,8 +465,8 @@ describe("WatchPage", () => {
     const disabledBtn = screen.getByRole("button", { name: /requesting/i });
     fireEvent.click(disabledBtn);
 
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const reqCalls = calls.filter((c) => c.kind === "RequestControl");
+    const calls = capturedRequest.mock.calls as [string, unknown][];
+    const reqCalls = calls.filter(([method]) => method === "arc.session.control");
     expect(reqCalls).toHaveLength(1);
   });
 
@@ -438,21 +475,23 @@ describe("WatchPage", () => {
   it("shows 'You are driving' and Release Control button after control is granted", () => {
     render(<WatchPage />);
     // Set a driver so Request Control button appears
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     // Click Request Control (sets pendingRequestMine=true)
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
-    // LeaseChanged with non-null driver while pending → grant-to-me
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    // Another grant arrives while pending → grant-to-me
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
@@ -463,68 +502,72 @@ describe("WatchPage", () => {
 
   it("renders XtermWrapper with readOnly=false when isDriver is true", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     // After grant, xterm should not be read-only
     expect(mockXtermProps.readOnly).toBe(false);
   });
 
-  it("clicking Release Control sends RevokeControl envelope", () => {
+  it("clicking Release Control sends arc.session.release request", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     // Now release control
     fireEvent.click(screen.getByRole("button", { name: /release control/i }));
 
-    const calls: ClientToArc[] = capturedSend.mock.calls.map((c: ClientToArc[]) => c[0]);
-    const revoke = calls.find(
-      (c) => c.kind === "RevokeControl",
-    ) as Extract<ClientToArc, { kind: "RevokeControl" }> | undefined;
+    const calls = capturedRequest.mock.calls as [string, Record<string, unknown>][];
+    const revoke = calls.find(([method]) => method === "arc.session.release");
     expect(revoke).toBeDefined();
-    expect(revoke!.data.session_id).toBe(SESSION_ID);
+    expect(revoke![1].session_id).toBe(SESSION_ID);
   });
 
   it("clicking Release Control optimistically clears isDriver", () => {
     render(<WatchPage />);
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     // Now release
@@ -535,14 +578,15 @@ describe("WatchPage", () => {
     expect(screen.queryByRole("button", { name: /release control/i })).toBeNull();
   });
 
-  it("LeaseChanged with driver when pendingRequestMine is false does NOT flip to driver mode", () => {
+  it("arc.mirror.control_grant without pending request does NOT flip to driver mode", () => {
     render(<WatchPage />);
-    // Receive LeaseChanged WITHOUT having clicked Request Control
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    // Receive arc.mirror.control_grant WITHOUT having clicked Request Control
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     // isDriver should remain false — "You are driving" should NOT appear
@@ -553,59 +597,63 @@ describe("WatchPage", () => {
     expect(mockXtermProps.readOnly).toBe(true);
   });
 
-  it("SessionRevoked resets isDriver to false", () => {
+  it("arc.session.revoked resets isDriver to false", () => {
     render(<WatchPage />);
     // Grant control
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
 
     // Session revoked
-    dispatch({
-      kind: "SessionRevoked",
-      data: { session_id: SESSION_ID, reason: "host closed session" },
+    dispatchNotif({
+      method: "arc.session.revoked",
+      params: { session_id: SESSION_ID, reason: "host closed session" },
     });
     // Should no longer be in driver mode
     expect(screen.queryByText(/you are driving/i)).toBeNull();
   });
 
-  it("LeaseChanged with null driver while isDriver resets to view-only", () => {
+  it("arc.mirror.control_revoke while isDriver resets to view-only", () => {
     render(<WatchPage />);
     // Grant control
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 2000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     expect(screen.getByText(/you are driving/i)).toBeInTheDocument();
 
-    // Relay revokes lease (driver becomes null)
-    dispatch({
-      kind: "LeaseChanged",
-      data: { session_id: SESSION_ID, driver: null },
+    // Relay revokes lease
+    dispatchNotif({
+      method: "arc.mirror.control_revoke",
+      params: { session_id: SESSION_ID },
     });
     expect(screen.queryByText(/you are driving/i)).toBeNull();
     expect(mockXtermProps.readOnly).toBe(true);
@@ -616,24 +664,25 @@ describe("WatchPage", () => {
     expect(mockXtermProps.readOnly).toBe(true);
   });
 
-  // ── Finding (1): LeaseChanged with null driver while pending must NOT grant isDriver ──
+  // ── Finding (1): arc.mirror.control_revoke while pending must NOT grant isDriver ──
 
-  it("LeaseChanged with null driver while pendingRequestMine does NOT set isDriver", () => {
+  it("arc.mirror.control_revoke while pendingRequestMine does NOT set isDriver", () => {
     render(<WatchPage />);
     // Set a driver so Request Control button appears
-    dispatch({
-      kind: "LeaseChanged",
-      data: {
+    dispatchNotif({
+      method: "arc.mirror.control_grant",
+      params: {
         session_id: SESSION_ID,
-        driver: { user_id: "u1", device_label: "MacBook Pro", since: 1000 },
+        controller_id: "u1",
+        controller_name: "MacBook Pro",
       },
     });
     // Click Request Control — sets pendingRequestMine=true
     fireEvent.click(screen.getByRole("button", { name: /request control/i }));
-    // Relay denies by sending LeaseChanged with null driver while we are pending
-    dispatch({
-      kind: "LeaseChanged",
-      data: { session_id: SESSION_ID, driver: null },
+    // Relay denies by sending revoke while we are pending
+    dispatchNotif({
+      method: "arc.mirror.control_revoke",
+      params: { session_id: SESSION_ID },
     });
     // isDriver must NOT become true — xterm stays read-only
     expect(mockXtermProps.readOnly).toBe(true);

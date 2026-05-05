@@ -5,20 +5,20 @@
  *
  * This is a sibling route to /sessions/[id] (the direct-attach page).
  * It does NOT modify the attach page; the two paths use separate wire modes:
- *   attach → AttachSession handshake (takes PTY control)
- *   mirror → SubscribeSession handshake (read-only observer stream)
+ *   attach → arc.session.attach (takes PTY control)
+ *   mirror → arc.session.subscribe (read-only observer stream)
  *
- * Effect-ordering note (UnsubscribeSession before ws.close):
+ * Effect-ordering note (arc.session.unsubscribe before ws.close):
  * React runs effect cleanups in the REVERSE order of registration.
- * useWebSocket registers its cleanup effect first (via the hook call).
- * The "unsubscribe" useEffect below is declared AFTER useWebSocket, so its
- * cleanup fires FIRST on unmount — sending UnsubscribeSession before the
+ * useArcJsonRpc registers its cleanup effect first (via the hook call).
+ * The "unsubscribe" useEffect below is declared AFTER useArcJsonRpc, so its
+ * cleanup fires FIRST on unmount — sending arc.session.unsubscribe before the
  * hook's own ws.close() runs. This gives the relay a clean presence signal.
  *
  * C3.5 — isDriver detection heuristic:
  *   Browser has no myUserId concept (intentional deferral). We use a local
- *   pendingRequestMine flag: set true on click, cleared on any LeaseChanged.
- *   If cleared while driver is non-null → assume grant-to-me → isDriver=true.
+ *   pendingRequestMine flag: set true on click, cleared on any control_grant/revoke.
+ *   If cleared while a grant arrived → assume grant-to-me → isDriver=true.
  *
  *   Known edge case: if two watchers click near-simultaneously and the other
  *   watcher wins, we show "You are driving" for one render before the relay's
@@ -29,14 +29,33 @@
 
 import { useParams, useRouter } from "next/navigation";
 import { useRef, useCallback, useState, useEffect, useLayoutEffect } from "react";
-import { useWebSocket } from "@/hooks/use-websocket";
+import { useArcJsonRpc } from "@/hooks/use-arc-jsonrpc";
 import { useMirrorBlocks } from "@/hooks/use-mirror-blocks";
 import { WatchBlockList } from "@/components/watch/WatchBlockList";
 import { XtermWrapper, type XtermHandle } from "@/components/terminal/xterm-wrapper";
 import { ChevronRightIcon, ChevronLeftIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { ArcToClient, DriverInfo, WatcherInfo, ClientToArc } from "@/types/protocol";
+import { b64ToBytes } from "@/lib/b64";
+import { getAccessToken } from "@/lib/auth";
+import { getWsUrl } from "@/lib/config";
+import { ArcMethod, ArcNotif } from "@/types/arc-rpc";
+import type {
+  MirrorFrameNotif,
+  MirrorControlGrantNotif,
+  MirrorControlRevokeNotif,
+  SessionParticipantNotif,
+  SessionRevokedNotif,
+  MirrorDiscontinuityNotif,
+  SessionParticipant,
+} from "@/types/arc-rpc";
+import type { Notification } from "@/lib/jsonrpc-ws";
+
+/** Minimal driver info tracked from arc.mirror.control_grant. */
+interface DriverInfo {
+  controller_id: string;
+  controller_name?: string;
+}
 
 export default function WatchPage() {
   const { id } = useParams<{ id: string }>();
@@ -45,86 +64,110 @@ export default function WatchPage() {
 
   // Mirror state
   const [driver, setDriver] = useState<DriverInfo | null>(null);
-  const [watchers, setWatchers] = useState<WatcherInfo[]>([]);
+  const [watchers, setWatchers] = useState<SessionParticipant[]>([]);
   const [revokedReason, setRevokedReason] = useState<string | null>(null);
-  // pendingRequestMine: true after "Request Control" click, cleared on any LeaseChanged
+  // pendingRequestMine: true after "Request Control" click, cleared on any control_grant/revoke
   const [pendingRequestMine, setPendingRequestMine] = useState(false);
   // isDriver: true when we believe the relay has granted us control
   const [isDriver, setIsDriver] = useState(false);
 
-  // Block-list sidebar collapse state (plain component state — watchers sidebar
-  // uses the same pattern: no localStorage persistence).
+  // Block-list sidebar collapse state (plain component state — no localStorage persistence).
   const [blockListOpen, setBlockListOpen] = useState(true);
 
   // useMirrorBlocks: lazily loads WASM detector; returns feedBytes callback.
   const { blocks, currentBlockId, feedBytes } = useMirrorBlocks(id);
 
-  // Track the highest seq received from SessionOutput for discontinuity resume.
+  // Track the highest seq received from arc.mirror.frame for discontinuity resume.
   const lastSeenSeqRef = useRef<number | null>(null);
 
-  // Stable ref to `send` so the onMessage callback can call it without
-  // listing it as a dependency (avoiding stale closure or infinite re-render).
-  const sendRef = useRef<((msg: ClientToArc) => void)>(() => {});
+  // Stable ref to `request` so the onNotification + cleanup callbacks can call it
+  // without listing it as a dependency (avoiding stale closure or infinite re-render).
+  const requestRef = useRef<(method: string, params: unknown) => Promise<unknown>>(
+    () => Promise.reject(new Error("not connected")),
+  );
 
-  const onMessage = useCallback(
-    (msg: ArcToClient) => {
+  // Read token + URL once per render (stable values — only change on auth refresh).
+  const token = getAccessToken();
+  const wsUrl = getWsUrl();
+
+  const onNotification = useCallback(
+    (notif: Notification) => {
+      const params = notif.params as Record<string, unknown> | null;
+
       // Only process envelopes for this session.
-      // All mirroring envelope types carry a session_id inside .data.
-      if (msg.data !== null && "session_id" in msg.data) {
-        if ((msg.data as { session_id: string }).session_id !== id) return;
-      }
+      if (params && "session_id" in params && params.session_id !== id) return;
 
-      switch (msg.kind) {
-        case "SessionOutput": {
-          const chunk = new Uint8Array(msg.data.bytes);
+      switch (notif.method) {
+        case ArcNotif.MirrorFrame: {
+          const p = params as unknown as MirrorFrameNotif;
+          const chunk = b64ToBytes(p.data);
           // Write bytes to xterm for both live and replay frames.
           xtermRef.current?.write(chunk);
           // Feed the same bytes into the block detector for WatchBlockList.
           feedBytes(chunk);
-          // Track highest seq for discontinuity resume
-          if (lastSeenSeqRef.current === null || msg.data.seq > lastSeenSeqRef.current) {
-            lastSeenSeqRef.current = msg.data.seq;
+          // Track highest seq for discontinuity resume.
+          if (lastSeenSeqRef.current === null || p.seq > lastSeenSeqRef.current) {
+            lastSeenSeqRef.current = p.seq;
           }
           break;
         }
-        case "LeaseChanged": {
-          const newDriver = msg.data.driver;
+
+        case ArcNotif.MirrorControlGrant: {
+          const p = params as unknown as MirrorControlGrantNotif;
+          const newDriver: DriverInfo = {
+            controller_id: p.controller_id,
+            controller_name: p.controller_name,
+          };
           setDriver(newDriver);
-          // Detection heuristic: if we had a pending request and the new driver
-          // is non-null, assume the grant was to us.
+          // Detection heuristic: if we had a pending request and a grant arrives,
+          // assume the grant was to us.
           setPendingRequestMine((pending) => {
-            // Single decisive expression: become driver iff we had a pending
-            // request AND the relay now shows a non-null driver (implicitly us).
-            // Every other case — denial (null driver while pending), or a lease
-            // change we did not request — sets isDriver=false unambiguously.
-            setIsDriver(pending && newDriver !== null);
+            setIsDriver(pending); // grant while pending → we are driver
             return false; // always clear pending
           });
           break;
         }
-        case "PresenceChanged": {
-          setWatchers(msg.data.watchers);
-          break;
-        }
-        case "SessionRevoked": {
-          setRevokedReason(msg.data.reason);
+
+        case ArcNotif.MirrorControlRevoke: {
+          setDriver(null);
+          // Revoke while pending means denial — clear pending, do NOT set isDriver.
+          setPendingRequestMine((pending) => {
+            if (pending) setIsDriver(false);
+            return false;
+          });
           setIsDriver(false);
           break;
         }
-        case "SessionDiscontinuity": {
+
+        case ArcNotif.SessionParticipant: {
+          const p = params as unknown as SessionParticipantNotif;
+          setWatchers(p.participants);
+          break;
+        }
+
+        case ArcNotif.SessionRevoked: {
+          const p = params as unknown as SessionRevokedNotif;
+          setRevokedReason(p.reason ?? "unknown reason");
+          setIsDriver(false);
+          break;
+        }
+
+        case ArcNotif.MirrorDiscontinuity: {
           // A gap was detected in the output stream. Re-subscribe from the
           // last seq we actually received so we don't miss any frames.
-          sendRef.current({
-            kind: "SubscribeSession",
-            data: {
-              session_id: id,
-              since_seq: lastSeenSeqRef.current,
-            },
+          requestRef.current(ArcMethod.SessionSubscribe, {
+            session_id: id,
+            since_seq: lastSeenSeqRef.current,
+          }).catch(() => {
+            // Best-effort: ignore if disconnected during discontinuity handling.
           });
           break;
         }
-        // Non-mirror kinds (e.g. BlockOutputChunk, Ping) are intentionally dropped
-        // on the view-only watch page.
+
+        case ArcNotif.MirrorHostInput:
+          // Host-input attribution UI — future enhancement; silently consumed.
+          break;
+
         default:
           break;
       }
@@ -134,21 +177,28 @@ export default function WatchPage() {
 
   // Hook call — registers its cleanup effect internally (ws.close on unmount).
   // This must come BEFORE the unsubscribe useEffect below.
-  const { state: wsState, send } = useWebSocket(id, onMessage, "mirror");
-
-  // Keep sendRef in sync with the latest send identity.
-  useLayoutEffect(() => {
-    sendRef.current = send;
+  const { state: wsState, request } = useArcJsonRpc({
+    url: wsUrl,
+    token,
+    enabled: !!token,
+    onConnect: async () => {
+      await requestRef.current(ArcMethod.SessionSubscribe, { session_id: id });
+    },
+    onNotification,
   });
 
-  // UnsubscribeSession cleanup — declared AFTER useWebSocket so React runs
+  // Keep requestRef in sync with the latest request identity each render.
+  useLayoutEffect(() => {
+    requestRef.current = request;
+  });
+
+  // arc.session.unsubscribe cleanup — declared AFTER useArcJsonRpc so React runs
   // THIS cleanup first (reverse registration order), ensuring the frame is
   // sent before the websocket is closed by the hook's own cleanup.
   useEffect(() => {
     return () => {
-      sendRef.current({
-        kind: "UnsubscribeSession",
-        data: { session_id: id },
+      requestRef.current(ArcMethod.SessionUnsubscribe, { session_id: id }).catch(() => {
+        // Best-effort: ignore rejection if connection is already closing.
       });
     };
   }, [id]);
@@ -157,9 +207,11 @@ export default function WatchPage() {
 
   const handleData = useCallback(
     (bytes: Uint8Array) => {
-      sendRef.current({
-        kind: "SessionInput",
-        data: { session_id: id, bytes },
+      import("@/lib/b64").then(({ bytesToB64 }) => {
+        requestRef.current(ArcMethod.SessionInput, {
+          session_id: id,
+          data: bytesToB64(bytes),
+        }).catch(() => {});
       });
     },
     [id],
@@ -167,18 +219,22 @@ export default function WatchPage() {
 
   const handleResize = useCallback(
     (cols: number, rows: number) => {
-      sendRef.current({
-        kind: "SessionResizeRequest",
-        data: { session_id: id, cols, rows },
-      });
+      requestRef.current(ArcMethod.SessionResize, {
+        session_id: id,
+        cols,
+        rows,
+      }).catch(() => {});
     },
     [id],
   );
 
   const handleReleaseControl = useCallback(() => {
-    send({ kind: "RevokeControl", data: { session_id: id } });
+    requestRef.current(ArcMethod.SessionRelease, {
+      session_id: id,
+      controller_id: driver?.controller_id ?? "",
+    }).catch(() => {});
     setIsDriver(false);
-  }, [send, id]);
+  }, [id, driver]);
 
   return (
     <div className="flex h-full flex-col">
@@ -216,9 +272,9 @@ export default function WatchPage() {
               <>
                 Driver:{" "}
                 <span className="font-medium text-foreground">
-                  {driver.device_label}
+                  {driver.controller_name ?? driver.controller_id}
                 </span>{" "}
-                ({driver.user_id})
+                ({driver.controller_id})
               </>
             ) : (
               "No driver"
@@ -242,7 +298,10 @@ export default function WatchPage() {
             disabled={pendingRequestMine}
             onClick={() => {
               setPendingRequestMine(true);
-              sendRef.current({ kind: "RequestControl", data: { session_id: id } });
+              requestRef.current(ArcMethod.SessionControl, {
+                session_id: id,
+                requester_id: "",
+              }).catch(() => {});
             }}
           >
             {pendingRequestMine ? "Requesting..." : "Request Control"}
@@ -284,10 +343,10 @@ export default function WatchPage() {
               <ul className="flex flex-wrap gap-x-3">
                 {watchers.map((w) => (
                   <li
-                    key={`${w.user_id}:${w.device_label}`}
+                    key={`${w.user_id}:${w.user_name ?? ""}`}
                     className="text-xs"
                   >
-                    <span className="font-medium">{w.device_label}</span>
+                    <span className="font-medium">{w.user_name ?? w.user_id}</span>
                     <span className="ml-1 text-muted-foreground">
                       ({w.user_id})
                     </span>
