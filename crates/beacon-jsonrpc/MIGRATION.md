@@ -398,9 +398,9 @@ translator drops `arc.mirror.frame`, `arc.mirror.block_*`,
 `arc.mirror.control_grant`/`revoke` are PRESERVED (mapped to
 `LeaseChanged`) because the daemon's lease cache needs them.
 
-#### Known gap — JSON-RPC reconnect parity
+~~#### Known gap — JSON-RPC reconnect parity~~
 
-`JsonRpcWsClient` has no auto-reconnect; the WS actor breaks on close.
+~~`JsonRpcWsClient` has no auto-reconnect; the WS actor breaks on close.
 msgpack `ArcConnection` reconnects with backoff via its own actor loop.
 Production hostd JSON-RPC connections will NOT survive WS drops until a
 follow-up lands either (a) a reconnect wrapper around
@@ -408,14 +408,69 @@ follow-up lands either (a) a reconnect wrapper around
 WS actor's exit path to drop `notif_tx` so `state_watch` publishes
 `Disconnected` and `beacon-hostd::daemon::relay_loop` can react.
 Test `state_stays_connected_after_drop_documenting_no_autoreconnect`
-locks in the current behavior as a tripwire.
+locks in the current behavior as a tripwire.~~
+
+**Closed** — see Reconnect parity section below.
 
 #### What ships next
 
 Phase G deletes msgpack on both sides — `beacon-net::ArcConnection`,
 `arc-relay/src/ws/host.rs`, the `beacon-proto` envelope module, and the
-msgpack branch of `arc-relay/src/api/shadow_routes.rs`. Reconnect parity
-follow-up may land before or alongside Phase G.
+msgpack branch of `arc-relay/src/api/shadow_routes.rs`.
+
+### Reconnect parity (post-Phase F)
+
+Closes the reconnect gap documented in Phase F. Landed on
+`feat/jsonrpc-reconnect-parity`.
+
+#### What closed
+
+**`JsonRpcWsClient` now auto-reconnects with exponential backoff.**
+
+The WS actor (`connection_actor`) wraps the inner `run_message_loop` in an
+outer reconnect loop mirroring msgpack `connection::connection_actor`:
+
+- On disconnect: drain `pending` (drops senders → callers see `Shutdown`),
+  then enter exponential-backoff retry (`backoff::delay` + `backoff::apply_jitter`).
+- Each retry: publish `ConnectionState::Reconnecting { attempt }` → sleep
+  jittered delay → call `open_and_negotiate`; on success publish `Connected`.
+- `state_tx`/`state_rx` created BEFORE actor spawn, initialized to `Connected`.
+- New fields on `JsonRpcWsConfig`: `initial_backoff` (100ms), `max_backoff` (30s),
+  `jitter_factor` (0.25). Builder: `with_reconnect(initial, max, jitter)`.
+
+**`ArcConnectionJsonRpc` now forwards client state; re-issues `arc.host.hello` on reconnect.**
+
+- Dropped the dead local `watch::channel(Connected)` that was never updated.
+  `state_rx` now delegates to `client.state_watch()` — real transitions propagate.
+- Supervisor task watches `state_watch()` and re-issues `arc.host.hello` on each
+  `Reconnecting → Connected` transition. A failed re-handshake is logged as warning
+  and does not abort (next caller request fails and triggers another cycle).
+- `_supervisor: JoinHandle<()>` stored on the struct so it lives as long as the
+  connection; aborted in `close()`.
+- `NetConfig::initial_backoff / max_backoff / jitter_factor` are now threaded
+  through to `JsonRpcWsConfig::with_reconnect()` — previously `_config` was silently
+  ignored.
+
+**`hostd::daemon::relay_loop` already handles the state transitions.**
+
+`relay_loop` watches `conn.state_watch()` and calls `registry.on_reconnect()` on
+`Connected`-after-non-Connected. This code path now fires for JSON-RPC connections —
+sessions are re-registered after a WS drop without any additional relay_loop changes.
+
+#### Tests added
+
+| File | Tests |
+|------|-------|
+| `beacon-net/src/jsonrpc/backoff.rs` | 4 unit tests (doubling, cap, zero-attempt, jitter window) |
+| `beacon-net/tests/jsonrpc_client.rs` | `client_state_flips_to_reconnecting_on_server_drop`, `client_state_returns_to_connected_after_server_restart` |
+| `beacon-net/tests/jsonrpc_connection.rs` | `state_flips_to_reconnecting_after_server_drops`, `state_returns_to_connected_after_server_restart` (replaced tripwire `state_stays_connected_after_drop_documenting_no_autoreconnect`) |
+| `beacon-hostd/tests/jsonrpc_reconnect_smoke.rs` | `relay_loop_sends_session_register_after_jsonrpc_reconnect` |
+
+#### What ships next
+
+Phase G deletes msgpack — `beacon-net::ArcConnection`, `arc-relay/src/ws/host.rs`,
+the `beacon-proto` msgpack envelope, and the legacy msgpack branch of
+`arc-relay/src/api/shadow_routes.rs`.
 
 ---
 
