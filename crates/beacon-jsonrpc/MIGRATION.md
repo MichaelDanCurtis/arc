@@ -81,7 +81,7 @@ until callers cut over.
 
 ---
 
-## 2. Arc WebSocket protocol  (currently: msgpack over WebSocket)
+## 2. Arc WebSocket protocol  (JSON-RPC 2.0 sole transport since Phase G, 2026-05-05)
 
 Source files: `arc-relay/src/relay.rs`, `arc-relay/src/session.rs`,
 `beacon-core/crates/beacon-session/src/arc_client.rs`.
@@ -142,9 +142,10 @@ interleave on a single broadcast channel. Per-session state lives in
 
 ### WS-endpoint cut-over — DONE (feat/jsonrpc-ws-cutover)
 
-`Sec-WebSocket-Protocol: arc.json-rpc` selects the JSON-RPC pump in
-`arc-relay/src/ws/jsonrpc_handler.rs`. Absent header → existing msgpack
-pump in `arc-relay/src/ws/handler.rs::handle_connection`, unchanged.
+`Sec-WebSocket-Protocol: arc.json-rpc` is **mandatory** since Phase G
+(2026-05-05). Absent header → `400 Bad Request` (msgpack fallback
+deleted). The JSON-RPC pump in `arc-relay/src/ws/jsonrpc_handler.rs`
+is the sole WebSocket handler.
 
 Live methods over WS: `arc.session.{attach,control,release}`,
 `arc.ai.{chat,stream_chat,list_models}`.
@@ -153,20 +154,13 @@ Live notifications over WS: `arc.session.participant`,
 `arc.mirror.{frame,control_grant,control_revoke}`,
 `ai.{chunk,done,error,tool_use}`.
 
-Mirror fanout: `MirrorRegistry::broadcast` invokes registered
-`BroadcastEmitter`s alongside the existing msgpack `Fanout::broadcast` path.
-The default emitter (`ArcMirrorEmitter` in `arc-relay/src/rpc.rs`) maps
-`ArcToClient::{SessionOutput, LeaseChanged}` → matching `arc.mirror.*`
-notifications on the per-session `broadcast::Sender<String>` watched by
-the JSON-RPC pump. Both wire formats fan out from the same call site
-(`src/ws/host.rs::PushOutput`).
+Mirror fanout: `MirrorRegistry::broadcast` invokes `ArcMirrorEmitter`
+(`arc-relay/src/rpc.rs`) which maps `ArcToClient::{SessionOutput,
+LeaseChanged}` → matching `arc.mirror.*` notifications on the
+per-session `broadcast::Sender<String>` watched by the JSON-RPC pump.
 
 ~~Production `HttpAiBackend` wiring against `arc-relay/src/api/ai_routes.rs`
 is deferred~~ — DONE in `feat/http-ai-backend`; see new section below.
-
-Client adoption (Mac via `beacon-net`, arc-web watch page) lands in a
-follow-up plan once the wire path settles in production. `JsonRpcSpine`
-flag flip + msgpack-path removal is a separate cleanup slice.
 
 ### HttpAiBackend production adapter — DONE (feat/http-ai-backend)
 
@@ -367,9 +361,9 @@ fully participate in mirroring, presence, and shadow-diff request/response.
 | `arc.host.push_output` | `MirrorRegistry::scrollback.append` (canonical seq) → `mirror_registry.broadcast` |
 | `arc.host.shadow_diff_response` | `RelayRouter::resolve_shadow_diff` |
 
-`shadow_routes::request_diff` now emits BOTH msgpack `ShadowDiffRequest`
-(legacy) AND `arc.host.shadow_diff_request` JSON-RPC notif (Phase F new),
-so either flavour of host can satisfy a diff request.
+`shadow_routes::get_shadow_diff` emits `arc.host.shadow_diff_request`
+via the JSON-RPC notification channel (Phase F). Phase G removed the
+parallel msgpack `send_to_host` call — JSON-RPC is the sole emitter.
 
 Host-bound msgpack frames (sent via `RelayRouter::register_session`'s
 `host_tx: mpsc::Sender<Vec<u8>>`) are translated to `arc.host.*` /
@@ -412,11 +406,39 @@ locks in the current behavior as a tripwire.~~
 
 **Closed** — see Reconnect parity section below.
 
-#### What ships next
+### Arc surface — Phase G (msgpack deletion, 2026-05-05)
 
-Phase G deletes msgpack on both sides — `beacon-net::ArcConnection`,
-`arc-relay/src/ws/host.rs`, the `beacon-proto` envelope module, and the
-msgpack branch of `arc-relay/src/api/shadow_routes.rs`.
+**Terminal state.** JSON-RPC 2.0 over WebSocket is now the sole Arc
+transport. All msgpack wire code deleted.
+
+#### Deleted
+
+| Component | What was removed |
+|-----------|-----------------|
+| `beacon-net::ArcConnection` | Entire msgpack WS client (`src/connection.rs`, ~465 lines) |
+| `beacon-net::ArcWire` enum | Private `daemon.rs` enum that wrapped both transport types |
+| `arc-relay/src/ws/host.rs` | Msgpack host-facing WS dispatcher (~490 lines) |
+| `arc-relay/src/ws/client.rs` | Msgpack watcher-facing WS dispatcher (~588 lines) |
+| `arc-relay/src/ws/handler.rs::handle_connection` | Msgpack WS upgrade pump |
+| `arc-relay/src/api/shadow_routes.rs` (partial) | Parallel msgpack `send_to_host` call; JSON-RPC path is now sole emitter |
+| `arc-web/src/lib/ws.ts` | Msgpack encode/decode + `connectToRelay` |
+| `arc-web/src/types/protocol.ts` | `ClientToArc` / `ArcToClient` msgpack types |
+| `arc-web/src/hooks/use-websocket.ts` | React hook wrapping `lib/ws.ts` |
+| `arc-web/src/hooks/use-blocks.ts` | React hook consuming `ArcToClient` events |
+
+#### Kept (intentionally retained for back-compat)
+
+- `FeatureFlag::JsonRpcSpine` — variant retained in enum; `BEACON_FF_JSON_RPC_SPINE` env-var introspection still works. No longer gates any code path.
+- `ConnectionState` enum — moved from deleted `connection.rs` to `beacon-net::config` (shared by `jsonrpc/client.rs` and `jsonrpc_connection.rs`).
+- `beacon-hostd::rpc::register` — previously `register_if_enabled`; `JsonRpcSpine` gate removed, returns `()`.
+
+#### Subprotocol enforcement
+
+`ws_handler` returns `400 Bad Request` when `Sec-WebSocket-Protocol: arc.json-rpc` is absent. All production clients (Mac hostd via `beacon-net::ArcConnectionJsonRpc`, arc-web via `JsonRpcWsClient`) send this header.
+
+#### Token revalidation
+
+`handle_jsonrpc_connection` now runs the same periodic `TOKEN_REVALIDATE_INTERVAL` expiry check the deleted msgpack `handle_connection` had. Close codes: 4001 (expired), 4003 (invalid). Integration tests in `arc-relay/tests/ws_jsonrpc_token_expiry.rs` gated on `--features fast-revalidate`.
 
 ### Reconnect parity (post-Phase F)
 
@@ -465,12 +487,6 @@ sessions are re-registered after a WS drop without any additional relay_loop cha
 | `beacon-net/tests/jsonrpc_client.rs` | `client_state_flips_to_reconnecting_on_server_drop`, `client_state_returns_to_connected_after_server_restart` |
 | `beacon-net/tests/jsonrpc_connection.rs` | `state_flips_to_reconnecting_after_server_drops`, `state_returns_to_connected_after_server_restart` (replaced tripwire `state_stays_connected_after_drop_documenting_no_autoreconnect`) |
 | `beacon-hostd/tests/jsonrpc_reconnect_smoke.rs` | `relay_loop_sends_session_register_after_jsonrpc_reconnect` |
-
-#### What ships next
-
-Phase G deletes msgpack — `beacon-net::ArcConnection`, `arc-relay/src/ws/host.rs`,
-the `beacon-proto` msgpack envelope, and the legacy msgpack branch of
-`arc-relay/src/api/shadow_routes.rs`.
 
 ---
 
@@ -542,8 +558,9 @@ excludes plugin-host gRPC from the unification scope.
 5. `arc.*` — `arc.session.*` (3 methods + 1 notif) **DONE** (branch `feat/jsonrpc-arc-session`); `arc.mirror.*` (3 notifs) **DONE** (branch `feat/jsonrpc-arc-mirror`); `arc.ai.*` (3 methods) **DONE** (branch `feat/jsonrpc-arc-ai`)
 6. `remote.*` — connect/disconnect + 4 notifs **DONE** (branch `feat/jsonrpc-remote`); exec/file.read/file.write/forward.start advertised but stubbed pending russh wiring
 
-Each migration step should remain feature-flagged (`FeatureFlag::JsonRpcSpine`) until
-the full boundary is cut over, then the flag can be removed.
+Each migration step was feature-flagged (`FeatureFlag::JsonRpcSpine`) until
+the full boundary cut over. Phase G (2026-05-05) completed the cut-over and
+deleted all msgpack wire code; `JsonRpcSpine` is retained for back-compat only.
 
 ### `JsonRpcSpine` default → ON (2026-05-02)
 

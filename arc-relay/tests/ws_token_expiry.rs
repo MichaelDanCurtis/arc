@@ -6,17 +6,17 @@
 /// We spin up an in-process axum server bound to a random OS-assigned port
 /// (no external process, no Docker, no real Postgres). The WS upgrade handler
 /// only needs the JWT secret — it never touches the DB until after the first
-/// `HostHello` / `AttachSession` message, which we deliberately never send.
-/// So a lazy `PgPool` (never actually connected) is sufficient.
+/// message, which we deliberately never send. So a lazy `PgPool` (never
+/// actually connected) is sufficient.
 ///
-/// We mint a 2-second access token, connect via `tokio-tungstenite`, sleep
-/// past the expiry window, then send a ping.  The relay's periodic 1-second
-/// expiry tick should have detected the expired token and sent a Close(4001)
-/// frame before (or in response to) our ping.
+/// Gated on `fast-revalidate` feature which drops `TOKEN_REVALIDATE_INTERVAL`
+/// from 30 s to 1 s. Run with: `cargo test -p arc-relay --features fast-revalidate`
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const JWT_SECRET: &str = "test-secret-that-is-long-enough-32x";
@@ -80,6 +80,9 @@ fn mint_token(ttl_secs: u64) -> String {
 
 /// The relay must close the WebSocket with code 4001 once the access token
 /// expires, even if the client never sends a message.
+///
+/// Requires `--features fast-revalidate` (1 s interval instead of 30 s).
+#[cfg(feature = "fast-revalidate")]
 #[tokio::test]
 async fn ws_closes_with_4001_when_access_token_expires() {
     // Issue a token that expires in 2 seconds.
@@ -88,7 +91,14 @@ async fn ws_closes_with_4001_when_access_token_expires() {
     let addr = spawn_relay().await;
     let url = format!("ws://127.0.0.1:{}/ws?token={}", addr.port(), access_token);
 
-    let (mut ws, _resp) = connect_async(&url).await.expect("WS connect failed");
+    // Phase G: arc.json-rpc subprotocol is mandatory.
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static("arc.json-rpc"),
+    );
+
+    let (mut ws, _resp) = connect_async(req).await.expect("WS connect failed");
 
     // Wait 4 seconds — well past the 2-second token TTL.
     // The relay's 1-second periodic tick will detect expiry and send Close(4001).

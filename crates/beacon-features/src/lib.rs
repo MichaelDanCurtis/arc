@@ -44,6 +44,10 @@ pub enum FeatureFlag {
     /// Remote sessions v2 transport. (P6 placeholder)
     RemoteV2,
     /// JSON-RPC spine unification. (P7 placeholder)
+    ///
+    /// GA since 2026-05-02; no longer gates production code paths post-Phase G
+    /// (2026-05-05). Retained for back-compat of `FeatureFlag` enum and
+    /// `BEACON_FF_JSON_RPC_SPINE` env-var introspection.
     JsonRpcSpine,
     /// Command signatures v2 corpus for ghost-text ranking. (P5 placeholder)
     CommandSignaturesV2,

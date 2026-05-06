@@ -1,5 +1,5 @@
-//! Verify that `Sec-WebSocket-Protocol: arc.json-rpc` is honoured by the
-//! upgrade handler. The msgpack path remains the default.
+//! Verify that `Sec-WebSocket-Protocol: arc.json-rpc` is mandatory and
+//! honoured by the upgrade handler (Phase G: msgpack path deleted).
 
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -29,18 +29,30 @@ async fn jsonrpc_subprotocol_is_accepted_in_handshake() {
     drop(ws);
 }
 
+/// Phase G: absent `Sec-WebSocket-Protocol: arc.json-rpc` → 400 Bad Request.
+/// The msgpack fallback path was deleted in Phase G (2026-05-05).
 #[tokio::test]
-async fn no_subprotocol_falls_back_to_msgpack_path() {
+async fn no_subprotocol_rejected_with_400() {
     let (addr, _state) = spawn_test_server().await;
     let token = mint_access_token();
     let req = format!("ws://{addr}/ws?token={token}")
         .into_client_request()
         .unwrap();
-    let (_ws, response) = tokio_tungstenite::connect_async(req).await.unwrap();
-    assert!(
-        response.headers().get("Sec-WebSocket-Protocol").is_none(),
-        "absent header → msgpack default, no subprotocol echoed"
-    );
+    // The server returns 400 before upgrading; tungstenite surfaces this as an error.
+    match tokio_tungstenite::connect_async(req).await {
+        Err(_) => {
+            // Connection rejected at the HTTP layer (400) — correct behaviour.
+        }
+        Ok((_ws, response)) => {
+            // If somehow connected, the status must not be 101 Switching Protocols.
+            let status = response.status();
+            assert_ne!(
+                status,
+                tokio_tungstenite::tungstenite::http::StatusCode::SWITCHING_PROTOCOLS,
+                "absent arc.json-rpc header must not result in a successful WS upgrade"
+            );
+        }
+    }
 }
 
 #[tokio::test]

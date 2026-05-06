@@ -2,29 +2,43 @@
 //!
 //! Auth is validated by the upgrade handler before this module runs.
 //! Each connection gets a fresh [`RpcDispatcher`] populated with:
-//!   - `arc.session.*` handlers (always, when `JsonRpcSpine` is on)
+//!   - `arc.session.*` handlers (always)
 //!   - `arc.ai.*` handlers (only when `state.arc_ai_backend` is `Some`)
 //!
 //! Inbound text frames are dispatched via [`RpcDispatcher::dispatch_raw`] and
 //! the JSON string response is sent back as a text frame. Ping → Pong.
 //! Binary frames are ignored with a warning. Close → clean exit.
+//!
+//! # Token revalidation
+//!
+//! A periodic `TOKEN_REVALIDATE_INTERVAL` timer re-decodes the bearer token
+//! to detect expiry mid-connection and sends a Close frame with the
+//! appropriate close code (4001 expired / 4003 invalid) before breaking.
+//! This matches the behaviour the deleted msgpack `handle_connection` had.
 
 use std::collections::HashSet;
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use beacon_jsonrpc::RpcDispatcher;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::api::AppState;
+use crate::ws::handler::{
+    token_decode_status, TokenStatus,
+    CLOSE_TOKEN_EXPIRED, CLOSE_TOKEN_INVALID, TOKEN_REVALIDATE_INTERVAL,
+};
 
 pub async fn handle_jsonrpc_connection(
     socket: WebSocket,
     user_id: Uuid,
-    _token: String,
+    token: String,
     state: AppState,
 ) {
+    let jwt_secret = state.config.jwt_secret.clone();
+
     let mut dispatcher = RpcDispatcher::new();
     crate::rpc::register_if_enabled(
         &mut dispatcher,
@@ -55,8 +69,34 @@ pub async fn handle_jsonrpc_connection(
     let mut ai_subs: HashSet<String> = HashSet::new();
     let mut forwarders: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // Periodic token-expiry check — mirrors the deleted msgpack handle_connection loop.
+    let mut expiry_tick = tokio::time::interval(TOKEN_REVALIDATE_INTERVAL);
+    expiry_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    expiry_tick.tick().await; // consume the immediate first tick
+
     loop {
         tokio::select! {
+            _ = expiry_tick.tick() => {
+                match token_decode_status(&token, &jwt_secret) {
+                    TokenStatus::Valid => {}
+                    TokenStatus::Expired => {
+                        tracing::info!(user_id = %user_id, "json-rpc WS closing: access token expired");
+                        let _ = ws_tx.send(Message::Close(Some(CloseFrame {
+                            code: CLOSE_TOKEN_EXPIRED,
+                            reason: "access token expired".into(),
+                        }))).await;
+                        break;
+                    }
+                    TokenStatus::Invalid => {
+                        tracing::warn!(user_id = %user_id, "json-rpc WS closing: token decode failed");
+                        let _ = ws_tx.send(Message::Close(Some(CloseFrame {
+                            code: CLOSE_TOKEN_INVALID,
+                            reason: "token rejected".into(),
+                        }))).await;
+                        break;
+                    }
+                }
+            }
             Some(line) = notif_rx.recv() => {
                 if ws_tx.send(Message::Text(line)).await.is_err() {
                     break;

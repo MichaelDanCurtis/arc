@@ -3,10 +3,6 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use beacon_proto::{
-    codec::encode,
-    envelope::ArcToClient,
-};
 use serde::Serialize;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -50,23 +46,6 @@ pub async fn get_shadow_diff(
     // Create a unique request ID for correlation
     let request_id = Uuid::new_v4().to_string();
 
-    // Build the ShadowDiffRequest envelope
-    let sid = session_id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid session ID".to_string()))?;
-
-    let request_msg = ArcToClient::ShadowDiffRequest {
-        session_id: sid,
-        request_id: request_id.clone(),
-    };
-
-    let encoded = encode(&request_msg).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Encode error: {e}"),
-        )
-    })?;
-
     // Register a oneshot channel BEFORE sending to the host so that a very
     // fast response cannot arrive and call resolve_shadow_diff before the
     // waiter entry exists (which would cause a spurious timeout).
@@ -75,27 +54,17 @@ pub async fn get_shadow_diff(
         .relay
         .register_shadow_diff_waiter(&request_id, tx);
 
-    // JSON-RPC path: if a JSON-RPC host entry exists for this session, emit
-    // arc.host.shadow_diff_request directly on its notification channel.
-    // The msgpack send_to_host call below stays as the legacy path — both run
-    // in parallel until Phase G removes msgpack.
-    // NOTE: the T1 translator also handles ArcToClient::ShadowDiffRequest from
-    // send_to_host; that arm is intentionally kept as a safety net. If the host
-    // is JSON-RPC-only, the translator path is a no-op (send_to_host returns
-    // false for a JSON-RPC-only host) so no double-fire occurs in that case.
-    if let Some(entry) = state.arc_session_store.get(&session_id).await {
-        emit_host_shadow_diff_request(&entry, &request_id);
-    }
-
-    // Send the request to the host via the relay router (msgpack legacy path).
-    if !state.relay.send_to_host(&session_id, encoded).await {
-        // Clean up the waiter we just registered before returning the error.
+    // Phase G: JSON-RPC is the sole transport.  Emit arc.host.shadow_diff_request
+    // on the host's notification channel.  If no JSON-RPC host entry exists the
+    // host is not connected; clean up and return 502.
+    let Some(entry) = state.arc_session_store.get(&session_id).await else {
         state.relay.remove_shadow_diff_waiter(&request_id);
         return Err((
             StatusCode::BAD_GATEWAY,
             "Host not connected for session".to_string(),
         ));
-    }
+    };
+    emit_host_shadow_diff_request(&entry, &request_id);
 
     // Wait for the response with a timeout
     let diff = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
