@@ -40,7 +40,7 @@ pub async fn handle_jsonrpc_connection(
     let jwt_secret = state.config.jwt_secret.clone();
 
     let mut dispatcher = RpcDispatcher::new();
-    crate::rpc::register_if_enabled(
+    crate::rpc::register(
         &mut dispatcher,
         state.arc_session_store.clone(),
         state.relay.clone(),
@@ -49,7 +49,7 @@ pub async fn handle_jsonrpc_connection(
         user_id,
     );
     if let Some(backend) = state.arc_ai_backend.clone() {
-        crate::ai_rpc::register_if_enabled(
+        crate::ai_rpc::register(
             &mut dispatcher,
             backend,
             state.arc_ai_session_store.clone(),

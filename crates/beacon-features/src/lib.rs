@@ -43,12 +43,6 @@ pub enum FeatureFlag {
     NewPersistence,
     /// Remote sessions v2 transport. (P6 placeholder)
     RemoteV2,
-    /// JSON-RPC spine unification. (P7 placeholder)
-    ///
-    /// GA since 2026-05-02; no longer gates production code paths post-Phase G
-    /// (2026-05-05). Retained for back-compat of `FeatureFlag` enum and
-    /// `BEACON_FF_JSON_RPC_SPINE` env-var introspection.
-    JsonRpcSpine,
     /// Command signatures v2 corpus for ghost-text ranking. (P5 placeholder)
     CommandSignaturesV2,
     /// Prompt the user before an AI agent writes to a block for the first time.
@@ -63,7 +57,6 @@ impl FeatureFlag {
             FeatureFlag::ArcRouting => "arc_routing",
             FeatureFlag::NewPersistence => "new_persistence",
             FeatureFlag::RemoteV2 => "remote_v2",
-            FeatureFlag::JsonRpcSpine => "json_rpc_spine",
             FeatureFlag::CommandSignaturesV2 => "command_signatures_v2",
             FeatureFlag::AgentFirstWritePrompt => "agent_first_write_prompt",
         }
@@ -80,7 +73,6 @@ impl FeatureFlag {
             "arc_routing" => Some(FeatureFlag::ArcRouting),
             "new_persistence" => Some(FeatureFlag::NewPersistence),
             "remote_v2" => Some(FeatureFlag::RemoteV2),
-            "json_rpc_spine" => Some(FeatureFlag::JsonRpcSpine),
             "command_signatures_v2" => Some(FeatureFlag::CommandSignaturesV2),
             "agent_first_write_prompt" => Some(FeatureFlag::AgentFirstWritePrompt),
             _ => None,
@@ -89,12 +81,8 @@ impl FeatureFlag {
 
     /// Built-in default for this flag (independent of debug/release mode).
     fn builtin_default(self) -> bool {
-        match self {
-            // GA — JSON-RPC spine handlers are now always registered.
-            FeatureFlag::JsonRpcSpine => true,
-            // All other flags default OFF unless listed in DOGFOOD_FLAGS (for debug builds).
-            _ => false,
-        }
+        // All flags default OFF unless listed in DOGFOOD_FLAGS (for debug builds).
+        false
     }
 }
 
@@ -335,7 +323,6 @@ mod tests {
         assert_eq!(FeatureFlag::ArcRouting.as_str(), "arc_routing");
         assert_eq!(FeatureFlag::NewPersistence.as_str(), "new_persistence");
         assert_eq!(FeatureFlag::RemoteV2.as_str(), "remote_v2");
-        assert_eq!(FeatureFlag::JsonRpcSpine.as_str(), "json_rpc_spine");
         assert_eq!(FeatureFlag::CommandSignaturesV2.as_str(), "command_signatures_v2");
         // P3e2: Tier 2 flag
         assert_eq!(FeatureFlag::AgentFirstWritePrompt.as_str(), "agent_first_write_prompt");
@@ -344,7 +331,7 @@ mod tests {
     #[test]
     fn test_env_var_name() {
         assert_eq!(FeatureFlag::ArcRouting.env_var(), "BEACON_FF_ARC_ROUTING");
-        assert_eq!(FeatureFlag::JsonRpcSpine.env_var(), "BEACON_FF_JSON_RPC_SPINE");
+        assert_eq!(FeatureFlag::CommandSignaturesV2.env_var(), "BEACON_FF_COMMAND_SIGNATURES_V2");
     }
 
     #[test]
@@ -353,7 +340,6 @@ mod tests {
             FeatureFlag::ArcRouting,
             FeatureFlag::NewPersistence,
             FeatureFlag::RemoteV2,
-            FeatureFlag::JsonRpcSpine,
             FeatureFlag::CommandSignaturesV2,
             // P3e2: Tier 2 flag
             FeatureFlag::AgentFirstWritePrompt,
@@ -377,7 +363,6 @@ mod tests {
             FeatureFlag::ArcRouting,
             FeatureFlag::NewPersistence,
             FeatureFlag::RemoteV2,
-            FeatureFlag::JsonRpcSpine,
             FeatureFlag::CommandSignaturesV2,
             // P3e2: Tier 2 flag
             FeatureFlag::AgentFirstWritePrompt,
@@ -456,7 +441,6 @@ mod tests {
             "BEACON_FF_ARC_ROUTING",
             "BEACON_FF_NEW_PERSISTENCE",
             "BEACON_FF_REMOTE_V2",
-            "BEACON_FF_JSON_RPC_SPINE",
             "BEACON_FF_COMMAND_SIGNATURES_V2",
         ] {
             std::env::remove_var(var);
@@ -466,8 +450,6 @@ mod tests {
         // In debug cfg, DOGFOOD_FLAGS is also empty, so still false.
         assert!(!FeatureFlag::NewPersistence.builtin_default());
         assert!(!FeatureFlag::RemoteV2.builtin_default());
-        // JsonRpcSpine is now GA → builtin_default = true.
-        assert!(FeatureFlag::JsonRpcSpine.builtin_default());
         assert!(!FeatureFlag::CommandSignaturesV2.builtin_default());
     }
 
@@ -476,13 +458,11 @@ mod tests {
     #[test]
     fn test_dogfood_flags_constant_exists() {
         // Currently exercises NewPersistence + CommandSignaturesV2 + RemoteV2
-        // by default in debug builds (3 flags as of 2026-05-02 — JsonRpcSpine
-        // graduated to GA via builtin_default = true and was removed from this list).
+        // by default in debug builds (3 flags as of 2026-05-06).
         assert!(DOGFOOD_FLAGS.len() >= 3);
         assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::NewPersistence));
         assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::CommandSignaturesV2));
         assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::RemoteV2));
-        assert!(!DOGFOOD_FLAGS.contains(&FeatureFlag::JsonRpcSpine));
     }
 
     #[cfg(debug_assertions)]
@@ -602,7 +582,6 @@ new_persistence = false"#;
             "arc_routing",
             "new_persistence",
             "remote_v2",
-            "json_rpc_spine",
             "command_signatures_v2",
             "agent_first_write_prompt",
         ];

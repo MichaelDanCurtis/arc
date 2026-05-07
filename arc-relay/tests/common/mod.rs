@@ -317,13 +317,6 @@ pub async fn host_register_session(relay: &Relay, user: &UserCreds, label: &str)
 /// The JWT secret is pinned to `"test-secret"` so that [`mint_access_token`]
 /// works without a real config.
 pub async fn spawn_test_server() -> (std::net::SocketAddr, AppState) {
-    // Ensure JsonRpcSpine is enabled for all JSON-RPC integration tests.
-    // (Also in DOGFOOD_FLAGS for debug builds, but env var is authoritative.)
-    // TODO(beacon-features test setter): replace with a proper test-mode setter on
-    // `beacon_features` once added; `set_var` is unsafe under concurrent reads and
-    // leaks process-globally to other tests in this binary.
-    std::env::set_var("BEACON_FF_JSON_RPC_SPINE", "1");
-
     // Lazy pool — DB is not exercised in these tests.
     let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
         .expect("lazy pool");
@@ -363,8 +356,6 @@ pub async fn spawn_test_server() -> (std::net::SocketAddr, AppState) {
 pub async fn spawn_test_server_with_ai(
     backend: std::sync::Arc<dyn arc_relay::ai_rpc::ArcAiBackend>,
 ) -> (std::net::SocketAddr, AppState) {
-    std::env::set_var("BEACON_FF_JSON_RPC_SPINE", "1");
-
     let pool = sqlx::PgPool::connect_lazy("postgres://arc:arc@localhost:5432/arc")
         .expect("lazy pool");
     let mut config = ArcConfig::default();

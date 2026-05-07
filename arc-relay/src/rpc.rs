@@ -18,13 +18,9 @@
 //!   `arc.host.shadow_diff_response`
 //!
 //! These handlers live alongside the existing msgpack `ClientToArc` /
-//! `ArcToClient` envelope (see `arc-relay/src/ws/handler.rs`); they do not
-//! replace it. Migration strategy: gate the handlers behind
-//! [`beacon_features::FeatureFlag::JsonRpcSpine`] and let callers opt in
-//! through a separate jsonrpc-aware WS endpoint in a later slice. Until that
-//! cut-over lands the handlers operate against an in-rpc-layer
-//! [`ArcSessionStore`] that mirrors the per-session lease/presence state the
-//! existing `MirrorRegistry` already tracks.
+//! `ArcToClient` envelope (see `arc-relay/src/ws/handler.rs`). They operate
+//! against an in-rpc-layer [`ArcSessionStore`] that mirrors the per-session
+//! lease/presence state the existing `MirrorRegistry` already tracks.
 //!
 //! # Wire format — methods
 //!
@@ -1108,7 +1104,7 @@ pub struct ArcHostSessionRegisterHandler {
     /// Uuid of the authenticated user on this WebSocket connection. Set to
     /// `Uuid::nil()` in unit-test contexts where no real auth is present; the
     /// production path threads the real user_id from the WS upgrade handler via
-    /// `register_if_enabled`.
+    /// `register`.
     user_id: Uuid,
 }
 
@@ -1861,7 +1857,7 @@ impl crate::mirror::fanout::BroadcastEmitter for ArcMirrorEmitter {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a fresh dispatcher with all 19 arc.session.* + arc.host.* handlers registered.
-/// Mainly used in tests; production wires through [`register_if_enabled`].
+/// Mainly used in tests; production wires through [`register`].
 ///
 /// `relay`, `mirror_registry`, `pool`, and `user_id` are threaded into
 /// `ArcHostSessionRegisterHandler` for full Phase F wire-up. Pass a nil Uuid
@@ -1909,56 +1905,50 @@ pub fn build_arc_session_dispatcher(
     d
 }
 
-/// Register all 19 arc.session.* + arc.host.* handlers with `dispatcher` if
-/// `JsonRpcSpine` is on. Returns `true` when handlers were registered.
+/// Register all 19 arc.session.* + arc.host.* handlers with `dispatcher`.
 ///
 /// `relay`, `mirror_registry`, `pool`, and `user_id` are required for the
 /// full Phase F wire-up of `arc.host.session_register`.
-pub fn register_if_enabled(
+pub fn register(
     dispatcher: &mut RpcDispatcher,
     store: ArcSessionStore,
     relay: Arc<crate::relay::router::RelayRouter>,
     mirror_registry: crate::mirror::MirrorRegistry,
     pool: sqlx::PgPool,
     user_id: Uuid,
-) -> bool {
-    if beacon_features::is_enabled(beacon_features::FeatureFlag::JsonRpcSpine) {
-        // Watcher surface (Phase A + B + C)
-        dispatcher.try_register(ArcSessionAttachHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionDetachHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionSubscribeHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionUnsubscribeHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionControlHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionReleaseHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionApproveControlHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionDenyControlHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionInputHandler::new(store.clone()));
-        dispatcher.try_register(ArcSessionResizeHandler::new(store.clone()));
-        // Host surface (Phase D + F)
-        dispatcher.try_register(ArcHostHelloHandler::new());
-        dispatcher.try_register(ArcHostSessionRegisterHandler::new(
-            store.clone(),
-            relay.clone(),
-            mirror_registry.clone(),
-            pool.clone(),
-            user_id,
-        ));
-        dispatcher.try_register(ArcHostSessionUnregisterHandler::new(
-            store.clone(),
-            relay.clone(),
-            mirror_registry.clone(),
-            pool,
-        ));
-        dispatcher.try_register(ArcHostBlockStartHandler::new(store.clone()));
-        dispatcher.try_register(ArcHostBlockChunkHandler::new(store.clone()));
-        dispatcher.try_register(ArcHostBlockEndHandler::new(store.clone()));
-        dispatcher.try_register(ArcHostSessionResizeHandler::new(store.clone(), relay.clone()));
-        dispatcher.try_register(ArcHostPushOutputHandler::new(store, mirror_registry));
-        dispatcher.try_register(ArcHostShadowDiffResponseHandler::new(relay));
-        true
-    } else {
-        false
-    }
+) {
+    // Watcher surface (Phase A + B + C)
+    dispatcher.try_register(ArcSessionAttachHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionDetachHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionSubscribeHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionUnsubscribeHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionControlHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionReleaseHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionApproveControlHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionDenyControlHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionInputHandler::new(store.clone()));
+    dispatcher.try_register(ArcSessionResizeHandler::new(store.clone()));
+    // Host surface (Phase D + F)
+    dispatcher.try_register(ArcHostHelloHandler::new());
+    dispatcher.try_register(ArcHostSessionRegisterHandler::new(
+        store.clone(),
+        relay.clone(),
+        mirror_registry.clone(),
+        pool.clone(),
+        user_id,
+    ));
+    dispatcher.try_register(ArcHostSessionUnregisterHandler::new(
+        store.clone(),
+        relay.clone(),
+        mirror_registry.clone(),
+        pool,
+    ));
+    dispatcher.try_register(ArcHostBlockStartHandler::new(store.clone()));
+    dispatcher.try_register(ArcHostBlockChunkHandler::new(store.clone()));
+    dispatcher.try_register(ArcHostBlockEndHandler::new(store.clone()));
+    dispatcher.try_register(ArcHostSessionResizeHandler::new(store.clone(), relay.clone()));
+    dispatcher.try_register(ArcHostPushOutputHandler::new(store, mirror_registry));
+    dispatcher.try_register(ArcHostShadowDiffResponseHandler::new(relay));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

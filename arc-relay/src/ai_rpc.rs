@@ -11,8 +11,7 @@
 //! notification surface so that watchers can subscribe with the same code
 //! whether the chat ran locally or through Arc.
 //!
-//! Gated by [`beacon_features::FeatureFlag::JsonRpcSpine`]. When the flag is
-//! OFF the legacy `/v1/ai/*` HTTP routes remain authoritative.
+//! Handlers are registered unconditionally via [`register`].
 //!
 //! # Wire format — methods
 //!
@@ -531,7 +530,7 @@ impl RpcHandler for ArcAiListModelsHandler {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Build a fresh dispatcher with all three `arc.ai.*` handlers registered.
-/// Mainly used in tests; production wires through [`register_if_enabled`].
+/// Mainly used in tests; production wires through [`register`].
 pub fn build_arc_ai_dispatcher(
     backend: Arc<dyn ArcAiBackend>,
     store: ArcAiSessionStore,
@@ -543,22 +542,15 @@ pub fn build_arc_ai_dispatcher(
     d
 }
 
-/// Register all three `arc.ai.*` handlers with `dispatcher` if
-/// [`beacon_features::FeatureFlag::JsonRpcSpine`] is enabled. Returns `true`
-/// when handlers were registered.
-pub fn register_if_enabled(
+/// Register all three `arc.ai.*` handlers with `dispatcher`.
+pub fn register(
     dispatcher: &mut RpcDispatcher,
     backend: Arc<dyn ArcAiBackend>,
     store: ArcAiSessionStore,
-) -> bool {
-    if beacon_features::is_enabled(beacon_features::FeatureFlag::JsonRpcSpine) {
-        dispatcher.try_register(ArcAiChatHandler::new(backend.clone()));
-        dispatcher.try_register(ArcAiStreamChatHandler::new(backend.clone(), store));
-        dispatcher.try_register(ArcAiListModelsHandler::new(backend));
-        true
-    } else {
-        false
-    }
+) {
+    dispatcher.try_register(ArcAiChatHandler::new(backend.clone()));
+    dispatcher.try_register(ArcAiStreamChatHandler::new(backend.clone(), store));
+    dispatcher.try_register(ArcAiListModelsHandler::new(backend));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

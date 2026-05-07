@@ -35,9 +35,6 @@ pub trait RpcHandler: Send + Sync {
 }
 
 /// Central dispatcher: holds a registry of [`RpcHandler`]s and routes requests.
-///
-/// The dispatcher is constructed unconditionally; gating via [`beacon_features::FeatureFlag::JsonRpcSpine`]
-/// is the caller's responsibility (i.e. call [`RpcDispatcher::dispatch`] only when the flag is enabled).
 #[derive(Default)]
 pub struct RpcDispatcher {
     handlers: HashMap<String, Arc<dyn RpcHandler>>,

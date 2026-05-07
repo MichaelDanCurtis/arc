@@ -56,7 +56,7 @@ complexity of callback interfaces when the notification may fire from any async 
 
 `ai.session.create`, `ai.send_message`, plus the three streaming notifications
 (`ai.chunk`, `ai.done`, `ai.error`) shipped on `feat/jsonrpc-ai`. Handlers in
-`beacon-multi-agent/src/ai_rpc.rs` gated by `JsonRpcSpine`. Streaming-over-RPC
+`beacon-multi-agent/src/ai_rpc.rs` registered unconditionally. Streaming-over-RPC
 design: `ai.send_message` returns `{ok:true}` immediately, then a spawned task
 drives `Provider::stream_chat` and emits `ai.chunk` per `StreamEvent::Text` and
 either `ai.done` or `ai.error` as the terminal frame. Subscribers attach via
@@ -76,7 +76,7 @@ moves over.
 
 `memory.list`, `memory.load`, `memory.save`, `memory.delete`, `memory.retrieval`
 shipped on `feat/jsonrpc-memory`. Handlers in `beacon-multi-agent/src/memory/rpc.rs`
-gated by `JsonRpcSpine` flag. Uniffi `memory::ffi` surface kept in parallel
+registered unconditionally. Uniffi `memory::ffi` surface kept in parallel
 until callers cut over.
 
 ---
@@ -112,8 +112,8 @@ Reference: `arc-relay/docs/ai-route.md` (P3 deferred endpoint spec).
 
 `arc.session.attach`, `arc.session.control`, `arc.session.release`, plus the
 `arc.session.participant` notification shipped on `feat/jsonrpc-arc-session`.
-Handlers in `arc-relay/src/rpc.rs` gated by `JsonRpcSpine` via
-`register_if_enabled`. Per-session state lives in `ArcSessionStore` (controller
+Handlers in `arc-relay/src/rpc.rs` registered unconditionally via
+`register`. Per-session state lives in `ArcSessionStore` (controller
 holder + per-session `broadcast::Sender<String>` for notifications). The
 existing msgpack `ClientToArc`/`ArcToClient` envelope through
 `ws/handler.rs` is unchanged; the jsonrpc handlers are wired into the WS
@@ -128,8 +128,8 @@ without that dep.
 ### arc.ai.* status (feat/jsonrpc-arc-ai)
 
 `arc.ai.chat`, `arc.ai.stream_chat`, `arc.ai.list_models` shipped on
-`feat/jsonrpc-arc-ai`. Handlers in `arc-relay/src/ai_rpc.rs` gated by
-`JsonRpcSpine` via `register_if_enabled`. The handlers depend on a pluggable
+`feat/jsonrpc-arc-ai`. Handlers in `arc-relay/src/ai_rpc.rs` registered
+unconditionally via `register`. The handlers depend on a pluggable
 `ArcAiBackend` trait (3 methods: `chat`, `stream_chat`, `list_models`).
 Streaming reuses the same `ai.chunk` / `ai.done` / `ai.error` notification
 surface as the local `ai.*` slice — watchers subscribe with identical code
@@ -428,9 +428,17 @@ transport. All msgpack wire code deleted.
 
 #### Kept (intentionally retained for back-compat)
 
-- `FeatureFlag::JsonRpcSpine` — variant retained in enum; `BEACON_FF_JSON_RPC_SPINE` env-var introspection still works. No longer gates any code path.
 - `ConnectionState` enum — moved from deleted `connection.rs` to `beacon-net::config` (shared by `jsonrpc/client.rs` and `jsonrpc_connection.rs`).
 - `beacon-hostd::rpc::register` — previously `register_if_enabled`; `JsonRpcSpine` gate removed, returns `()`.
+
+#### Cleanup tail (post-Phase G, 2026-05-06)
+
+`FeatureFlag::JsonRpcSpine` has been **removed** from the `beacon-features` enum.
+All formerly-gated `register_if_enabled` helpers were renamed to `register` and
+the `is_enabled(JsonRpcSpine)` checks were dropped — handlers now register
+unconditionally. `BEACON_FF_JSON_RPC_SPINE` env-var and `json_rpc_spine` TOML
+keys are silently ignored by `from_str_key` (unknown key → `None`). No panic,
+no data loss.
 
 #### Subprotocol enforcement
 
@@ -548,27 +556,22 @@ excludes plugin-host gRPC from the unification scope.
 
 ## Estimated migration order
 
-1. `command.describe` — **DONE** (branch `refactor/jsonrpc-spine`, gated by `FeatureFlag::JsonRpcSpine`)
+1. `command.describe` — **DONE** (branch `refactor/jsonrpc-spine`)
 2. `session.*` (5 methods) + 4 session notifications — **DONE** (branch `feat/jsonrpc-hostd`)
    - `SessionRpcHandler` in `beacon-hostd/src/rpc.rs`
    - `FfiHostdRpc` + `FfiNotifReceiver` + `FfiSessionStore` in `beacon-ffi/src/lib.rs`
    - Notification channel: `broadcast::Sender<String>` per session, polled via `FfiNotifReceiver::poll_next()`
-3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`, gated by `JsonRpcSpine`)
-4. `ai.*` (`ai.session.create`, `ai.send_message` + 3 streaming notifications) — **DONE** (branch `feat/jsonrpc-ai`, gated by `JsonRpcSpine`)
+3. `memory.*` (list, load, save, delete, retrieval) — **DONE** (branch `feat/jsonrpc-memory`)
+4. `ai.*` (`ai.session.create`, `ai.send_message` + 3 streaming notifications) — **DONE** (branch `feat/jsonrpc-ai`)
 5. `arc.*` — `arc.session.*` (3 methods + 1 notif) **DONE** (branch `feat/jsonrpc-arc-session`); `arc.mirror.*` (3 notifs) **DONE** (branch `feat/jsonrpc-arc-mirror`); `arc.ai.*` (3 methods) **DONE** (branch `feat/jsonrpc-arc-ai`)
 6. `remote.*` — connect/disconnect + 4 notifs **DONE** (branch `feat/jsonrpc-remote`); exec/file.read/file.write/forward.start advertised but stubbed pending russh wiring
 
 Each migration step was feature-flagged (`FeatureFlag::JsonRpcSpine`) until
 the full boundary cut over. Phase G (2026-05-05) completed the cut-over and
-deleted all msgpack wire code; `JsonRpcSpine` is retained for back-compat only.
-
-### `JsonRpcSpine` default → ON (2026-05-02)
-
-`FeatureFlag::JsonRpcSpine.builtin_default()` now returns `true` (release + debug). All
-`register_if_enabled` call sites continue to honour env (`BEACON_FF_JSON_RPC_SPINE=0`)
-and TOML overrides, so callers can still disable the spine if needed. Removal of the
-gating helpers (turning `register_if_enabled` into unconditional `register`) is a
-follow-up cleanup once the wire-side cut-over (msgpack → JSON-RPC) is complete.
+deleted all msgpack wire code. The cleanup tail (2026-05-06) removed the
+`JsonRpcSpine` enum variant entirely — all `register_if_enabled` helpers were
+renamed to `register` and the `is_enabled` checks dropped; handlers now
+register unconditionally.
 
 ---
 
