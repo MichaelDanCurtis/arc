@@ -17,6 +17,7 @@ use crate::rpc::ArcSessionStore;
 
 pub mod ai_routes;
 pub mod auth_routes;
+pub mod graphql_routes;
 pub mod marketplace_author_routes;
 pub mod marketplace_install_routes;
 pub mod marketplace_org_routes;
@@ -171,6 +172,13 @@ pub fn build_router(state: AppState) -> Router {
     // ── WebSocket route ──────────────────────────────────────────────────────
     let ws = Router::new().route("/ws", get(crate::ws::handler::ws_handler));
 
+    // ── Beam GraphQL-compat surface ─────────────────────────────────────────
+    // Beam OSS clients hit `/graphql/v2?op=<OperationName>` for a handful of
+    // legacy queries — most notably `FreeAvailableModels` on first launch.
+    // The stub handler returns sensible empty responses so the client
+    // doesn't spam DNS-failure warnings.
+    let graphql = Router::new().route("/v2", post(graphql_routes::graphql_handler));
+
     Router::new()
         .nest("/api/auth", auth)
         .nest("/api/marketplace", marketplace)
@@ -178,6 +186,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/v1/ai", ai)
         .nest("/api/setup", setup)
         .nest("/api/audit", audit)
+        .nest("/graphql", graphql)
         .merge(ws)
         .with_state(state)
 }
@@ -354,6 +363,47 @@ pub(crate) mod tests {
     async fn unknown_route_returns_404() {
         let s = status(build_router(test_state()), "GET", "/api/unknown-path").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn graphql_v2_route_exists_and_serves_free_available_models() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/graphql/v2?op=FreeAvailableModels")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"query FreeAvailableModels { __typename }","variables":{}}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status_code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status_code, StatusCode::OK, "/graphql/v2 must respond 200, body was {body}");
+        // Stub shape: data.freeAvailableModels.models = []
+        let models = body
+            .get("data")
+            .and_then(|d| d.get("freeAvailableModels"))
+            .and_then(|f| f.get("models"))
+            .expect("data.freeAvailableModels.models");
+        assert!(models.is_array());
+        assert!(models.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn graphql_v2_unknown_op_returns_graphql_error() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/graphql/v2?op=SomeUnknownOp")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // GraphQL-shape error response, not a 4xx
+        assert!(body.get("errors").is_some(), "expected GraphQL errors field, got {body}");
     }
 
     // ── protected route with valid token ────────────────────────────────────
