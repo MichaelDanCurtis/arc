@@ -18,6 +18,7 @@ use crate::rpc::ArcSessionStore;
 pub mod ai_routes;
 pub mod auth_routes;
 pub mod graphql_routes;
+pub mod health_routes;
 pub mod marketplace_author_routes;
 pub mod marketplace_install_routes;
 pub mod marketplace_org_routes;
@@ -180,6 +181,7 @@ pub fn build_router(state: AppState) -> Router {
     let graphql = Router::new().route("/v2", post(graphql_routes::graphql_handler));
 
     Router::new()
+        .route("/health", get(health_routes::health_handler))
         .nest("/api/auth", auth)
         .nest("/api/marketplace", marketplace)
         .nest("/api", api)
@@ -363,6 +365,50 @@ pub(crate) mod tests {
     async fn unknown_route_returns_404() {
         let s = status(build_router(test_state()), "GET", "/api/unknown-path").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    // ── /health (tier-one observability probe target) ────────────────────────
+
+    #[tokio::test]
+    async fn health_route_returns_ok_json_with_required_fields() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status_code = resp.status();
+        assert_eq!(
+            status_code,
+            StatusCode::OK,
+            "/health must return 200 (got {status_code}) — route may not be wired"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("/health body must be JSON");
+        assert_eq!(
+            body.get("status").and_then(|s| s.as_str()),
+            Some("ok"),
+            "status must be \"ok\", body was {body}"
+        );
+        assert!(
+            body.get("version")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "version must be a non-empty string, body was {body}"
+        );
+        assert!(
+            body.get("uptime_seconds")
+                .and_then(|u| u.as_u64())
+                .is_some(),
+            "uptime_seconds must be a u64, body was {body}"
+        );
+        assert!(
+            body.get("build_sha").and_then(|b| b.as_str()).is_some(),
+            "build_sha must be a string (may be empty), body was {body}"
+        );
     }
 
     #[tokio::test]
