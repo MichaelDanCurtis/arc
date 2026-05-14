@@ -19,12 +19,17 @@ RUN cargo install wasm-pack --version 0.14.0 --locked
 
 WORKDIR /workspace
 
-# Copy the whole workspace — it's small (6 crates) and Docker layer caching
-# only invalidates this layer when one of those Cargo.toml/.lock/src files
-# changes, which is fine.
 COPY Cargo.toml Cargo.toml
 COPY rust-toolchain.toml rust-toolchain.toml
 COPY crates crates
+
+# arc-relay is the 7th workspace member but we don't compile it here.
+# Stub its manifest + empty lib/main so cargo's workspace resolver is
+# happy without bringing arc-relay/ into this layer's cache key.
+RUN mkdir -p arc-relay/src && \
+    printf '[package]\nname = "arc-relay"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "arc_relay"\npath = "src/lib.rs"\n\n[[bin]]\nname = "arc-relay"\npath = "src/main.rs"\n' > arc-relay/Cargo.toml && \
+    echo "// stub" > arc-relay/src/lib.rs && \
+    echo "fn main() {}" > arc-relay/src/main.rs
 
 RUN rustup target add wasm32-unknown-unknown
 RUN wasm-pack build \
