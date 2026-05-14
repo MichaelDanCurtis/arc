@@ -1,0 +1,60 @@
+# ARC — workspace manifest
+#
+# This repo houses the Arc relay (arc-relay) + Arc web frontend (arc-web)
+# and the six shared crates that both the Arc server and its clients
+# (Beacon, Beam) consume from the wire-protocol layer.
+#
+# Lineage: extracted from MichaelDanCurtis/Beacon (`WarpClone/`) on
+# 2026-05-13 per `docs/superpowers/specs/2026-05-13-arc-extraction-migration.md`
+# in the WarpClone history. The shared crates were renamed:
+#   WarpClone/beacon-core/crates/<X> → ARC/crates/<X>
+# Their package names keep the `beacon-` prefix for backwards-source-compat
+# with downstream consumers; a rename pass can come later if desired.
+
+[workspace]
+resolver = "2"
+members = [
+    "arc-relay",
+    "crates/beacon-features",
+    "crates/beacon-model",
+    "crates/beacon-proto",
+    "crates/beacon-blocks",
+    "crates/beacon-blocks-wasm",
+    "crates/beacon-jsonrpc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MichaelDanCurtis/arc"
+
+# Shared deps — superset that any member can opt into via `{ workspace = true }`.
+# Copied from the beacon-core workspace at the time of extraction; some entries
+# are aspirational (no current crate uses them) but kept so future Arc work
+# doesn't have to retype version pins.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = ">=1.1, <1.2"
+thiserror = "1"
+tracing = "0.1"
+ulid = { version = "1.1", features = ["serde"] }
+vte = "0.13"
+blake3 = "1.5"
+tempfile = "3"
+pretty_assertions = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time", "signal"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+async-trait = "0.1"
+regex = "1"
+pin-project-lite = "0.2"
+axum = "0.7"
+toml = "0.8"
+hex = "0.4"
+rand = "0.8"

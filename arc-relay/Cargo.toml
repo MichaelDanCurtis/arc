@@ -13,10 +13,10 @@ name = "arc-relay"
 path = "src/main.rs"
 
 [dependencies]
-beacon-model = { path = "../beacon-core/crates/beacon-model" }
-beacon-proto = { path = "../beacon-core/crates/beacon-proto" }
-beacon-jsonrpc = { path = "../beacon-core/crates/beacon-jsonrpc" }
-beacon-features = { path = "../beacon-core/crates/beacon-features" }
+beacon-model = { path = "../crates/beacon-model" }
+beacon-proto = { path = "../crates/beacon-proto" }
+beacon-jsonrpc = { path = "../crates/beacon-jsonrpc" }
+beacon-features = { path = "../crates/beacon-features" }
 axum = { version = "0.7", features = ["ws"] }
 axum-extra = { version = "0.9", features = ["typed-header", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "signal", "time"] }

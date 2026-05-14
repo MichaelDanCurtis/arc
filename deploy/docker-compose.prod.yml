@@ -70,10 +70,16 @@ services:
       # Pin the network so Traefik picks the correct IP when a container is
       # on multiple networks (internal + root_default).
       - "traefik.docker.network=root_default"
-      # /api/* on both hosts → arc-relay. Higher priority than arc-web so
-      # the catch-all doesn't eat it; rule-length is already longer but we
-      # set priority explicitly for safety.
-      - "traefik.http.routers.arc-relay.rule=(Host(`arc.ailuxis.com`) || Host(`beam.ailuxis.com`)) && PathPrefix(`/api`)"
+      # /api/* AND /graphql/* on both hosts → arc-relay. Higher priority
+      # than arc-web so the catch-all doesn't eat them; rule-length is
+      # already longer but we set priority explicitly for safety.
+      #
+      # /graphql/* added 2026-05-13 (extraction migration). arc-relay has
+      # a /graphql/v2 handler (PR #17, commit a338353 / now 7e5a0aa in
+      # this repo) for Beam OSS client compat. Without this Traefik label,
+      # /graphql/v2 is caught by the arc-web catch-all and Next.js 404s
+      # before the request reaches arc-relay.
+      - "traefik.http.routers.arc-relay.rule=(Host(`arc.ailuxis.com`) || Host(`beam.ailuxis.com`)) && (PathPrefix(`/api`) || PathPrefix(`/graphql`))"
       - "traefik.http.routers.arc-relay.entrypoints=websecure"
       - "traefik.http.routers.arc-relay.tls=true"
       - "traefik.http.routers.arc-relay.tls.certresolver=mytlschallenge"

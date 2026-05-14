@@ -1,0 +1,12 @@
+**/target/
+**/.DS_Store
+**/node_modules/
+**/.env
+**/.env.local
+*.swp
+*.pyc
+arc-web/.next/
+.superpowers/
+.claude/worktrees/
+.idea/
+.vscode/
