@@ -2,15 +2,49 @@ use arc_relay::{api, audit, config, db, relay, retention};
 use std::sync::Arc;
 
 use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Initialise Sentry FIRST, before the tracing subscriber, so that
+    // panics and tracing::error! events from the rest of startup are
+    // captured. If SENTRY_DSN is unset, `sentry::init((None, ...))`
+    // returns an inactive client — no network calls, no overhead.
+    // The returned guard MUST stay alive for the process duration;
+    // dropping it flushes pending events and disconnects.
+    let _sentry_guard = sentry::init((
+        std::env::var("SENTRY_DSN").ok(),
+        sentry::ClientOptions {
+            release: Some(
+                format!(
+                    "arc-relay@{}+{}",
+                    env!("CARGO_PKG_VERSION"),
+                    option_env!("BUILD_SHA").unwrap_or("unknown")
+                )
+                .into(),
+            ),
+            // 10% of traces sampled for performance monitoring. Tune
+            // per-environment via SENTRY_TRACES_SAMPLE_RATE if exposed
+            // later; hardcoded for now.
+            traces_sample_rate: 0.1,
+            attach_stacktrace: true,
+            send_default_pii: false,
+            ..Default::default()
+        },
+    ));
+
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "arc_relay=info".into()),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(sentry_tracing::layer())
         .init();
+
+    // Force START_TIME init so /api/health reports accurate uptime
+    // from process boot rather than from first request.
+    std::sync::LazyLock::force(&api::health_routes::START_TIME);
 
     let config = config::ArcConfig::from_env().expect("invalid configuration");
     let pool = db::init_pool(&config.database_url).await?;

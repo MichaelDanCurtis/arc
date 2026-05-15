@@ -34,6 +34,8 @@ zstd = "0.13"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
+sentry-tracing = "0.34"
 tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
 oauth2 = "4"
