@@ -8,6 +8,14 @@
 # ---------------------------------------------------------------------------
 FROM rust:1.91-bookworm AS builder
 
+# BUILD_SHA is read at compile time by `option_env!("BUILD_SHA")` in
+# arc-relay/src/api/health_routes.rs and surfaced via GET /health's
+# `build_sha` field. Default "unknown" so `cargo run` on a dev laptop
+# (no build-arg) still produces a working binary; CI passes the real
+# SHA via `--build-arg BUILD_SHA=$(git rev-parse --short HEAD)`.
+ARG BUILD_SHA=unknown
+ENV BUILD_SHA=${BUILD_SHA}
+
 WORKDIR /build
 
 # Copy the workspace + the binary's source. Workspace manifest at root
