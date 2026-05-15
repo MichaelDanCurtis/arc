@@ -1,4 +1,4 @@
-//! `/health` — tier-one observability probe target.
+//! `/api/health` — tier-one observability probe target.
 //!
 //! Returns 200 with JSON `{status, version, uptime_seconds, build_sha}`. No
 //! auth required; no DB ping (yet). Designed to be cheap enough that an

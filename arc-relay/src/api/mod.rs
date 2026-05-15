@@ -180,8 +180,14 @@ pub fn build_router(state: AppState) -> Router {
     // doesn't spam DNS-failure warnings.
     let graphql = Router::new().route("/v2", post(graphql_routes::graphql_handler));
 
+    // ── /api/health — tier-one uptime probe target ───────────────────────────
+    // Lives under /api/* so Traefik's PathPrefix(`/api`) rule routes it to
+    // arc-relay. A root-level /health would 404 from arc-web (the catch-all
+    // frontend) because Traefik doesn't route bare /health to the relay.
+    let health = Router::new().route("/", get(health_routes::health_handler));
+
     Router::new()
-        .route("/health", get(health_routes::health_handler))
+        .nest("/api/health", health)
         .nest("/api/auth", auth)
         .nest("/api/marketplace", marketplace)
         .nest("/api", api)
@@ -367,14 +373,14 @@ pub(crate) mod tests {
         assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
-    // ── /health (tier-one observability probe target) ────────────────────────
+    // ── /api/health (tier-one observability probe target) ────────────────────
 
     #[tokio::test]
     async fn health_route_returns_ok_json_with_required_fields() {
         let app = build_router(test_state());
         let req = Request::builder()
             .method("GET")
-            .uri("/health")
+            .uri("/api/health")
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -382,12 +388,12 @@ pub(crate) mod tests {
         assert_eq!(
             status_code,
             StatusCode::OK,
-            "/health must return 200 (got {status_code}) — route may not be wired"
+            "/api/health must return 200 (got {status_code}) — route may not be wired"
         );
 
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let body: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("/health body must be JSON");
+            serde_json::from_slice(&bytes).expect("/api/health body must be JSON");
         assert_eq!(
             body.get("status").and_then(|s| s.as_str()),
             Some("ok"),
