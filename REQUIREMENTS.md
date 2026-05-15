@@ -34,9 +34,10 @@ call site or planned PR for it. "Nice to haves" go in
 |---|---|---|---|
 | Providers | (TBD: GitHub? Google? Microsoft?) | (TBD) | All three; cred config in arc-relay `.env` |
 | Endpoint | `/api/auth/oauth/<provider>` (existing) | (TBD) | Keep existing |
-| Token format | (TBD: bearer? JWT?) | (TBD) | (TBD) |
+| Token format | (TBD: bearer? JWT?) | (TBD) | **JWT (HS256, 32+ char secret), bearer in `Authorization` header** |
 | Session lifetime | (TBD) | (TBD) | (TBD) |
 | Refresh flow | (TBD) | (TBD) | (TBD) |
+| Surface | n/a | n/a | **HTTP routes (`POST /api/auth/{register,login,refresh}`, `GET /api/auth/oauth/:provider`), NOT JSON-RPC. Bearer JWT enforced at WS upgrade (`?token=...`) and on protected `/api/*` HTTP routes. No `arc.auth.*` JSON-RPC methods by design.** |
 
 ### 2. AI chat streaming
 
@@ -73,20 +74,20 @@ call site or planned PR for it. "Nice to haves" go in
 
 |  | Beacon | Beam | Convergence |
 |---|---|---|---|
-| Target self | yes (already via beacon-host) | yes | unified `arc.exec.spawn { target: "self" }` |
+| Target self | yes (already via beacon-host) | yes (beam-001 §B ack) | unified `arc.exec.spawn { target: Self }` — **typed enum, not free-form string** (beam-001 §B) |
 | Target another user | within-org, with consent | cross-org, with consent | same wire; differ on org gate |
-| Target plugin executor | yes (Slurm, K8s, etc.) | yes | same |
-| Sandbox / CommandPolicy | Beacon has it (`beacon-command`) | Beam: roll own or path-dep into ARC? | (TBD — see consolidation doc Q D) |
+| Target plugin executor | yes (K8s, etc.) | yes (beam-001 §F: prefer K8s as canonical example over Slurm) | same; **Kubernetes as the reference plugin** |
+| Sandbox / CommandPolicy | Beacon has it (`beacon-command`) | **Beam adopts via path-dep** (beam-001 §D) | `beacon-command` is the shared sandbox layer; Beacon owns evolution. Crate may need to move into `ARC/crates/` when Beam path-deps it. **Resolved 2026-05-14.** |
 | Audit log | yes (proprietary requirement) | (TBD) | yes; emit `arc.exec.requested` event |
 
 ### 6. Plugin host (gRPC contracts)
 
 |  | Beacon | Beam | Convergence |
 |---|---|---|---|
-| Runtime | Beacon's `beacon-plugin-host` (in WarpClone, Slice C) | Adopt Beacon's host via path-dep | Same crate; Beacon owns evolution |
+| Runtime | Beacon's `beacon-plugin-host` (in WarpClone, Slice C) | **Adopt via path-dep** (beam-001 §G) | Same crate; Beacon owns evolution |
 | Bundle format | `.beaconplug` (zip + Ed25519 signature) | Same | Same |
-| Capability traits | Executor, Messenger, TerminalProvider, DataSource, EventSink (proposed) | (TBD) | Same trait set |
-| Federation | Beacon: org-shareable | Beam: public-allowlisted | Hooks defined; deferred to v1 |
+| Capability traits | Executor, Messenger, TerminalProvider, DataSource, EventSink (proposed) | **Ack 5-set sufficient for v0** (beam-001 §A); optional `Notifier`/`Alarm` deferred as composable from `EventSink + Executor` | **Ship the 5 as-is.** Add only if a real plugin can't be expressed. |
+| Federation | Beacon: org-shareable | Beam: public-allowlisted | **v0: inert scaffolding** (`arc.plugin.discover` + per-plugin ACL hooks defined but no implementation). **v1: federation lights up.** (beam-001 §C) **Resolved 2026-05-14.** |
 
 ### 7. Marketplace (browse, install, publish)
 
@@ -133,9 +134,20 @@ These are sometimes mentioned but explicitly **not** in Arc's surface:
 ## Decisions still pending
 
 1. **OAuth client_id / R2 creds** — user-action, not coding. See WarpClone milestone plan M2.4.
-2. **Schema for `arc.exec.*` and `arc.msg.*`** — proposed in WarpClone's `docs/superpowers/specs/2026-05-12-arc-properties-and-plugins.md`. Need Beam ack.
-3. **Plugin federation in v0 or v1?** — Beam to weigh in.
-4. **Sandbox crate ownership** — does Beam adopt Beacon's `beacon-command` (CommandPolicy + DangerGate) via path-dep, or roll its own? Beam-claude's call.
+2. **Schema for `arc.exec.*` and `arc.msg.*`** — proposed in WarpClone's `docs/superpowers/specs/2026-05-12-arc-properties-and-plugins.md`. Beam tentative-ack'd shapes in beam-001 §B; specific field-level review pending Beam's next turn.
+3. ~~**Plugin federation in v0 or v1?**~~ → **Resolved 2026-05-14**: v1. v0 ships `arc.plugin.discover` + per-plugin ACL as inert scaffolding so the wire surface doesn't break later (beam-001 §C).
+4. ~~**Sandbox crate ownership**~~ → **Resolved 2026-05-14**: Beam adopts `beacon-command` via path-dep (beam-001 §D). beacon-command stays in WarpClone for now (Beacon-internal); may need to move into `ARC/crates/` when Beam's path-dep wiring lands.
+
+## Shipped wire surface (authoritative)
+
+The complete enumeration of every JSON-RPC method and notification the
+relay actually serves lives in **`arc-relay/docs/rpc-method-inventory.md`**.
+Current counts: 22 methods + 22 notifications = 44 total, concentrated in
+§2 (AI: 7), §3 (mirroring: 24), §8 (host protocol: 13). §4 and §5 are
+proposed-only; zero handlers exist for `arc.msg.*` or `arc.exec.*` today.
+
+The inventory file is regenerated from source; treat it as the source of
+truth when wires diverge from this doc.
 
 ---
 
@@ -144,6 +156,7 @@ These are sometimes mentioned but explicitly **not** in Arc's surface:
 | Date | By | Change |
 |---|---|---|
 | 2026-05-13 | arc-claude (extraction session) | Initial stub. |
+| 2026-05-14 | arc-claude | beam-001 resolutions integrated: §5 typed-enum target + K8s reference + sandbox via path-dep; §6 5-trait ack + federation deferred to v1; §1 convergence row clarifying auth is HTTP not JSON-RPC. Q3 and Q4 resolved. Linked to `arc-relay/docs/rpc-method-inventory.md` for shipped-surface ground truth. |
 | *(next)* | *beacon-claude* | *Populate Beacon columns.* |
 | *(next)* | *beam-claude* | *Populate Beam columns.* |
-| *(next)* | *arc-claude* | *Fill convergence column, commit to shipping the named surface.* |
+| *(next)* | *arc-claude* | *Fill remaining convergence rows after both clients land their columns.* |

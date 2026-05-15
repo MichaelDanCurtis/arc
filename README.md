@@ -108,10 +108,25 @@ A2A channel; protocol at the sibling `a2a-protocol.md`).
 
 ## License
 
-Proprietary. Deployed as a service. Both client codebases path-dep into
-this workspace's crates, but those crates are under the same proprietary
-license unless explicitly re-licensed (none are today). If a crate ends
-up needing to ship inside an OSS client image, it must be relicensed
-before that ships — see WarpClone's
-`skills/agpl-license-blocks-commercial-sister-fork` for the cascade
-considerations.
+Dual structure, to support both the proprietary service and the OSS Beam
+client without a license cascade:
+
+- **`arc-relay/` and `arc-web/`** (service binary + frontend): proprietary.
+  Deployed as a service; not redistributable.
+- **`crates/*`** (wire-protocol shared types — `beacon-features`,
+  `beacon-jsonrpc`, `beacon-model`, `beacon-proto`, `beacon-blocks`,
+  `beacon-blocks-wasm`): **`MIT OR Apache-2.0`**, declared at the
+  workspace level in `Cargo.toml` and inherited by every crate via
+  `license.workspace = true`. Both Beacon (proprietary) and Beam
+  (`MIT OR Apache-2.0`) can path-dep or git-dep these crates without
+  a license-cascade conflict.
+
+License text files at the repo root: `LICENSE-MIT`, `LICENSE-APACHE`.
+SPDX-compliant. Service-binary terms are governed by the deploy agreement
+(TBD at `ailuxis.com/legal/arc-tos`), not the crate license.
+
+If a future crate needs to ship inside an OSS client image, confirm it
+inherits `license.workspace = true` (or sets its own MIT/Apache-2.0
+declaration) before adding new dependencies that could cascade restrictively
+— see the `agpl-license-blocks-commercial-sister-fork` skill for the
+audit checklist.
