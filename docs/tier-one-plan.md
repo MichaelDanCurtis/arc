@@ -75,17 +75,24 @@ can't measure the SLOs we just committed to.
 
 ### 2. Deploy automation (P0 — half exists today)
 
+**Deploy model: arc-claude session as the runner.** Deploys flow through
+a Claude Code session (not GitHub Actions). The session has Docker + the
+Hostinger MCP tool + repo access, which is enough to build, push, refresh,
+and smoke-verify end-to-end. Trade: human-in-loop (a session has to be
+active), no GHA secrets to manage, no surprise auto-deploys.
+
 | Step | Today | Tier-one target |
 |---|---|---|
-| Build images | Manual `docker buildx` from laptop | GitHub Actions on tag push |
-| Push to Docker Hub | Manual | GHA, signed digests |
-| Update VPS compose | SSH-vim (manual) | A `deploy/sync.sh` script + Hostinger MCP |
-| Pull + restart | `mcp__hostinger__VPS_updateProjectV1` | Same, but called from GHA |
-| Smoke verify | Eyeballing curl | GHA post-deploy script: hit `/health`, run JSON-RPC `arc.version`, confirm version string matches deployed tag |
-| Rollback | Re-pull a prior tag manually | One-command: `deploy/rollback.sh <tag>` |
+| Build images | Manual `docker buildx` from laptop | arc-claude session: `docker buildx --build-arg BUILD_SHA=$(git rev-parse --short HEAD) --push` |
+| Push to Docker Hub | Manual | Same session, `--push` flag. Tag `:latest` + `:<short-sha>` |
+| Update VPS compose | SSH-vim (manual) | A `deploy/sync.sh` runnable on the VPS (still needs human-at-VPS for one-off compose changes; rare in steady state) |
+| Pull + restart | `mcp__hostinger__VPS_updateProjectV1` | Same — arc-claude calls it |
+| Smoke verify | Eyeballing curl | `curl https://arc.ailuxis.com/health` — confirm `build_sha` matches just-deployed tag; plus JSON-RPC `arc.ai.list_models` round-trip |
+| Rollback | Re-pull a prior tag manually | arc-claude session retags `:latest` → `:<prior-sha>` on Docker Hub and triggers VPS refresh. One prompt, ~2 min. |
 
-**Bottleneck:** GitHub repo doesn't exist yet (`github.com/MichaelDanCurtis/arc`).
-This is the #1 blocker on the deploy automation pillar.
+**Bottleneck:** none structural. The session model works today; what's
+missing is a `deploy/release.sh` and a `deploy/rollback.sh` so the steps
+are deterministic and don't depend on Claude remembering the recipe.
 
 ### 3. Wire-surface contracts (P1 — partial today)
 
@@ -138,17 +145,16 @@ A cross-client smoke suite run on every release:
 5. Both disconnect cleanly
 ```
 
-Either run as a GHA job (test container with both clients vendored), or
-as a CLI tool both teams can invoke against staging/prod. Lives in
-`tests/integration/cross-client.rs`.
+Run as a CLI tool both teams can invoke against staging/prod. arc-claude
+session triggers it post-deploy. Lives in `tests/integration/cross-client.rs`.
 
 ## Milestone plan
 
 | M | Theme | Concrete deliverables | Acceptance |
 |---|---|---|---|
-| **T1.0** | Foundations | GitHub repo created; CI builds images; uptime probes live; Sentry hooked up | Build a known-good image from GHA; uptime dashboard shows `arc.ailuxis.com` 99.9%+ over 7 days; an intentionally-thrown error in dev shows up in Sentry within 60s |
-| **T1.1** | Contracts | REQUIREMENTS.md columns filled by both clients; PR template enforces row-update; `arc.exec.*` + `arc.msg.*` wire ack'd; convergence rows decided | Every JSON-RPC method in `src/rpc.rs` has a row in REQUIREMENTS.md with both clients' ack |
-| **T1.2** | Deploys | `deploy/release.sh` one-shot script; rollback script; GHA on tag push builds + pushes + triggers VPS refresh + smoke-verifies | Releasing `v0.2.0` is a `git tag` + `git push --tags` and nothing else; rollback to `v0.1.x` is one command |
+| **T1.0** | Foundations | GitHub repo created; uptime probes live; Sentry hooked up; `BUILD_SHA` baked into images; `/health` ships to prod | arc-claude session can build + push + deploy in one prompt; uptime dashboard shows `arc.ailuxis.com` 99.9%+ over 7 days; an intentionally-thrown error in dev shows up in Sentry within 60s; `curl /health` returns the deployed SHA |
+| **T1.1** | Contracts | REQUIREMENTS.md columns filled by both clients; `arc.exec.*` + `arc.msg.*` wire ack'd; convergence rows decided | Every JSON-RPC method in `src/rpc.rs` has a row in REQUIREMENTS.md with both clients' ack |
+| **T1.2** | Deploys | `deploy/release.sh` + `deploy/rollback.sh` scripts callable from an arc-claude session; post-deploy smoke step embedded; failed smoke → automatic rollback | A session can run `./deploy/release.sh` (or a single prompt) and produce a deployed + smoke-verified prod in under 5 min, end-to-end; rollback to a prior `:<sha>` is one command |
 | **T1.3** | Recovery | Runbooks for the 4 incidents; quarterly DR drill; `/health` returns DB + R2 + version JSON | Pick a random Saturday, kill arc-relay, time how long to recovery; must be < 30 min using only the runbook |
 | **T1.4** | Smoke | Cross-client integration suite; runs on every prod deploy; auto-rollback if smoke fails | Intentionally regress the `/graphql/v2` handler; smoke must fail and deploy must auto-rollback |
 | **T1.5** | Observability polish | Status page at status.ailuxis.com; SLO burn-rate alerts; Grafana dashboard linked from this doc | Burn 10% of monthly error budget in a test → page fires within 5 min |
@@ -168,28 +174,33 @@ as a CLI tool both teams can invoke against staging/prod. Lives in
 
 | Item | Why blocks | Asks |
 |---|---|---|
-| Create `github.com/MichaelDanCurtis/arc` | T1.0 — no CI without it | Create repo, add as origin |
+| ~~Create `github.com/MichaelDanCurtis/arc`~~ | ~~T1.0~~ | ✅ Done 2026-05-14 (private repo, default branch `main`) |
 | OAuth client_id / secrets | T1.1 — auth flow can't be contracted without provider creds | GitHub OAuth app at minimum, callback `https://arc.ailuxis.com/api/auth/oauth/github/callback` |
 | R2 creds | T1.3 DR — plugin uploads/restores need them | Create bucket + API token, populate `.env` |
+| Sentry project DSN | T1.0 — error tracking is dead without it | Create Sentry project (free tier), share DSN; I'll wire it into arc-relay |
+| UptimeRobot account | T1.0 — uptime probes need somewhere to live | Free-tier account; I'll add the probe configs |
 | Status page domain | T1.5 — choose `status.ailuxis.com` or other | Pick subdomain + DNS |
 | SLO numbers above | T1.0 — these are my guesses; you may want tighter/looser | Confirm or override the 99.9%/250ms/0.5% targets |
 
 ## Next-action recommendation
 
 Land **T1.0 foundations** first — none of the others matter without
-observability + a GitHub repo. Order:
+observability. Order (deploys flow through arc-claude sessions, not CI):
 
-1. You: create `github.com/MichaelDanCurtis/arc`, add me as collaborator (or
-   give me a deploy key). 5 min.
-2. arc-claude: push current state to origin, set up GHA workflow for image
-   builds. 30 min once origin exists.
-3. arc-claude: integrate Sentry into arc-relay + arc-web. 1 hour.
-4. You: create Sentry project (free tier). 5 min.
-5. arc-claude: add UptimeRobot probes (or Hostinger built-in) for the four
-   surfaces. 15 min.
+1. ~~Create GitHub repo.~~ ✅ Done.
+2. arc-claude: ship `/health` to prod (rebuild arc-relay with
+   `BUILD_SHA=<sha>` → push → `VPS_updateProjectV1`). 30-40 min wall-time
+   per cycle. Once landed, uptime probes have a meaningful target.
+3. You: create Sentry project (free tier) and share DSN. 5 min.
+4. arc-claude: integrate Sentry into arc-relay + arc-web; redeploy. 1 hr +
+   deploy cycle.
+5. You: create UptimeRobot account (or use Hostinger's built-in). 5 min.
+6. arc-claude: add probes for `arc.ailuxis.com/health`, `beam.ailuxis.com/`,
+   `wss://arc.ailuxis.com/ws`, and Postgres TCP. 15 min.
 
-After T1.0, T1.1 (contracts) is the natural next milestone because both
-sides of the A2A channel can fill columns in parallel.
+After T1.0, T1.1 (contracts) is the natural next milestone — runs in
+parallel with Beacon-claude and Beam-claude populating REQUIREMENTS.md
+columns.
 
 ---
 
