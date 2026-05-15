@@ -62,6 +62,10 @@ services:
       R2_SECRET_KEY: ${R2_SECRET_KEY:-}
       R2_BUCKET: ${R2_BUCKET:-beacon-plugins}
       RUST_LOG: ${RUST_LOG:-arc_relay=info}
+      # Sentry DSN — when set, panics + tracing::error! events flow to
+      # Sentry. Unset → sentry::init returns an inactive client (no-op,
+      # no network). See arc-relay/src/main.rs.
+      SENTRY_DSN: ${SENTRY_DSN:-}
     depends_on:
       arc-postgres:
         condition: service_healthy
