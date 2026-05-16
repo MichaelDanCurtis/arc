@@ -90,7 +90,7 @@ The following are **fully implemented and shipping** but have no explicit row in
 | §4 User-to-user messaging (arc.msg.*) | `arc.msg.dm_send`, `arc.msg.channel_create`, etc. | ❌ | **Proposed but not shipped.** No RPC handlers; no broadcast channels |
 | §5 Agent-to-Execution (arc.exec.*) | `arc.exec.spawn`, `arc.exec.target_self`, etc. | ❌ | **Proposed but not shipped.** No RPC handlers; referenced in REQUIREMENTS but unimplemented |
 | §6 Plugin host | Plugin capability traits | ⚠️ | Path-dependency stub exists; gRPC contract not in JSON-RPC surface |
-| §7 Marketplace | Browse, install, publish | ❌ | Out of scope; handled by external ailuxis marketplace service |
+| §7 Marketplace | Browse, install, publish | ❌ | **Proposed but not shipped.** Arc owns marketplace (user direction 2026-05-15). Browse routes targeted for arc-relay HTTP surface (`GET /api/marketplace/plugins`, `GET /api/marketplace/plugins/:slug`, etc.); install is a client-side filesystem drop (`~/.beam/skills/<slug>/` for Beam, signed/allowlist-gated for Beacon); publish is gated to `pro` org role on Beacon. No RPC handlers yet. |
 | §8 New endpoints Beam needs | `/api/current_time`, `/api/v1/telemetry`, `/api/v1/conversations/sync`, etc. | ❌ | Stub HTTP routes exist but not JSON-RPC; planned for future slices |
 
 ---
@@ -132,9 +132,10 @@ The following are **fully implemented and shipping** but have no explicit row in
 The following capabilities mentioned in REQUIREMENTS.md are **explicitly outside JSON-RPC**:
 
 - User auth OAuth flow: HTTP `POST /api/auth/register`, `POST /api/auth/login`, `POST /api/auth/refresh`
-- Plugin distribution: External ailuxis marketplace (not Arc)
 - Payment: Handled by billing service (not Arc)
 - File transfer: Arc stores session output; file sharing is future work
+
+(Note: marketplace was previously listed here as "External ailuxis marketplace (not Arc)" — that was wrong. Per user direction 2026-05-15, **Arc is the single source of truth for marketplace** — see §7 in `REQUIREMENTS.md` and the row above in §2 of this doc.)
 
 ---
 
@@ -143,3 +144,4 @@ The following capabilities mentioned in REQUIREMENTS.md are **explicitly outside
 | Date | Change |
 |---|---|
 | 2026-05-14 | Initial inventory: 22 methods, 22 notifications across §2, §3, §8. Identified 3 major gaps: (1) arc.msg.* unshipped, (2) arc.exec.* unshipped, (3) auth routes are HTTP, not JSON-RPC. |
+| 2026-05-15 | §7 Marketplace row + Out-of-Scope bullet: revised to reflect user direction that Arc owns marketplace (was previously labelled out-of-scope / external service). Marketplace routes still unshipped; planned HTTP surface enumerated. (beam-claude PR) |
