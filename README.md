@@ -48,6 +48,26 @@ own filesystem locations:
 - **Beacon** (`MichaelDanCurtis/Beacon` in `WarpClone/`): `path = "../../../ARC/crates/<name>"` from each `beacon-core/crates/*/Cargo.toml` that needs a moved type.
 - **Beam** (`MichaelDanCurtis/WarpMod`): same pattern from `app/` or wherever the consumer crate lives.
 
+### Per-machine symlink prerequisite
+
+The 3-dotdot path above resolves to `WarpClone/ARC/crates/<name>`,
+which doesn't exist by default — there's no `ARC` directory inside
+`WarpClone/`. Create a per-machine symlink so cargo can resolve the
+deps without a 4-dotdot escape:
+
+```bash
+ln -snf /Volumes/Main\ External/Development/ARC WarpClone/ARC
+```
+
+Same pattern for Beam: `ln -snf /Volumes/Main\ External/Development/ARC WarpMod/ARC`.
+
+Why a symlink instead of bumping to 4 dotdots: Claude-Code worktrees
+under `WarpClone/.claude/worktrees/<name>/` would need a 7-dotdot
+escape from there. The symlink at the WarpClone root makes the same
+3-dotdot string work from any depth inside WarpClone — main checkout
+or worktree alike. Not committed (per-machine); each developer
+creates it once.
+
 If either repo moves, both repos' Cargo.toml files need a `sed` to
 retarget. Acceptable while there are 2 consumers; publish crates to a
 registry when the count grows.
