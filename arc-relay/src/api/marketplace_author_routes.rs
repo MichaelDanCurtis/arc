@@ -40,9 +40,11 @@ pub async fn create_plugin(
 }
 
 /// PATCH /api/marketplace/plugins/:slug — update own plugin (slug may be a UUID or slug string)
+///
+/// Pro-tier-gated (REQUIREMENTS.md §7).
 pub async fn update_plugin(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    RequirePro(user_id): RequirePro,
     Path(slug): Path<String>,
     Json(req): Json<UpdatePluginRequest>,
 ) -> Result<Json<MarketplacePlugin>, (StatusCode, String)> {
@@ -56,9 +58,11 @@ pub async fn update_plugin(
 }
 
 /// DELETE /api/marketplace/plugins/:slug — delete own plugin
+///
+/// Pro-tier-gated (REQUIREMENTS.md §7).
 pub async fn delete_plugin(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    RequirePro(user_id): RequirePro,
     Path(slug): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let plugin_id = Uuid::parse_str(&slug)
@@ -82,9 +86,12 @@ pub async fn my_plugins(
 }
 
 /// POST /api/marketplace/plugins/:slug/versions — upload a new plugin version
+///
+/// Pro-tier-gated (REQUIREMENTS.md §7). R2 upload of the bundle bytes
+/// happens in the handler body once tier + ownership are confirmed.
 pub async fn upload_version(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    RequirePro(user_id): RequirePro,
     Path(slug): Path<String>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<MarketplaceVersion>), (StatusCode, String)> {
@@ -226,9 +233,12 @@ pub async fn upload_version(
 }
 
 /// PUT /api/marketplace/signing-key — upload developer's public key
+///
+/// Pro-tier-gated (REQUIREMENTS.md §7): signing keys belong to authors
+/// who can publish, which is pro-only.
 pub async fn set_signing_key(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    RequirePro(user_id): RequirePro,
     body: String,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if !body.contains("BEGIN PUBLIC KEY") {
