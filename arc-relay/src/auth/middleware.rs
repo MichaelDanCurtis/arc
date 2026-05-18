@@ -1,10 +1,11 @@
 use async_trait::async_trait;
 use axum::{
-    extract::FromRequestParts,
+    extract::{FromRef, FromRequestParts},
     http::{request::Parts, StatusCode},
     middleware::Next,
     response::Response,
 };
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::jwt::{decode_token, TokenKind};
@@ -120,6 +121,70 @@ where
         })?;
 
         Ok(AuthUser(user_id))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RequirePro extractor
+// ---------------------------------------------------------------------------
+
+/// Axum extractor that validates the user's JWT (via [`AuthUser`]) AND
+/// asserts their entitlement tier is `'pro'`. Used to gate premium
+/// surfaces — marketplace publish, audit-log query, cross-org A2E, etc.
+///
+/// Requires:
+/// - The JWT secret injected via [`inject_jwt_secret`] (same as
+///   `AuthUser`).
+/// - The router's state to expose [`sqlx::PgPool`] via [`FromRef`] —
+///   already satisfied for [`crate::api::AppState`] (see the
+///   `impl FromRef<AppState> for PgPool` in `api/mod.rs`).
+///
+/// Rejection codes:
+/// - `401 Unauthorized` — passed through from `AuthUser` (no token,
+///   bad token, refresh token used, etc.).
+/// - `403 Forbidden` — JWT was valid but the user's tier is not
+///   `'pro'`. Fail-closed: this also covers the case where the user
+///   row is missing or the DB lookup errors, so that an unverified
+///   user CANNOT access pro-gated surfaces.
+///
+/// Wraps the validated user ID just like `AuthUser`, so handlers
+/// extract it the same way:
+///
+/// ```ignore
+/// async fn publish_handler(RequirePro(user_id): RequirePro) -> impl IntoResponse { ... }
+/// ```
+pub struct RequirePro(pub Uuid);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for RequirePro
+where
+    S: Send + Sync,
+    PgPool: FromRef<S>,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // First validate the JWT and resolve user_id. Bubbles up any
+        // 401 from AuthUser as-is.
+        let AuthUser(user_id) = AuthUser::from_request_parts(parts, state).await?;
+
+        // Resolve the user's tier from DB. Fail-closed on any error
+        // (missing row, query failure, etc.) → 403, NOT 500. The
+        // alternative (treating DB error as 500) would leak whether a
+        // user exists, which is a minor info-disclosure concern.
+        let pool = PgPool::from_ref(state);
+        let tier = match crate::models::user::get_user_tier(&pool, user_id).await {
+            Ok(t) => t,
+            Err(_) => None,
+        };
+
+        match tier.as_deref() {
+            Some("pro") => Ok(RequirePro(user_id)),
+            _ => Err((
+                StatusCode::FORBIDDEN,
+                "This endpoint requires the `pro` entitlement tier".to_string(),
+            )),
+        }
     }
 }
 

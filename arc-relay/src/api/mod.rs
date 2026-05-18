@@ -46,6 +46,15 @@ pub struct AppState {
     pub arc_ai_backend: Option<Arc<dyn ArcAiBackend>>,
 }
 
+/// Expose `PgPool` via `FromRef` so extractors that need DB access
+/// (e.g. `RequirePro` in `auth::middleware`) can pull a connection
+/// pool without depending on the concrete `AppState` type.
+impl axum::extract::FromRef<AppState> for sqlx::PgPool {
+    fn from_ref(state: &AppState) -> Self {
+        state.pool.clone()
+    }
+}
+
 /// Assemble the top-level Axum router.
 pub fn build_router(state: AppState) -> Router {
     let jwt_secret = state.config.jwt_secret.clone();
@@ -371,6 +380,40 @@ pub(crate) mod tests {
     async fn unknown_route_returns_404() {
         let s = status(build_router(test_state()), "GET", "/api/unknown-path").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    // ── tier gating ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn marketplace_plugin_publish_requires_pro_tier() {
+        use crate::auth::jwt::generate_token_pair;
+
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        // Mint a valid access token for a random user ID. The user won't
+        // exist in DB (lazy pool / no real connection) — RequirePro must
+        // fail-closed and return 403 when it can't verify the user is
+        // `pro`-tier. This is BOTH the route-level entitlement gate AND
+        // the security-fallback stance.
+        let user_id = uuid::Uuid::new_v4();
+        let pair =
+            generate_token_pair(user_id, &state.config.jwt_secret, 900, 86_400).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/marketplace/plugins")
+            .header("authorization", format!("Bearer {}", pair.access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"slug":"x","name":"x","summary":"x","kind":"theme","category":"ai"}"#))
+            .unwrap();
+
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "POST /api/marketplace/plugins must require pro tier (got {s})"
+        );
     }
 
     // ── /api/health (tier-one observability probe target) ────────────────────

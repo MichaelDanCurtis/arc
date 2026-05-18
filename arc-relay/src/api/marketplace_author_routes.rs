@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::api::AppState;
-use crate::auth::middleware::AuthUser;
+use crate::auth::middleware::{AuthUser, RequirePro};
 use crate::models::marketplace::{
     self, CreatePluginRequest, MarketplacePlugin, MarketplaceVersion, UpdatePluginRequest,
 };
@@ -18,9 +18,12 @@ use crate::models::marketplace::{
 // ---------------------------------------------------------------------------
 
 /// POST /api/marketplace/plugins — create a new plugin (status = draft)
+///
+/// Pro-tier-gated per REQUIREMENTS.md §7 + §1 Tiers row: marketplace
+/// publish is a `pro`-only surface. Free users get 403.
 pub async fn create_plugin(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    RequirePro(user_id): RequirePro,
     Json(req): Json<CreatePluginRequest>,
 ) -> Result<(StatusCode, Json<MarketplacePlugin>), (StatusCode, String)> {
     match marketplace::create_plugin(&state.pool, user_id, &req).await {

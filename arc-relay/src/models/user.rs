@@ -13,6 +13,23 @@ pub struct User {
     pub oauth_provider: Option<String>,
     pub oauth_provider_id: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Entitlement tier; `"free"` or `"pro"`. Populated by migration
+    /// `006_user_tier.sql`; defaults to `"free"` for existing rows.
+    /// Used by the `RequirePro` extractor in `auth/middleware.rs`.
+    pub tier: String,
+}
+
+/// Lightweight tier lookup — avoids a full row fetch for the hot path
+/// of the `RequirePro` extractor on every authenticated request.
+pub async fn get_user_tier(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT tier FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(t,)| t))
 }
 
 pub async fn create_user(
