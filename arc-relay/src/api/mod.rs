@@ -19,6 +19,7 @@ pub mod ai_routes;
 pub mod auth_routes;
 pub mod graphql_routes;
 pub mod health_routes;
+pub mod time_routes;
 pub mod marketplace_author_routes;
 pub mod marketplace_install_routes;
 pub mod marketplace_org_routes;
@@ -195,8 +196,16 @@ pub fn build_router(state: AppState) -> Router {
     // frontend) because Traefik doesn't route bare /health to the relay.
     let health = Router::new().route("/", get(health_routes::health_handler));
 
+    // ── /api/v1 — versioned Beam-required + future-stable endpoints ──────────
+    // Per REQUIREMENTS.md §8a. Grows as endpoints land:
+    //   - /current_time (shipped — D1)
+    //   - /telemetry, /relevant_files, /voice/transcribe, /credential_meter (TBD)
+    //   - /conversations/sync, /images/upload (per docs/specs/)
+    let v1 = Router::new().route("/current_time", get(time_routes::current_time_handler));
+
     Router::new()
         .nest("/api/health", health)
+        .nest("/api/v1", v1)
         .nest("/api/auth", auth)
         .nest("/api/marketplace", marketplace)
         .nest("/api", api)
@@ -380,6 +389,41 @@ pub(crate) mod tests {
     async fn unknown_route_returns_404() {
         let s = status(build_router(test_state()), "GET", "/api/unknown-path").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    // ── /api/v1/current_time (D1 — Beam clock-skew check target) ────────────
+
+    #[tokio::test]
+    async fn current_time_route_returns_unix_seconds_and_iso() {
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/current_time")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status_code = resp.status();
+        assert_eq!(
+            status_code,
+            StatusCode::OK,
+            "/api/v1/current_time must return 200 (got {status_code})"
+        );
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("body must be JSON");
+        assert!(
+            body.get("unix_seconds")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|n| n > 1_700_000_000),
+            "unix_seconds must be a recent u64, body was {body}"
+        );
+        assert!(
+            body.get("iso8601")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains('T') && s.ends_with('Z')),
+            "iso8601 must be an RFC3339-style string with T and Z, body was {body}"
+        );
     }
 
     // ── tier gating ──────────────────────────────────────────────────────────
