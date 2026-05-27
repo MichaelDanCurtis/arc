@@ -174,11 +174,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(crate::setup::get_setup_status))
         .route("/", post(crate::setup::complete_setup));
 
-    // ── Audit route (public for now; protect behind JWT in production) ───────
-    let audit_state = state.audit.clone();
+    // ── Audit route — admin-only, JWT-gated ──────────────────────────────────
+    //
+    // The handler now takes `State<AppState>` + `AuthUser` + checks
+    // `user::is_admin`. Returns 401 without a Bearer token, 403 for a
+    // non-admin user. The JWT secret is injected via the same
+    // `inject_jwt_secret` middleware used by the marketplace review router.
+    let jwt_secret_audit = state.config.jwt_secret.clone();
     let audit = Router::new()
         .route("/", get(crate::audit::get_audit_log))
-        .with_state(audit_state);
+        .layer(middleware::from_fn_with_state(
+            jwt_secret_audit,
+            inject_jwt_secret,
+        ));
 
     // ── WebSocket route ──────────────────────────────────────────────────────
     let ws = Router::new().route("/ws", get(crate::ws::handler::ws_handler));
@@ -389,6 +397,64 @@ pub(crate) mod tests {
     async fn unknown_route_returns_404() {
         let s = status(build_router(test_state()), "GET", "/api/unknown-path").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    // ── audit log access control ─────────────────────────────────────────────
+    //
+    // Prior to F1 the audit route was mounted as a public router. These
+    // tests assert it now requires a Bearer JWT and rejects non-admins.
+
+    #[tokio::test]
+    async fn audit_route_requires_auth() {
+        // Audit router is nested at /api/audit with a single route at "/" —
+        // axum 0.7 nesting strips the prefix so the actual match is /api/audit
+        // (no trailing slash), same shape as /api/health.
+        //
+        // Important assertion: an unauthenticated caller cannot get 200.
+        // Prior to F1 this returned 200 with the full log payload.
+        let s = status(build_router(test_state()), "GET", "/api/audit").await;
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "/api/audit must return 401 without a Bearer token (got {s})"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_route_with_non_admin_token_returns_forbidden() {
+        use crate::auth::jwt::generate_token_pair;
+
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        // Mint a valid access token for a random user ID. The user won't
+        // exist in DB (lazy pool / no real connection). With the F1 fix
+        // the handler calls `user::is_admin` which will either return
+        // Ok(false) (no membership row → 403) or Err (DB lookup failed
+        // → 500). Either way the route MUST NOT return 200 to a
+        // non-admin caller, and MUST NOT return 401 (token was valid).
+        let user_id = uuid::Uuid::new_v4();
+        let pair =
+            generate_token_pair(user_id, &state.config.jwt_secret, 900, 86_400).unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/audit")
+            .header("authorization", format!("Bearer {}", pair.access_token))
+            .body(Body::empty())
+            .unwrap();
+
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_ne!(
+            s,
+            StatusCode::OK,
+            "/api/audit must NOT return 200 to a non-admin caller (got {s})"
+        );
+        assert_ne!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "/api/audit with a valid token must NOT return 401 (got {s})"
+        );
     }
 
     // ── /api/v1/current_time (D1 — Beam clock-skew check target) ────────────

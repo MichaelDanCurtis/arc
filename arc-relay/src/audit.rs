@@ -8,6 +8,10 @@ use sqlx::PgPool;
 use std::sync::{Arc, Mutex};
 use tracing::error;
 
+use crate::api::AppState;
+use crate::auth::middleware::AuthUser;
+use crate::models::user;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: u64,
@@ -225,12 +229,30 @@ impl From<AuditRow> for AuditEntry {
     }
 }
 
-/// GET /api/audit — query audit log
+/// GET /api/audit — query audit log (admin only).
+///
+/// Security: requires a valid Bearer JWT (returns 401 otherwise) AND the
+/// caller must have an `admin` role in at least one org (returns 403
+/// otherwise). Audit logs can contain user identifiers and action detail
+/// strings, so they are explicitly admin-gated rather than tier-gated.
 pub async fn get_audit_log(
-    State(log): State<AuditLog>,
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
     Query(q): Query<AuditQuery>,
-) -> Result<Json<Vec<AuditEntry>>, StatusCode> {
-    let entries = log
+) -> Result<Json<Vec<AuditEntry>>, (StatusCode, String)> {
+    let admin = user::is_admin(&state.pool, user_id).await.map_err(|e| {
+        error!(error = %e, user_id = %user_id, "audit is_admin lookup failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    })?;
+    if !admin {
+        return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
+    }
+
+    let entries = state
+        .audit
         .query(
             q.limit.unwrap_or(50),
             q.offset.unwrap_or(0),
