@@ -46,6 +46,7 @@ pub mod plugin_routes;
 pub mod session_routes;
 pub mod shadow_routes;
 pub mod team_routes;
+pub mod telemetry_routes;
 pub mod user_routes;
 
 /// Shared application state injected into every route handler.
@@ -228,28 +229,31 @@ pub fn build_router(state: AppState) -> Router {
 
     // ── /api/v1 — versioned Beam-required + future-stable endpoints ──────────
     // Per REQUIREMENTS.md §8a. Grows as endpoints land:
-    //   - /current_time (shipped — D1)
+    //   - /current_time (shipped — D1, public)
     //   - /admin/users/:user_id/tier (shipped — A3, gated by RequireAdmin)
-    //   - /telemetry, /relevant_files, /voice/transcribe, /credential_meter (TBD)
+    //   - /telemetry    (shipped — D2, opt-in event sink, gated by AuthUser)
+    //   - /relevant_files, /voice/transcribe, /credential_meter (TBD)
     //   - /conversations/sync, /images/upload (per docs/specs/)
     //
-    // The admin sub-router carries its own JWT middleware layer so the
-    // `RequireAdmin` extractor (which reads `JwtSecret` from request
-    // extensions) can validate the caller. `current_time` stays public
-    // by living outside that layer.
-    let jwt_secret_admin = state.config.jwt_secret.clone();
-    let v1_admin = Router::new()
-        .route(
-            "/users/:user_id/tier",
-            axum::routing::patch(admin_routes::patch_user_tier),
-        )
-        .layer(middleware::from_fn_with_state(
-            jwt_secret_admin,
-            inject_jwt_secret,
-        ));
+    // `inject_jwt_secret` is layered on the WHOLE /api/v1 nest so handlers
+    // using `AuthUser` / `RequireAdmin` / `RequirePro` can resolve the
+    // `JwtSecret` from request extensions. The middleware merely INJECTS
+    // the secret into extensions — it does NOT enforce auth — so public
+    // routes (e.g. /current_time) ignore it and remain reachable without
+    // a Bearer token. Auth enforcement is per-handler via the extractors.
+    let jwt_secret_v1 = state.config.jwt_secret.clone();
+    let v1_admin = Router::new().route(
+        "/users/:user_id/tier",
+        axum::routing::patch(admin_routes::patch_user_tier),
+    );
     let v1 = Router::new()
         .route("/current_time", get(time_routes::current_time_handler))
-        .nest("/admin", v1_admin);
+        .route("/telemetry", post(telemetry_routes::telemetry_handler))
+        .nest("/admin", v1_admin)
+        .layer(middleware::from_fn_with_state(
+            jwt_secret_v1,
+            inject_jwt_secret,
+        ));
 
     Router::new()
         .nest("/api/health", health)
@@ -690,6 +694,57 @@ pub(crate) mod tests {
             s,
             StatusCode::FORBIDDEN,
             "PATCH /api/v1/admin/users/:user_id/tier must require admin (got {s})"
+        );
+    }
+
+    // ── /api/v1/telemetry (D2 — Beam opt-in event sink) ─────────────────────
+
+    #[tokio::test]
+    async fn telemetry_route_requires_auth() {
+        // POST without an Authorization header — AuthUser must reject with 401.
+        // 404 here would mean the route was never wired into the router.
+        let app = build_router(test_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/telemetry")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event":"app.launched"}"#))
+            .unwrap();
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            s,
+            StatusCode::UNAUTHORIZED,
+            "POST /api/v1/telemetry must require Bearer JWT (got {s}); \
+             404 means the route was never wired"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_route_accepts_authenticated_event() {
+        // Mint a valid access token and POST a tiny event body. The handler
+        // is pure log-and-ack (no DB), so a valid JWT must drive it to 204.
+        use crate::auth::jwt::generate_token_pair;
+
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        let user_id = uuid::Uuid::new_v4();
+        let pair =
+            generate_token_pair(user_id, &state.config.jwt_secret, 900, 86_400).unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/telemetry")
+            .header("authorization", format!("Bearer {}", pair.access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event":"app.launched","ts":1700000000}"#))
+            .unwrap();
+
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            s,
+            StatusCode::NO_CONTENT,
+            "POST /api/v1/telemetry with valid JWT must return 204 (got {s})"
         );
     }
 
