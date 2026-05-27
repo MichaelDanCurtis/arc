@@ -1,10 +1,25 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
     Router,
 };
+
+/// Maximum allowed request body size for marketplace plugin bundle uploads
+/// (POST `/api/marketplace/plugins/:slug/versions`).
+///
+/// 50 MiB is intentionally generous for a single-binary plugin while still
+/// preventing a pro-tier author from OOMing the relay by streaming an
+/// unbounded multipart field into memory. Axum returns `413 Payload Too
+/// Large` automatically when a request body exceeds this limit.
+///
+/// Bumping this cap requires also revisiting the multipart handler in
+/// `marketplace_author_routes::upload_version` (the entire file field is
+/// still buffered into `Vec<u8>` for SHA-256 + R2 upload — at much larger
+/// sizes that buffer becomes a problem on its own).
+const MAX_PLUGIN_BUNDLE_BYTES: usize = 50 * 1024 * 1024;
 
 use crate::ai_rpc::{ArcAiBackend, ArcAiSessionStore};
 use crate::audit::AuditLog;
@@ -167,6 +182,12 @@ pub fn build_router(state: AppState) -> Router {
         // ── signing key routes
         .route("/signing-key", axum::routing::put(marketplace_author_routes::set_signing_key))
         .route("/signing-key/server", get(marketplace_author_routes::get_server_public_key))
+        // F2: Cap request body size for the entire marketplace surface so
+        // a pro-tier author can't OOM the relay by uploading a giant
+        // bundle. axum's default is 2 MiB which would block legitimate
+        // plugin bundles; MAX_PLUGIN_BUNDLE_BYTES (50 MiB) is the new
+        // explicit ceiling. axum returns 413 when this is exceeded.
+        .layer(DefaultBodyLimit::max(MAX_PLUGIN_BUNDLE_BYTES))
         .layer(middleware::from_fn_with_state(jwt_secret_clone, inject_jwt_secret));
 
     // ── Setup routes (public, no JWT required) ──────────────────────────────
