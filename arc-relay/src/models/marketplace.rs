@@ -485,13 +485,43 @@ pub async fn remove_from_org_allowlist(
 // Install to team
 // ---------------------------------------------------------------------------
 
+/// Errors that can occur when installing an approved marketplace version
+/// onto a team.
+///
+/// M1 introduces `SignatureInvalid` as a defense-in-depth gate: even though
+/// the upload path already verifies the developer signature and admin review
+/// only countersigns after manual approval, we re-verify both signatures at
+/// install time against the value in the version row (which lives across
+/// process boundaries — R2, DB, anything that touched the row in between).
+/// If either the developer signature or the server countersig is missing
+/// or fails to verify against the stored `archive_sha256`, the install is
+/// refused.
+#[derive(thiserror::Error, Debug)]
+pub enum InstallError {
+    /// Plugin or version not found, or version is not in `approved` state.
+    #[error("plugin or version not found")]
+    NotFound,
+
+    /// The version row's developer signature or server countersig either is
+    /// absent or fails to verify against the stored archive hash + the
+    /// matching public key. Defense-in-depth — should be unreachable on a
+    /// correctly-administered server, but the audit explicitly asked for
+    /// this check to be installed at the install boundary too.
+    #[error("version signature invalid; cannot install")]
+    SignatureInvalid,
+
+    /// Internal database error.
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+}
+
 pub async fn install_to_team(
     pool: &PgPool,
     plugin_id: Uuid,
     version: &str,
     team_id: Uuid,
     installed_by: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), InstallError> {
     // Look up plugin (approved only)
     let plugin = sqlx::query_as::<_, MarketplacePlugin>(
         "SELECT * FROM marketplace_plugins WHERE id = $1 AND status = 'approved'",
@@ -499,7 +529,7 @@ pub async fn install_to_team(
     .bind(plugin_id)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| sqlx::Error::RowNotFound)?;
+    .ok_or(InstallError::NotFound)?;
 
     // Look up version (approved only)
     let ver = sqlx::query_as::<_, MarketplaceVersion>(
@@ -510,7 +540,63 @@ pub async fn install_to_team(
     .bind(version)
     .fetch_optional(pool)
     .await?
-    .ok_or_else(|| sqlx::Error::RowNotFound)?;
+    .ok_or(InstallError::NotFound)?;
+
+    // M1 defense-in-depth: re-verify BOTH signatures against the stored
+    // archive_sha256 right before completing the install. The trust chain
+    // is "developer signs the bundle → admin reviews + server countersigns
+    // → install requires both" — every step that uses the version row
+    // should re-check it, not assume earlier steps were sound.
+    //
+    // The audit explicitly called out that install handlers were trusting
+    // the `status='approved'` row state and skipping the verify. That's
+    // tolerable on a closed system but fails open the moment anything in
+    // the trust chain (DB write path, review tooling, R2 swap) is wrong.
+    let dev_sig = ver.signature.as_deref().ok_or(InstallError::SignatureInvalid)?;
+    let countersig = ver.countersig.as_deref().ok_or(InstallError::SignatureInvalid)?;
+
+    // Developer public key (lives on the users row, set via PUT
+    // /api/marketplace/signing-key).
+    let dev_pub_pem: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT signing_public_key FROM users WHERE id = $1",
+    )
+    .bind(plugin.author_id)
+    .fetch_optional(pool)
+    .await?;
+    let dev_pub_pem = dev_pub_pem
+        .and_then(|(k,)| k)
+        .ok_or(InstallError::SignatureInvalid)?;
+
+    let dev_ok = crate::signing::verify_developer_signature(
+        &dev_pub_pem,
+        &ver.archive_sha256,
+        dev_sig,
+    )
+    .map_err(|_| InstallError::SignatureInvalid)?;
+    if !dev_ok {
+        return Err(InstallError::SignatureInvalid);
+    }
+
+    // Server public key (lives in server_config; populated by
+    // signing::get_or_create_server_key on first countersign).
+    let server_pub_pem: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM server_config WHERE key = 'signing_public_key'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let server_pub_pem = server_pub_pem
+        .map(|(p,)| p)
+        .ok_or(InstallError::SignatureInvalid)?;
+
+    let server_ok = crate::signing::verify_developer_signature(
+        &server_pub_pem,
+        &ver.archive_sha256,
+        countersig,
+    )
+    .map_err(|_| InstallError::SignatureInvalid)?;
+    if !server_ok {
+        return Err(InstallError::SignatureInvalid);
+    }
 
     // Build manifest JSON
     let manifest = serde_json::json!({
@@ -608,5 +694,45 @@ mod tests {
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(json.contains("550e8400-e29b-41d4-a716-446655440000"));
         assert!(json.contains("550e8400-e29b-41d4-a716-446655440001"));
+    }
+
+    // ── M1: InstallError surface tests ─────────────────────────────────────
+
+    #[test]
+    fn install_error_distinguishes_not_found_from_signature_invalid() {
+        // The handler relies on being able to pattern-match on variants —
+        // pin that the enum has the three variants the handler expects.
+        // A future refactor that conflates NotFound and SignatureInvalid
+        // would silently downgrade 403 (signature) to 404 (not found),
+        // breaking the audit-required UX.
+        let nf = InstallError::NotFound;
+        let si = InstallError::SignatureInvalid;
+        let db = InstallError::Db(sqlx::Error::RowNotFound);
+
+        assert!(matches!(nf, InstallError::NotFound));
+        assert!(matches!(si, InstallError::SignatureInvalid));
+        assert!(matches!(db, InstallError::Db(_)));
+
+        // Display impls are user-visible (via thiserror) — pin the exact
+        // string the M1 handler returns to the client.
+        assert_eq!(
+            format!("{si}"),
+            "version signature invalid; cannot install"
+        );
+    }
+
+    #[test]
+    fn install_error_from_sqlx_via_question_mark() {
+        // The `#[from] sqlx::Error` derive on the Db variant is what lets
+        // install_to_team use `?` on sqlx calls. Verify the conversion
+        // path stays wired up — if a future refactor strips `#[from]`,
+        // this fails to compile, which is the warning we want.
+        fn convert(e: sqlx::Error) -> InstallError {
+            e.into()
+        }
+        assert!(matches!(
+            convert(sqlx::Error::RowNotFound),
+            InstallError::Db(_)
+        ));
     }
 }
