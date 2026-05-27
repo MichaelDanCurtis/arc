@@ -51,6 +51,7 @@
 | `arc.mirror.control_grant` | notification | §3 Session mirroring | rpc.rs:203 | Relay→all; write control transferred to new holder | Both |
 | `arc.mirror.control_revoke` | notification | §3 Session mirroring | rpc.rs:215 | Relay→all; write control released, no successor | Both |
 | `arc.mirror.discontinuity` | notification | §3 Session mirroring | rpc.rs:227 | Relay→watcher; broadcast buffer overflow; gap signal | Both |
+| `arc.mirror.resize` | notification | §3 Session mirroring | _(proposed; see "Proposed: arc.mirror.resize" below)_ | Relay→all watchers; PTY dimensions changed; watchers must re-layout their grid | Both |
 | `arc.mirror.block_start` | notification | §3 Session mirroring | rpc.rs:246 | Relay→watchers; new command block begins; full BlockHeader included | Both |
 | `arc.mirror.block_chunk` | notification | §3 Session mirroring | rpc.rs:263 | Relay→watchers; block output chunk with seq for gap detection | Both |
 | `arc.mirror.block_end` | notification | §3 Session mirroring | rpc.rs:286 | Relay→watchers; command block finished; full BlockFooter included | Both |
@@ -95,19 +96,114 @@ The following are **fully implemented and shipping** but have no explicit row in
 
 ---
 
-### 3. Method Count by REQUIREMENTS.md Section
+### 3. Proposed Notification: `arc.mirror.resize`
+
+**Status:** Spec only — handler emit-site and `emit_mirror_resize` helper are not yet wired. PR adding the doc row above is doc-only by design; implementation follows in a separate arc-relay PR.
+
+**Wire shape:**
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "method": "arc.mirror.resize",
+  "params": {
+    "session_id": "<ULID>",   // matches the receiving watcher's attached session
+    "cols": 120,              // u16, 1..=65535
+    "rows": 40                // u16, 1..=65535
+  }
+}
+```
+
+No `id` (notification). No response expected.
+
+**Direction:** relay → all subscribed watchers of `session_id` (same fanout as `arc.mirror.frame`, `arc.mirror.block_*`).
+
+**Emission rule:** the relay emits `arc.mirror.resize` exactly once for every successful `arc.host.session_resize` from the session's host (see `ArcHostSessionResizeHandler` at `arc-relay/src/rpc.rs:1615`). This covers both:
+
+1. **Driver-initiated resize** — controller calls `arc.session.resize` → relay emits `arc.host.resize_request` (rpc.rs:389) → host applies the resize → host calls `arc.host.session_resize` (rpc.rs:1615) → **relay emits `arc.mirror.resize` to watchers** (new).
+2. **Host-initiated resize** — host detects a local PTY size change (terminal app window resize, `SIGWINCH`, native shell-window drag) and calls `arc.host.session_resize` unsolicited → **relay emits `arc.mirror.resize`** (new).
+
+The notification is **not** emitted on `arc.session.resize` directly — that fires only `arc.host.resize_request` and waits for the host to confirm via `arc.host.session_resize`. Watchers learn the size only after the host has actually applied it, so what they receive is always the true PTY geometry, not a pending request.
+
+**Why watchers need this:** today they receive `arc.mirror.frame` (PTY output bytes) without knowing the column/row geometry. Their local terminal-emulator state must be sized to match the host PTY or wrap/cursor positions desync. The two existing alternatives are both lossy: (a) infer geometry from ANSI cursor reports embedded in frame data — brittle, breaks on apps that disable cursor reporting; (b) re-replay scrollback on every suspected resize — expensive and visible. A dedicated notification is the clean fix.
+
+**Proposed emit-fn (sketch, for the follow-up implementation PR):**
+
+```rust
+// arc-relay/src/rpc.rs, slot next to emit_mirror_discontinuity (~line 227)
+
+/// Emit `arc.mirror.resize` — relay→all watchers when the host PTY
+/// dimensions change. Fires from `ArcHostSessionResizeHandler` after
+/// `RelayRouter::update_size` succeeds, regardless of whether the resize
+/// originated from a driver request (`arc.session.resize` → `arc.host.resize_request`)
+/// or from a host-side event (window resize, SIGWINCH).
+///
+/// Watchers consume this to re-lay-out their grid; without it, frame bytes
+/// from `arc.mirror.frame` can render at the wrong dimensions and the
+/// cursor desyncs.
+pub fn emit_mirror_resize(entry: &ArcSessionEntry, cols: u16, rows: u16) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.resize",
+        json!({
+            "session_id": entry.session_id,
+            "cols": cols,
+            "rows": rows,
+        }),
+    );
+}
+```
+
+**Proposed handler wiring** (one-line change at `arc-relay/src/rpc.rs:1635`, inside `ArcHostSessionResizeHandler::handle`, after `relay.update_size(&session_id, cols, rows);` and before the `tracing::info!`):
+
+```rust
+emit_mirror_resize(&entry, cols, rows);  // entry already in scope; bind it instead of `_entry`
+```
+
+**Proposed test (for the follow-up PR, mirroring `emit_mirror_discontinuity_round_trip` at rpc.rs:2636):**
+
+```rust
+#[tokio::test]
+async fn host_session_resize_emits_mirror_resize() {
+    let (store, _mr, d) = make_dispatcher_with_mirror();
+    let entry = store.get_or_create("s_resize").await;
+    let mut rx = entry.notif_tx.subscribe();
+
+    let req = Request::new(
+        "arc.host.session_resize",
+        json!({"session_id": "s_resize", "cols": 132, "rows": 50}),
+        1i64,
+    );
+    assert!(d.dispatch(req).await.is_success());
+
+    let raw = rx.recv().await.unwrap();
+    let v: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(v["method"], "arc.mirror.resize");
+    assert_eq!(v["params"]["session_id"], "s_resize");
+    assert_eq!(v["params"]["cols"], 132);
+    assert_eq!(v["params"]["rows"], 50);
+}
+```
+
+**Out of scope for this proposal:**
+- Persisting last-known size on `ArcSessionEntry` so freshly-attached watchers learn the geometry from `arc.session.attach`'s response. Useful follow-up; not blocking.
+- A separate `arc.session.resize` echo to the driver. The driver already knows it sent the request; the round-trip via the host is canonical confirmation.
+
+---
+
+### 4. Method Count by REQUIREMENTS.md Section
 
 | Section | Methods | Notifications | Total |
 |---|---|---|---|
 | §1 User auth | 0 | 0 | 0 |
 | §2 AI chat streaming | 3 | 4 | 7 |
-| §3 Session mirroring + remote control | 10 | 14 | 24 |
+| §3 Session mirroring + remote control | 10 | 14 (+1 proposed: `arc.mirror.resize`) | 24 |
 | §4 User-to-user messaging | 0 | 0 | 0 |
 | §5 Agent-to-Execution | 0 | 0 | 0 |
 | §6 Plugin host | 0 | 0 | 0 |
 | §7 Marketplace | 0 | 0 | 0 |
 | §8 Beam-required endpoints | 9 | 4 | 13 |
-| **Total** | **22** | **22** | **44** |
+| **Total** | **22** | **22 shipped (+1 proposed)** | **44 shipped** |
 
 ---
 
@@ -145,3 +241,4 @@ The following capabilities mentioned in REQUIREMENTS.md are **explicitly outside
 |---|---|
 | 2026-05-14 | Initial inventory: 22 methods, 22 notifications across §2, §3, §8. Identified 3 major gaps: (1) arc.msg.* unshipped, (2) arc.exec.* unshipped, (3) auth routes are HTTP, not JSON-RPC. |
 | 2026-05-15 | §7 Marketplace row + Out-of-Scope bullet: revised to reflect user direction that Arc owns marketplace (was previously labelled out-of-scope / external service). Marketplace routes still unshipped; planned HTTP surface enumerated. (beam-claude PR) |
+| 2026-05-15 | §3 proposal: `arc.mirror.resize` notification (relay→watchers, fires after `arc.host.session_resize`). Doc-only; emit-site and helper sketch included for follow-up implementation PR. Closes A2 in arc-009 from A2A channel. (beacon-claude PR) |
