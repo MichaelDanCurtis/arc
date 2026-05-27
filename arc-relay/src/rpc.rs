@@ -3605,7 +3605,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn host_session_resize_emits_no_notif() {
+    async fn host_session_resize_emits_arc_mirror_resize() {
+        // Updated contract per PR #6 / A2 (commit fb33e9b):
+        // `arc.host.session_resize` now DOES emit `arc.mirror.resize`
+        // to subscribed watchers so they can re-layout their grid.
+        // Previously this test asserted no-emit; that behavior was the
+        // gap PR #6 closed.
         let (store, d) = make_dispatcher();
         let entry = store.get_or_create("s-resize").await;
         let mut rx = entry.notif_tx.subscribe();
@@ -3615,8 +3620,13 @@ mod tests {
             1i64,
         );
         assert!(d.dispatch(req).await.is_success());
-        // Host-driven resize is not broadcast to watchers in msgpack either.
-        assert!(rx.try_recv().is_err());
+
+        let raw = rx.try_recv().expect("arc.mirror.resize must be emitted");
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.resize");
+        assert_eq!(v["params"]["session_id"], "s-resize");
+        assert_eq!(v["params"]["cols"], 80);
+        assert_eq!(v["params"]["rows"], 24);
     }
 
     // ── arc.host.push_output ─────────────────────────────────────────────────
