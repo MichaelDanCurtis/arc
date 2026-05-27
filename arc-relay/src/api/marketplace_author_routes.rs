@@ -4,6 +4,8 @@ use axum::{
     Json,
 };
 use axum_extra::extract::Multipart;
+use ed25519_dalek::pkcs8::DecodePublicKey;
+use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 use tracing::error;
 use uuid::Uuid;
@@ -277,14 +279,25 @@ pub async fn upload_version(
 ///
 /// Pro-tier-gated (REQUIREMENTS.md §7): signing keys belong to authors
 /// who can publish, which is pro-only.
+///
+/// F4: validates the PEM by actually parsing it as an Ed25519 public key
+/// (the previous `body.contains("BEGIN PUBLIC KEY")` substring check
+/// accepted any string with that marker, including bodies that would
+/// later cause verification to error out at sig-check time). We accept
+/// the body only after `VerifyingKey::from_public_key_pem` succeeds.
 pub async fn set_signing_key(
     State(state): State<AppState>,
     RequirePro(user_id): RequirePro,
     body: String,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    if !body.contains("BEGIN PUBLIC KEY") {
-        return Err((StatusCode::BAD_REQUEST, "Expected PEM-encoded public key".to_string()));
-    }
+    // Strict parse: must be a valid PKCS#8 SubjectPublicKeyInfo PEM
+    // whose key type is Ed25519. Anything else → 400.
+    VerifyingKey::from_public_key_pem(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Invalid Ed25519 public-key PEM: {e}"),
+        )
+    })?;
 
     crate::models::user::set_signing_key(&state.pool, user_id, &body)
         .await
@@ -344,5 +357,40 @@ mod tests {
             .unwrap();
         let s = app.oneshot(req).await.unwrap().status();
         assert_eq!(s, StatusCode::UNAUTHORIZED, "GET /api/marketplace/my-plugins must require auth");
+    }
+
+    // ── F4: strict Ed25519 PEM validation ───────────────────────────────────
+    //
+    // Unit-test the parser directly: assert that bodies that pass the OLD
+    // substring check ("contains BEGIN PUBLIC KEY") but are not valid
+    // Ed25519 PEM are rejected.
+
+    #[test]
+    fn ed25519_pem_parser_rejects_fake_pem_with_marker_only() {
+        // Substring-only validation accepted this — strict parse must not.
+        let body = "-----BEGIN PUBLIC KEY-----\nnot-actually-base64\n-----END PUBLIC KEY-----\n";
+        assert!(
+            VerifyingKey::from_public_key_pem(body).is_err(),
+            "malformed PEM with valid marker must be rejected"
+        );
+    }
+
+    #[test]
+    fn ed25519_pem_parser_rejects_empty_string() {
+        assert!(VerifyingKey::from_public_key_pem("").is_err());
+    }
+
+    #[test]
+    fn ed25519_pem_parser_accepts_real_key() {
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+        use ed25519_dalek::SigningKey;
+        // Round-trip a freshly generated key through PEM to verify the
+        // parser accepts the canonical form we'd actually receive.
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pub_pem = key
+            .verifying_key()
+            .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .unwrap();
+        assert!(VerifyingKey::from_public_key_pem(&pub_pem).is_ok());
     }
 }
