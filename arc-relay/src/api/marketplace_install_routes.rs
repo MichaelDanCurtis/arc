@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use tracing::error;
 use uuid::Uuid;
 
 use crate::api::AppState;
@@ -41,7 +42,14 @@ pub async fn install(
             StatusCode::NOT_FOUND,
             "Plugin or version not found (must be approved)".to_string(),
         )),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => {
+            // F3: log full error server-side, return generic 500 to client
+            error!(operation = "install_to_team", error = %e, "marketplace DB error");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            ))
+        }
     }
 }
 

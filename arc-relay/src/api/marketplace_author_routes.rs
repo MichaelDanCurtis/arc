@@ -5,6 +5,7 @@ use axum::{
 };
 use axum_extra::extract::Multipart;
 use sha2::{Digest, Sha256};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::api::AppState;
@@ -12,6 +13,22 @@ use crate::auth::middleware::{AuthUser, RequirePro};
 use crate::models::marketplace::{
     self, CreatePluginRequest, MarketplacePlugin, MarketplaceVersion, UpdatePluginRequest,
 };
+
+/// Helper for marketplace handlers: log a server-side error with full
+/// context and return a generic 500 to the client.
+///
+/// sqlx errors include table names, column names, and constraint names —
+/// surfacing them to HTTP clients leaks schema details. Use this for any
+/// DB / storage failure in the marketplace surface. F3.
+fn db_500<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> (StatusCode, String) {
+    move |e: E| {
+        error!(operation = op, error = %e, "marketplace DB error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -29,11 +46,25 @@ pub async fn create_plugin(
     match marketplace::create_plugin(&state.pool, user_id, &req).await {
         Ok(plugin) => Ok((StatusCode::CREATED, Json(plugin))),
         Err(e) => {
+            // We still need to peek at the sqlx error to distinguish the
+            // 409 conflict case (duplicate slug), but the full string is
+            // never returned to the client. F3.
             let msg = e.to_string();
             if msg.contains("duplicate key") || msg.contains("unique") {
-                Err((StatusCode::CONFLICT, "A plugin with that slug already exists".to_string()))
+                Err((
+                    StatusCode::CONFLICT,
+                    "A plugin with that slug already exists".to_string(),
+                ))
             } else {
-                Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
+                error!(
+                    operation = "create_plugin",
+                    error = %e,
+                    "marketplace DB error"
+                );
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error".to_string(),
+                ))
             }
         }
     }
@@ -53,7 +84,7 @@ pub async fn update_plugin(
     match marketplace::update_plugin(&state.pool, plugin_id, user_id, &req).await {
         Ok(Some(plugin)) => Ok(Json(plugin)),
         Ok(None) => Err((StatusCode::NOT_FOUND, "Plugin not found or not yours".to_string())),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(db_500::<sqlx::Error>("update_plugin")(e)),
     }
 }
 
@@ -70,7 +101,7 @@ pub async fn delete_plugin(
     match marketplace::delete_plugin(&state.pool, plugin_id, user_id).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "Plugin not found or not yours".to_string())),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(db_500::<sqlx::Error>("delete_plugin")(e)),
     }
 }
 
@@ -81,7 +112,7 @@ pub async fn my_plugins(
 ) -> Result<Json<Vec<MarketplacePlugin>>, (StatusCode, String)> {
     match marketplace::list_plugins_by_author(&state.pool, user_id).await {
         Ok(plugins) => Ok(Json(plugins)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(db_500::<sqlx::Error>("list_plugins_by_author")(e)),
     }
 }
 
@@ -107,7 +138,7 @@ pub async fn upload_version(
     // Verify plugin exists and belongs to this user
     let plugin = marketplace::get_plugin_by_id(&state.pool, plugin_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(db_500::<sqlx::Error>("get_plugin_by_id"))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Plugin not found".to_string()))?;
 
     if plugin.author_id != user_id {
@@ -192,9 +223,12 @@ pub async fn upload_version(
     if let Some(ref sig) = signature_str {
         let user_key = crate::models::user::get_signing_key(&state.pool, user_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
+            .map_err(db_500::<sqlx::Error>("get_signing_key"))?;
 
         if let Some(pub_pem) = user_key {
+            // verify_developer_signature returns String — pass as-is to the
+            // 400 path since this surfaces a user-controlled error (their
+            // signature didn't parse). No DB schema leak risk.
             let valid = crate::signing::verify_developer_signature(&pub_pem, &archive_sha256, sig)
                 .map_err(|e| (StatusCode::BAD_REQUEST, format!("Signature error: {e}")))?;
             if !valid {
@@ -203,12 +237,19 @@ pub async fn upload_version(
         }
     }
 
-    // Upload to R2
+    // Upload to R2 — `e` here is the storage-layer error (R2 SDK + our wrapper).
+    // Log it server-side and return a generic message.
     let key = crate::storage::R2Client::archive_key(&plugin.slug, &version, &platform);
     let archive_url = r2
         .upload_plugin_archive(&key, bytes, "application/octet-stream")
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(|e| {
+            error!(operation = "r2_upload", error = %e, "marketplace storage error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            )
+        })?;
 
     // Create version record
     let ver = marketplace::create_version(
@@ -222,12 +263,12 @@ pub async fn upload_version(
         signature_str.as_deref(),
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(db_500::<sqlx::Error>("create_version"))?;
 
     // Transition plugin from draft → pending_review
     marketplace::set_plugin_pending_if_draft(&state.pool, plugin_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(db_500::<sqlx::Error>("set_plugin_pending_if_draft"))?;
 
     Ok((StatusCode::CREATED, Json(ver)))
 }
@@ -247,7 +288,7 @@ pub async fn set_signing_key(
 
     crate::models::user::set_signing_key(&state.pool, user_id, &body)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
+        .map_err(db_500::<sqlx::Error>("set_signing_key"))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -261,7 +302,7 @@ pub async fn get_server_public_key(
     )
     .fetch_optional(&state.pool)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
+    .map_err(db_500::<sqlx::Error>("get_server_public_key"))?;
 
     match row {
         Some((pem,)) => Ok(pem),

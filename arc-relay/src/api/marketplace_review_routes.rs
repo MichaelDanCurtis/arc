@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use tracing::error;
 use uuid::Uuid;
 
 use crate::api::AppState;
@@ -13,6 +14,28 @@ use crate::models::{marketplace, user};
 #[derive(Debug, Deserialize)]
 pub struct ReviewAction {
     pub reason: Option<String>,
+}
+
+/// F3: log full sqlx error server-side, return generic 500 to the client.
+fn db_500(op: &'static str) -> impl FnOnce(sqlx::Error) -> (StatusCode, String) {
+    move |e| {
+        error!(operation = op, error = %e, "marketplace review DB error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    }
+}
+
+/// F3: log internal signing-layer error string, return generic 500.
+fn signing_500(op: &'static str) -> impl FnOnce(String) -> (StatusCode, String) {
+    move |e| {
+        error!(operation = op, error = %e, "marketplace review signing error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -26,14 +49,14 @@ pub async fn list_pending(
 ) -> Result<Json<Vec<marketplace::MarketplaceVersion>>, (StatusCode, String)> {
     let admin = user::is_admin(&state.pool, user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(db_500("is_admin"))?;
     if !admin {
         return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
     }
 
     match marketplace::list_pending_review(&state.pool).await {
         Ok(versions) => Ok(Json(versions)),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(db_500("list_pending_review")(e)),
     }
 }
 
@@ -45,14 +68,14 @@ pub async fn approve(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let admin = user::is_admin(&state.pool, user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(db_500("is_admin"))?;
     if !admin {
         return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
     }
 
     let updated = marketplace::set_version_status(&state.pool, version_id, "approved")
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(db_500("set_version_status_approved"))?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "Version not found".to_string()));
@@ -65,29 +88,29 @@ pub async fn approve(
     .bind(version_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(db_500("fetch_version"))?;
 
     if let Some(ver) = &version {
         marketplace::approve_plugin_if_first(&state.pool, ver.plugin_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(db_500("approve_plugin_if_first"))?;
     }
 
     // Countersign the archive SHA-256
     if let Some(ref ver) = version {
         let server_key = crate::signing::get_or_create_server_key(&state.pool)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(signing_500("get_or_create_server_key"))?;
 
         let countersig_hex = crate::signing::countersign(&server_key, &ver.archive_sha256)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(signing_500("countersign"))?;
 
         sqlx::query("UPDATE marketplace_versions SET countersig = $2 WHERE id = $1")
             .bind(version_id)
             .bind(&countersig_hex)
             .execute(&state.pool)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB: {e}")))?;
+            .map_err(db_500("update_countersig"))?;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -102,14 +125,14 @@ pub async fn reject(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let admin = user::is_admin(&state.pool, user_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(db_500("is_admin"))?;
     if !admin {
         return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
     }
 
     let updated = marketplace::set_version_status(&state.pool, version_id, "rejected")
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(db_500("set_version_status_rejected"))?;
 
     if !updated {
         return Err((StatusCode::NOT_FOUND, "Version not found".to_string()));
