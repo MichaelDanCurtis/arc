@@ -165,6 +165,7 @@ pub fn build_router(state: AppState) -> Router {
             get(marketplace_routes::get_plugin_versions)
                 .post(marketplace_author_routes::upload_version),
         )
+        .route("/plugins/:slug/versions/:version/download", get(marketplace_routes::download_version))
         // ── admin review queue
         .route("/review", get(marketplace_review_routes::list_pending))
         .route("/review/:id/approve", post(marketplace_review_routes::approve))

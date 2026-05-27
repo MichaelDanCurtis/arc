@@ -368,6 +368,42 @@ pub async fn approve_plugin_if_first(
     Ok(())
 }
 
+/// Atomically increment `download_count` for the matching approved version
+/// and return its `archive_url`.
+///
+/// Used by the public bundle-download endpoint
+/// (`GET /api/marketplace/plugins/:slug/versions/:version/download`). The
+/// increment and the URL lookup happen in a single `UPDATE ... RETURNING`
+/// statement so concurrent downloads can't double-count or race-skip a
+/// counter bump.
+///
+/// Returns `Ok(None)` when no row matches (plugin/version not found OR the
+/// version is not approved). The handler maps this to 404.
+///
+/// `(plugin_id, version, platform)` is the table's uniqueness constraint —
+/// multiple platforms can share a version string. Today we increment ALL
+/// matching approved rows (one per platform) and return the first
+/// `archive_url`. This keeps the per-plugin "total downloads" sum accurate
+/// when summed across platforms in `list_approved_plugins`. If the route
+/// later grows a `?platform=` selector, swap to a platform-scoped WHERE.
+pub async fn increment_download_count_and_get_url(
+    pool: &PgPool,
+    plugin_id: Uuid,
+    version: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "UPDATE marketplace_versions \
+         SET download_count = download_count + 1 \
+         WHERE plugin_id = $1 AND version = $2 AND status = 'approved' \
+         RETURNING archive_url",
+    )
+    .bind(plugin_id)
+    .bind(version)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(url,)| url))
+}
+
 // ---------------------------------------------------------------------------
 // Org allowlist types and functions
 // ---------------------------------------------------------------------------
