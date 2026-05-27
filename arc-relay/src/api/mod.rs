@@ -30,6 +30,7 @@ use crate::mirror::MirrorRegistry;
 use crate::relay::router::RelayRouter;
 use crate::rpc::ArcSessionStore;
 
+pub mod admin_routes;
 pub mod ai_routes;
 pub mod auth_routes;
 pub mod graphql_routes;
@@ -228,9 +229,27 @@ pub fn build_router(state: AppState) -> Router {
     // ── /api/v1 — versioned Beam-required + future-stable endpoints ──────────
     // Per REQUIREMENTS.md §8a. Grows as endpoints land:
     //   - /current_time (shipped — D1)
+    //   - /admin/users/:user_id/tier (shipped — A3, gated by RequireAdmin)
     //   - /telemetry, /relevant_files, /voice/transcribe, /credential_meter (TBD)
     //   - /conversations/sync, /images/upload (per docs/specs/)
-    let v1 = Router::new().route("/current_time", get(time_routes::current_time_handler));
+    //
+    // The admin sub-router carries its own JWT middleware layer so the
+    // `RequireAdmin` extractor (which reads `JwtSecret` from request
+    // extensions) can validate the caller. `current_time` stays public
+    // by living outside that layer.
+    let jwt_secret_admin = state.config.jwt_secret.clone();
+    let v1_admin = Router::new()
+        .route(
+            "/users/:user_id/tier",
+            axum::routing::patch(admin_routes::patch_user_tier),
+        )
+        .layer(middleware::from_fn_with_state(
+            jwt_secret_admin,
+            inject_jwt_secret,
+        ));
+    let v1 = Router::new()
+        .route("/current_time", get(time_routes::current_time_handler))
+        .nest("/admin", v1_admin);
 
     Router::new()
         .nest("/api/health", health)
@@ -630,6 +649,48 @@ pub(crate) mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // GraphQL-shape error response, not a 4xx
         assert!(body.get("errors").is_some(), "expected GraphQL errors field, got {body}");
+    }
+
+    // ── /api/v1/admin/users/:user_id/tier (A3 — tier provisioning) ──────────
+
+    /// A valid-but-non-admin JWT must be rejected by `RequireAdmin` with 403.
+    ///
+    /// This is also our fail-closed assertion: with the lazy pool the
+    /// `is_admin` query fails (no DB connection), and `RequireAdmin` must
+    /// treat that as "not admin" rather than 500.
+    ///
+    /// Note: a complementary positive-path test (admin JWT → handler
+    /// reached) is intentionally NOT in the unit-test suite. Marking a
+    /// user `admin` requires a real DB row in `org_memberships`, which
+    /// these route-shape tests don't provide. The admin success path is
+    /// exercised by integration tests against a live Postgres.
+    #[tokio::test]
+    async fn admin_set_tier_requires_admin() {
+        use crate::auth::jwt::generate_token_pair;
+
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        // Mint a valid access token for a random (non-admin) user.
+        let caller_id = uuid::Uuid::new_v4();
+        let target_id = uuid::Uuid::new_v4();
+        let pair =
+            generate_token_pair(caller_id, &state.config.jwt_secret, 900, 86_400).unwrap();
+
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/api/v1/admin/users/{target_id}/tier"))
+            .header("authorization", format!("Bearer {}", pair.access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"tier":"pro"}"#))
+            .unwrap();
+
+        let s = app.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "PATCH /api/v1/admin/users/:user_id/tier must require admin (got {s})"
+        );
     }
 
     // ── protected route with valid token ────────────────────────────────────

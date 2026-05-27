@@ -189,6 +189,71 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// RequireAdmin extractor
+// ---------------------------------------------------------------------------
+
+/// Axum extractor that validates the user's JWT (via [`AuthUser`]) AND
+/// asserts the user has at least one `'admin'` role in `org_memberships`.
+/// Used to gate operational/provisioning surfaces — most notably the
+/// PATCH /api/v1/admin/users/:user_id/tier endpoint that flips a user
+/// between `'free'` and `'pro'` entitlements (A3).
+///
+/// Requires:
+/// - The JWT secret injected via [`inject_jwt_secret`] (same as
+///   `AuthUser`).
+/// - The router's state to expose [`sqlx::PgPool`] via [`FromRef`] —
+///   already satisfied for [`crate::api::AppState`].
+///
+/// Rejection codes:
+/// - `401 Unauthorized` — passed through from `AuthUser`.
+/// - `403 Forbidden` — JWT was valid but the user is not an admin.
+///   Fail-closed: any DB error (including missing connection) is
+///   treated as "not admin" so an unverified caller CANNOT reach
+///   admin-gated routes.
+///
+/// Wraps the validated admin user ID just like `AuthUser` and
+/// `RequirePro`:
+///
+/// ```ignore
+/// async fn admin_handler(RequireAdmin(admin_id): RequireAdmin) -> impl IntoResponse { ... }
+/// ```
+pub struct RequireAdmin(pub Uuid);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for RequireAdmin
+where
+    S: Send + Sync,
+    PgPool: FromRef<S>,
+{
+    type Rejection = (StatusCode, String);
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // First validate the JWT and resolve user_id. Bubbles up any
+        // 401 from AuthUser as-is.
+        let AuthUser(user_id) = AuthUser::from_request_parts(parts, state).await?;
+
+        // Check admin status. Fail-closed on any DB error → 403, NOT
+        // 500. Same reasoning as RequirePro: a 500 here would leak
+        // information about DB availability and could be exploited to
+        // distinguish "user exists but is not admin" from "DB down".
+        let pool = PgPool::from_ref(state);
+        let admin = matches!(
+            crate::models::user::is_admin(&pool, user_id).await,
+            Ok(true)
+        );
+
+        if admin {
+            Ok(RequireAdmin(user_id))
+        } else {
+            Err((
+                StatusCode::FORBIDDEN,
+                "This endpoint requires admin privileges".to_string(),
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
