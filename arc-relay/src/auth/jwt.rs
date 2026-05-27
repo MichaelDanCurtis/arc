@@ -83,8 +83,12 @@ pub fn decode_token(token: &str, jwt_secret: &str) -> Result<Claims, jsonwebtoke
     let mut validation = Validation::new(Algorithm::HS256);
     // Validate expiry explicitly.
     validation.validate_exp = true;
-    // Set leeway to 0 so there is no clock-skew grace period.
-    validation.leeway = 0;
+    // Allow a small clock-skew grace period when validating `exp` / `nbf`.
+    // 30 seconds matches the de-facto industry default (e.g. AWS IAM
+    // STS, GitHub's JWT validators, several large OIDC providers) and
+    // tolerates minor drift between Beam clients and the relay without
+    // meaningfully extending the attack window on a leaked token. F5.
+    validation.leeway = 30;
 
     let data = decode::<Claims>(token, &key, &validation)?;
     Ok(data.claims)
