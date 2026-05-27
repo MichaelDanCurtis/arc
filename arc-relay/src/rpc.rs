@@ -235,6 +235,29 @@ pub fn emit_mirror_discontinuity(entry: &ArcSessionEntry, last_seq: u64) {
     );
 }
 
+/// Emit `arc.mirror.resize` — relay→all watchers when the host PTY dimensions
+/// change. Fires from `ArcHostSessionResizeHandler` after
+/// `RelayRouter::update_size` succeeds, regardless of whether the resize
+/// originated from a driver request (`arc.session.resize` →
+/// `arc.host.resize_request`) or from a host-side event (window resize,
+/// SIGWINCH).
+///
+/// Watchers consume this to re-lay-out their terminal grid; without it,
+/// `arc.mirror.frame` bytes can render at the wrong dimensions and the
+/// cursor desyncs. Spec: `arc-relay/docs/rpc-method-inventory.md` §3
+/// "Proposed Notification: arc.mirror.resize" (PR #6, A2 from arc-009).
+pub fn emit_mirror_resize(entry: &ArcSessionEntry, cols: u16, rows: u16) {
+    send_notif(
+        &entry.notif_tx,
+        "arc.mirror.resize",
+        json!({
+            "session_id": entry.session_id,
+            "cols": cols,
+            "rows": rows,
+        }),
+    );
+}
+
 /// Emit `arc.mirror.block_start` — relay→watcher when a new command block
 /// begins. Carries the full `BlockHeader` envelope (id, command, cwd, env,
 /// host_info, etc.) per the spec-locked wire shape from Task 1.
@@ -1624,16 +1647,21 @@ impl RpcHandler for ArcHostSessionResizeHandler {
             let cols = require_u32(&params, "cols")? as u16;
             let rows = require_u32(&params, "rows")? as u16;
 
-            let Some(_entry) = store.get(&session_id).await else {
+            let Some(entry) = store.get(&session_id).await else {
                 return Err(RpcError::server_error(format!(
                     "not found: {session_id}"
                 )));
             };
             relay.update_size(&session_id, cols, rows);
+            // Fan the new geometry out to subscribed watchers so they
+            // re-layout their terminal grid (spec: A2 / PR #6). One emit
+            // site covers both driver-initiated and host-initiated
+            // resizes because both terminate in this handler.
+            emit_mirror_resize(&entry, cols, rows);
             tracing::info!(
                 session_id = %session_id,
                 cols, rows,
-                "arc.host.session_resize: updated RelayRouter size",
+                "arc.host.session_resize: updated RelayRouter size + emitted arc.mirror.resize",
             );
             Ok(json!({"ok": true}))
         })
@@ -2645,6 +2673,28 @@ mod tests {
         assert_eq!(v["method"], "arc.mirror.discontinuity");
         assert_eq!(v["params"]["session_id"], "s7");
         assert_eq!(v["params"]["last_seq"], 42);
+    }
+
+    #[tokio::test]
+    async fn emit_mirror_resize_round_trip() {
+        // Closes A2 from arc-009 (PR #6 spec). Wire shape:
+        //   { method: "arc.mirror.resize",
+        //     params: { session_id, cols, rows } }
+        // Emitted from ArcHostSessionResizeHandler after
+        // RelayRouter::update_size succeeds — covers both driver-initiated
+        // and host-initiated resizes through the same emit site.
+        let store = ArcSessionStore::new(8);
+        let entry = store.get_or_create("s-resize").await;
+        let mut rx = entry.notif_tx.subscribe();
+
+        emit_mirror_resize(&entry, 120, 40);
+
+        let raw = rx.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["method"], "arc.mirror.resize");
+        assert_eq!(v["params"]["session_id"], "s-resize");
+        assert_eq!(v["params"]["cols"], 120);
+        assert_eq!(v["params"]["rows"], 40);
     }
 
     #[tokio::test]
