@@ -1644,8 +1644,10 @@ impl RpcHandler for ArcHostSessionResizeHandler {
         let store = self.store.clone();
         Box::pin(async move {
             let session_id = require_str(&params, "session_id")?.to_string();
-            let cols = require_u32(&params, "cols")? as u16;
-            let rows = require_u32(&params, "rows")? as u16;
+            let cols = u16::try_from(require_u32(&params, "cols")?)
+                .map_err(|_| RpcError::invalid_params("cols out of u16 range"))?;
+            let rows = u16::try_from(require_u32(&params, "rows")?)
+                .map_err(|_| RpcError::invalid_params("rows out of u16 range"))?;
 
             let Some(entry) = store.get(&session_id).await else {
                 return Err(RpcError::server_error(format!(
@@ -3602,6 +3604,29 @@ mod tests {
         );
         let resp = d.dispatch(req).await;
         assert!(resp.err().unwrap().message.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn host_session_resize_cols_out_of_u16_range_invalid_params() {
+        // cols = 70000 exceeds u16::MAX (65535). Previously `as u16` would
+        // silently truncate to 4464. Now we reject with -32602 invalid-params
+        // so a malformed message produces a clear error instead of a
+        // wrong-geometry resize.
+        let (store, d) = make_dispatcher();
+        store.get_or_create("s-resize-big").await;
+        let req = Request::new(
+            "arc.host.session_resize",
+            json!({"session_id": "s-resize-big", "cols": 70000u32, "rows": 24u32}),
+            1i64,
+        );
+        let resp = d.dispatch(req).await;
+        let err = resp.err().expect("expected invalid_params error");
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message.contains("cols"),
+            "expected cols-out-of-range message, got: {}",
+            err.message,
+        );
     }
 
     #[tokio::test]
