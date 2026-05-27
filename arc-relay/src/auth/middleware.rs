@@ -175,7 +175,14 @@ where
         let pool = PgPool::from_ref(state);
         let tier = match crate::models::user::get_user_tier(&pool, user_id).await {
             Ok(t) => t,
-            Err(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "tier lookup failed; treating as not-pro",
+                );
+                None
+            }
         };
 
         match tier.as_deref() {
